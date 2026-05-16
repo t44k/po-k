@@ -85,6 +85,10 @@ pub async fn ingest(
 
     let mut accepted: u64 = 0;
     let mut duplicates: u64 = 0;
+    // (session_key, kind, raw, timestamp) for events we accepted (not duplicates),
+    // so we can publish them onto the bus after commit. Sidechain events aren't
+    // published in v1 — live updates are main-session only.
+    let mut to_publish: Vec<(String, String, String, Option<String>)> = Vec::new();
 
     for ev in &events {
         // Upsert session aggregate.
@@ -148,6 +152,14 @@ pub async fn ingest(
                     {
                         return server_error(&format!("insert fts5: {e}"));
                     }
+                    if !ev.is_sidechain {
+                        to_publish.push((
+                            ev.session_key.as_str().to_string(),
+                            ev.kind.clone(),
+                            ev.raw.clone(),
+                            ev.timestamp.clone(),
+                        ));
+                    }
                 } else {
                     duplicates += 1;
                 }
@@ -176,6 +188,14 @@ pub async fn ingest(
 
     if let Err(e) = tx.commit().await {
         return server_error(&format!("commit: {e}"));
+    }
+
+    // Publish accepted events onto the live bus. Render each to HTML on the way
+    // out so WebSocket subscribers can append it directly.
+    for (session_key, kind, raw, ts) in &to_publish {
+        if let Some(html) = crate::transcript::render_event_to_html(kind, raw, ts.as_deref()) {
+            state.bus().publish(session_key, html);
+        }
     }
 
     (

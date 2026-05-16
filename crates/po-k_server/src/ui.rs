@@ -2,7 +2,7 @@
 
 use askama::Template;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ws::Message, ws::WebSocket, ws::WebSocketUpgrade, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json, Response},
 };
@@ -16,6 +16,7 @@ use crate::transcript::build_turns_html;
 use po_k_proto::HEADER_API_KEY;
 
 const PAGE_SIZE: i64 = 200;
+const OLDER_PAGE_SIZE: i64 = 100;
 
 // ─── Project list ─────────────────────────────────────────────────────────────
 
@@ -127,22 +128,20 @@ struct TranscriptTpl {
     title: Option<String>,
     event_count: i64,
     turns_html: Vec<String>,
-    next_cursor: Option<i64>,
-    remaining: i64,
+    /// Smallest `line_no` rendered; used as `before` cursor for the next "load older" request.
+    oldest_cursor: Option<i64>,
 }
 
 #[derive(Template)]
-#[template(path = "transcript_page.html")]
-struct TranscriptPageTpl {
-    session_key: String,
+#[template(path = "transcript_older.html")]
+struct TranscriptOlderTpl {
     turns_html: Vec<String>,
-    next_cursor: Option<i64>,
-    remaining: i64,
+    oldest_cursor: Option<i64>,
 }
 
 #[derive(Deserialize)]
-pub struct PageQuery {
-    cursor: Option<i64>,
+pub struct OlderQuery {
+    before: Option<i64>,
 }
 
 pub async fn transcript(
@@ -171,8 +170,8 @@ pub async fn transcript(
     .ok()
     .flatten();
 
-    let (turns_html, next_cursor, remaining) =
-        match load_page(&state, &session_key, 0).await {
+    let (turns_html, oldest_cursor) =
+        match load_latest(&state, &session_key, PAGE_SIZE).await {
             Ok(v) => v,
             Err(e) => return server_error(e),
         };
@@ -185,63 +184,96 @@ pub async fn transcript(
         title,
         event_count: session.try_get("event_count").unwrap_or(0),
         turns_html,
-        next_cursor,
-        remaining,
+        oldest_cursor,
     })
 }
 
-pub async fn transcript_page(
+pub async fn transcript_older(
     State(state): State<AppState>,
     Path(session_key): Path<String>,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<OlderQuery>,
 ) -> Response {
-    let cursor = q.cursor.unwrap_or(0);
-    let (turns_html, next_cursor, remaining) =
-        match load_page(&state, &session_key, cursor).await {
+    let Some(before) = q.before else {
+        return (StatusCode::BAD_REQUEST, "missing ?before=N").into_response();
+    };
+    let (turns_html, oldest_cursor) =
+        match load_older(&state, &session_key, before, OLDER_PAGE_SIZE).await {
             Ok(v) => v,
             Err(e) => return server_error(e),
         };
-
-    render(TranscriptPageTpl {
-        session_key,
+    render(TranscriptOlderTpl {
         turns_html,
-        next_cursor,
-        remaining,
+        oldest_cursor,
     })
 }
 
-async fn load_page(
+/// Load the most recent `limit` main events, returned in chronological order so the
+/// renderer can just iterate top-to-bottom.
+async fn load_latest(
     state: &AppState,
     session_key: &str,
-    cursor: i64,
-) -> Result<(Vec<String>, Option<i64>, i64), sqlx::Error> {
-    let mut main_rows = sqlx::query(
+    limit: i64,
+) -> Result<(Vec<String>, Option<i64>), sqlx::Error> {
+    let mut rows = sqlx::query(
         "SELECT line_no, byte_offset, timestamp, kind, agent_id, CAST(raw AS TEXT) AS raw
          FROM events
-         WHERE session_key = ? AND is_sidechain = 0 AND line_no >= ?
-         ORDER BY line_no ASC
+         WHERE session_key = ? AND is_sidechain = 0
+         ORDER BY line_no DESC
          LIMIT ?",
     )
     .bind(session_key)
-    .bind(cursor)
-    .bind(PAGE_SIZE + 1)
+    .bind(limit)
     .fetch_all(state.pool())
     .await?;
+    rows.reverse();
+    let oldest_cursor = rows
+        .first()
+        .and_then(|r| r.try_get::<i64, _>("line_no").ok());
 
-    let has_more = main_rows.len() as i64 > PAGE_SIZE;
-    if has_more {
-        main_rows.pop();
-    }
+    let (side_rows, meta_rows) = load_session_extras(state, session_key).await?;
+    let turns_html = build_turns_html(rows, side_rows, meta_rows);
+    Ok((turns_html, oldest_cursor))
+}
 
-    let next_cursor = if has_more {
-        main_rows
-            .last()
-            .and_then(|r| r.try_get::<i64, _>("line_no").ok())
-            .map(|ln| ln + 1)
-    } else {
-        None
-    };
+/// Load up to `limit` events with `line_no < before`, chronologically.
+async fn load_older(
+    state: &AppState,
+    session_key: &str,
+    before: i64,
+    limit: i64,
+) -> Result<(Vec<String>, Option<i64>), sqlx::Error> {
+    let mut rows = sqlx::query(
+        "SELECT line_no, byte_offset, timestamp, kind, agent_id, CAST(raw AS TEXT) AS raw
+         FROM events
+         WHERE session_key = ? AND is_sidechain = 0 AND line_no < ?
+         ORDER BY line_no DESC
+         LIMIT ?",
+    )
+    .bind(session_key)
+    .bind(before)
+    .bind(limit)
+    .fetch_all(state.pool())
+    .await?;
+    rows.reverse();
+    let oldest_cursor = rows
+        .first()
+        .and_then(|r| r.try_get::<i64, _>("line_no").ok());
 
+    let (side_rows, meta_rows) = load_session_extras(state, session_key).await?;
+    let turns_html = build_turns_html(rows, side_rows, meta_rows);
+    Ok((turns_html, oldest_cursor))
+}
+
+async fn load_session_extras(
+    state: &AppState,
+    session_key: &str,
+) -> Result<
+    (
+        Vec<sqlx::sqlite::SqliteRow>,
+        Vec<sqlx::sqlite::SqliteRow>,
+    ),
+    sqlx::Error,
+> {
     let side_rows = sqlx::query(
         "SELECT agent_id, line_no, timestamp, kind, CAST(raw AS TEXT) AS raw
          FROM events
@@ -251,29 +283,61 @@ async fn load_page(
     .bind(session_key)
     .fetch_all(state.pool())
     .await?;
-
     let meta_rows = sqlx::query(
         "SELECT agent_file, agent_type, description FROM subagent_meta WHERE session_key = ?",
     )
     .bind(session_key)
     .fetch_all(state.pool())
     .await?;
+    Ok((side_rows, meta_rows))
+}
 
-    let turns_html = build_turns_html(main_rows, side_rows, meta_rows);
+// ─── WebSocket: live event tail ───────────────────────────────────────────────
 
-    let remaining = if has_more {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM events WHERE session_key = ? AND is_sidechain = 0 AND line_no >= ?",
-        )
-        .bind(session_key)
-        .bind(next_cursor.unwrap_or(0))
-        .fetch_one(state.pool())
-        .await?
-    } else {
-        0
-    };
+pub async fn transcript_ws(
+    State(state): State<AppState>,
+    Path(session_key): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| ws_loop(state, session_key, socket))
+}
 
-    Ok((turns_html, next_cursor, remaining))
+async fn ws_loop(state: AppState, session_key: String, mut socket: WebSocket) {
+    let mut rx = state.bus().subscribe(&session_key);
+    loop {
+        tokio::select! {
+            // Server-side: a new event arrived for this session — forward it.
+            msg = rx.recv() => {
+                match msg {
+                    Ok(html) => {
+                        if socket.send(Message::Text(html)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // If the channel lagged we tell the client; it can refresh.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = socket.send(Message::Text(
+                            "<!-- bus lagged; refresh for the latest -->".to_string()
+                        )).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            // Client-side: pings / close.
+            ws_msg = socket.recv() => {
+                match ws_msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(p))) => {
+                        if socket.send(Message::Pong(p)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 // ─── Search ───────────────────────────────────────────────────────────────────

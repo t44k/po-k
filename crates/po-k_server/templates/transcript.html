@@ -3,8 +3,102 @@
 {% block crumbs %}<a href="/ui">projects</a> / <a href="/ui/project/{{ sanitized_cwd }}">{{ sanitized_cwd }}</a> / {{ session_uuid }}{% endblock %}
 {% block content %}
 <h2>{% match title %}{% when Some with (t) %}{{ t }}{% when None %}session{% endmatch %}
-  <span class="muted">· {{ event_count }} events · machine {{ machine_id }}</span>
+  <span class="muted">· <span id="event-count">{{ event_count }}</span> events · machine {{ machine_id }} · <span id="live-status" class="muted">connecting…</span></span>
 </h2>
 
-{% include "transcript_page.html" %}
+<div id="transcript"
+     data-session-key="{{ session_key }}"
+     data-oldest-cursor="{% if let Some(c) = oldest_cursor %}{{ c }}{% else %}-1{% endif %}">
+  <div id="older-trigger" class="muted" style="text-align:center; padding:8px; font-size:12px">
+    {% if let Some(_) = oldest_cursor %}scroll up to load older{% else %}(beginning of session){% endif %}
+  </div>
+  <div id="turns">
+{% for h in turns_html %}{{ h|safe }}
+{% endfor %}
+  </div>
+</div>
+
+<script>
+(function () {
+  const root = document.getElementById('transcript');
+  const turns = document.getElementById('turns');
+  const olderTrigger = document.getElementById('older-trigger');
+  const liveStatus = document.getElementById('live-status');
+  const eventCount = document.getElementById('event-count');
+  const sessionKey = root.dataset.sessionKey;
+
+  // Scroll to bottom on first paint so the most recent turns are visible.
+  // (The container is the whole document; we scroll the window.)
+  function scrollToBottom() { window.scrollTo({ top: document.body.scrollHeight, behavior: 'instant' }); }
+  setTimeout(scrollToBottom, 0);
+
+  // Following: true when the user is within 80px of the page bottom.
+  function nearBottom() {
+    return (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 80);
+  }
+
+  // ── Live tail via WebSocket ────────────────────────────────────────────────
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${wsProto}//${location.host}/ui/session/${sessionKey}/ws`;
+  let ws;
+  function connect() {
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => { liveStatus.textContent = 'live'; liveStatus.style.color = 'var(--user)'; };
+    ws.onclose = () => {
+      liveStatus.textContent = 'reconnecting…'; liveStatus.style.color = 'var(--warn)';
+      setTimeout(connect, 2000);
+    };
+    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+    ws.onmessage = (ev) => {
+      const wasNearBottom = nearBottom();
+      const tmp = document.createElement('div');
+      tmp.innerHTML = ev.data;
+      while (tmp.firstChild) {
+        turns.appendChild(tmp.firstChild);
+      }
+      eventCount.textContent = (parseInt(eventCount.textContent, 10) || 0) + 1;
+      if (wasNearBottom) scrollToBottom();
+    };
+  }
+  connect();
+
+  // ── Infinite scroll up: when the older-trigger is visible, fetch older ────
+  let loadingOlder = false;
+  async function loadOlder() {
+    if (loadingOlder) return;
+    const cursor = parseInt(root.dataset.oldestCursor, 10);
+    if (isNaN(cursor) || cursor <= 0) return;  // already at the beginning
+    loadingOlder = true;
+    olderTrigger.textContent = 'loading older…';
+    try {
+      const resp = await fetch(`/ui/session/${sessionKey}/older?before=${cursor}`, { credentials: 'include' });
+      if (!resp.ok) throw new Error(`status ${resp.status}`);
+      const html = await resp.text();
+      const tmp = document.createElement('div');
+      tmp.innerHTML = html;
+      // The server response is a fragment: turns + an updated data-oldest-cursor
+      // embedded as an HTML comment we parse out.
+      const m = html.match(/<!--\s*oldest-cursor:\s*(-?\d+)\s*-->/);
+      const newCursor = m ? m[1] : '-1';
+      // Preserve scroll position visually as we prepend.
+      const prevHeight = document.body.scrollHeight;
+      while (tmp.firstChild) turns.insertBefore(tmp.firstChild, turns.firstChild);
+      const delta = document.body.scrollHeight - prevHeight;
+      window.scrollTo({ top: window.scrollY + delta, behavior: 'instant' });
+      root.dataset.oldestCursor = newCursor;
+      if (parseInt(newCursor, 10) <= 0) {
+        olderTrigger.textContent = '(beginning of session)';
+      } else {
+        olderTrigger.textContent = 'scroll up to load older';
+      }
+    } catch (e) {
+      olderTrigger.textContent = `older load failed (${e}); scroll up to retry`;
+    } finally {
+      loadingOlder = false;
+    }
+  }
+  // Trigger when within 200px of top.
+  window.addEventListener('scroll', () => { if (window.scrollY < 200) loadOlder(); });
+})();
+</script>
 {% endblock %}

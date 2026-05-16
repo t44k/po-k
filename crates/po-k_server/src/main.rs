@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod admin;
 mod auth;
+mod bus;
 mod distill;
 mod embed;
 mod ingest;
@@ -195,8 +196,12 @@ async fn run_server(db: PathBuf, listen: String) -> Result<()> {
         .route("/ui/project/:sanitized_cwd", axum::routing::get(ui::sessions))
         .route("/ui/session/:session_key", axum::routing::get(ui::transcript))
         .route(
-            "/ui/session/:session_key/page",
-            axum::routing::get(ui::transcript_page),
+            "/ui/session/:session_key/older",
+            axum::routing::get(ui::transcript_older),
+        )
+        .route(
+            "/ui/session/:session_key/ws",
+            axum::routing::get(ui::transcript_ws),
         )
         .route("/ui/search", axum::routing::get(ui::search))
         .route("/api/search", axum::routing::get(ui::api_search))

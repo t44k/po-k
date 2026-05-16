@@ -5,12 +5,14 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::bus::EventBus;
 use crate::embed::Embedder;
 
 #[derive(Clone)]
 pub struct AppState {
     pool: SqlitePool,
     embedder: Option<Arc<dyn Embedder>>,
+    bus: EventBus,
 }
 
 impl AppState {
@@ -28,11 +30,16 @@ impl AppState {
         Ok(Self {
             pool,
             embedder: None,
+            bus: EventBus::new(),
         })
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub fn bus(&self) -> &EventBus {
+        &self.bus
     }
 
     pub fn embedder(&self) -> Option<&Arc<dyn Embedder>> {

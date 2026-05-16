@@ -60,7 +60,7 @@ impl Turn {
         buf
     }
 
-    fn write_html(&self, buf: &mut String) {
+    pub fn write_html(&self, buf: &mut String) {
         match self {
             Turn::UserText { text, ts } => {
                 let _ = write!(
@@ -510,6 +510,122 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+/// Render ONE event row to HTML for the live transcript push.
+///
+/// Lighter than `build_turns_html` — no subagent splicing (the live feed doesn't
+/// have the full sidechain context), no tool_use ↔ tool_result pairing (they
+/// arrive as separate events). Refreshing the page gets the properly paired view.
+///
+/// Returns the HTML snippet (possibly multiple turns concatenated for an assistant
+/// event with mixed text + tool_use), or None for events we don't render in the
+/// transcript (file-history-snapshot, attachment, etc.).
+pub fn render_event_to_html(kind: &str, raw: &str, timestamp: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let ts = timestamp.map(str::to_string);
+    let mut out = String::new();
+    match kind {
+        "user" => {
+            let content = v.pointer("/message/content")?;
+            match content {
+                serde_json::Value::String(s) => {
+                    if !s.trim().is_empty() {
+                        Turn::UserText {
+                            text: s.clone(),
+                            ts,
+                        }
+                        .write_html(&mut out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    let mut text_buf = String::new();
+                    for item in items {
+                        let t = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+                        if t == "text" {
+                            if let Some(text) = item.get("text").and_then(serde_json::Value::as_str)
+                            {
+                                if !text_buf.is_empty() {
+                                    text_buf.push('\n');
+                                }
+                                text_buf.push_str(text);
+                            }
+                        } else if t == "tool_result" {
+                            // Render the orphan tool_result as a standalone block —
+                            // pairing will happen on the next page refresh.
+                            let inner = item.get("content");
+                            let text = extract_text_content(inner);
+                            let is_error =
+                                item.get("is_error").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                            Turn::Tool {
+                                name: "tool result".to_string(),
+                                summary: truncate(&first_nonblank_line(&text), 100),
+                                input_pretty: String::new(),
+                                result: Some(ToolResult { text, is_error }),
+                            }
+                            .write_html(&mut out);
+                        }
+                    }
+                    if !text_buf.trim().is_empty() {
+                        Turn::UserText {
+                            text: text_buf,
+                            ts: ts.clone(),
+                        }
+                        .write_html(&mut out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        "assistant" => {
+            let items = v.pointer("/message/content")?.as_array()?;
+            for item in items {
+                let t = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+                if t == "text" {
+                    if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                        if !text.trim().is_empty() {
+                            Turn::AssistantText {
+                                text: text.to_string(),
+                                ts: ts.clone(),
+                            }
+                            .write_html(&mut out);
+                        }
+                    }
+                } else if t == "tool_use" {
+                    let name = item
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
+                        .to_string();
+                    let input = item.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                    let input_pretty =
+                        serde_json::to_string_pretty(&input).unwrap_or_default();
+                    let summary = one_line_input_summary(&name, &input);
+                    Turn::Tool {
+                        name,
+                        summary,
+                        input_pretty,
+                        result: None,
+                    }
+                    .write_html(&mut out);
+                }
+            }
+        }
+        "system" => {
+            if let Some(content) = v.get("content").and_then(serde_json::Value::as_str) {
+                Turn::System {
+                    text: content.to_string(),
+                }
+                .write_html(&mut out);
+            }
+        }
+        _ => return None,
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
