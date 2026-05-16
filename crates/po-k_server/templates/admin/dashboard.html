@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}admin · po-k{% endblock %}
+{% block crumbs %}<a href="/ui/admin">admin</a> · team <code>{{ team }}</code> · <a href="/ui/logout">log out</a>{% endblock %}
+{% block content %}
+<h2>dashboard · team <code>{{ team }}</code></h2>
+
+<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px,1fr)); gap:12px; max-width:900px">
+  <div class="turn"><header class="role">sessions</header><div style="font-size:24px">{{ sessions }}</div></div>
+  <div class="turn"><header class="role">events</header><div style="font-size:24px">{{ events }}</div></div>
+  <div class="turn"><header class="role">embeddings</header>
+    <div style="font-size:24px">{{ embedded }}</div>
+    <div class="muted">{{ embedded_pct }}% of events</div>
+  </div>
+  <div class="turn"><header class="role">machines</header><div style="font-size:24px">{{ machines }}</div></div>
+  <div class="turn"><header class="role">api keys</header><div style="font-size:24px">{{ keys }}</div></div>
+  <div class="turn"><header class="role">topics / digests</header><div style="font-size:24px">{{ topics }} / {{ digests }}</div></div>
+</div>
+
+<h2>last activity</h2>
+<p class="muted">{% if let Some(t) = last_activity %}{{ t }}{% else %}—{% endif %}</p>
+
+<h2>admin pages</h2>
+<ul>
+  <li><a href="/ui/admin/keys">API keys</a> — mint and revoke</li>
+  <li><a href="/ui/admin/topics">Topics &amp; digests</a> — define questions, trigger distillation, read digests</li>
+  <li><a href="/ui/admin/mcp">MCP setup</a> — paste-ready snippet for Claude Code</li>
+</ul>
+{% endblock %}

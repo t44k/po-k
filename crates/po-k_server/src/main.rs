@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod admin;
 mod auth;
 mod distill;
 mod embed;
@@ -200,6 +201,19 @@ async fn run_server(db: PathBuf, listen: String) -> Result<()> {
         .route("/ui/search", axum::routing::get(ui::search))
         .route("/api/search", axum::routing::get(ui::api_search))
         .route("/mcp", axum::routing::post(mcp::handle))
+        .route("/ui/login", axum::routing::get(admin::login_get).post(admin::login_post))
+        .route("/ui/logout", axum::routing::get(admin::logout))
+        .route("/ui/admin", axum::routing::get(admin::dashboard))
+        .route("/ui/admin/keys", axum::routing::get(admin::keys_get).post(admin::keys_post))
+        .route("/ui/admin/keys/revoke", axum::routing::post(admin::keys_revoke))
+        .route(
+            "/ui/admin/topics",
+            axum::routing::get(admin::topics_get).post(admin::topics_post),
+        )
+        .route("/ui/admin/topic/:id", axum::routing::get(admin::topic_get))
+        .route("/ui/admin/topic/distill", axum::routing::post(admin::topic_distill))
+        .route("/ui/admin/topic/remove", axum::routing::post(admin::topic_remove))
+        .route("/ui/admin/mcp", axum::routing::get(admin::mcp_get).post(admin::mcp_keygen))
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(128 * 1024 * 1024))
