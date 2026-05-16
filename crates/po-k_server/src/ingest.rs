@@ -9,6 +9,7 @@ use po_k_core::Event;
 use po_k_proto::{BatchHeader, IngestResponse, SubagentMetaRow, HEADER_API_KEY};
 use sqlx::Acquire;
 
+use crate::auth;
 use crate::state::AppState;
 
 pub async fn ingest(
@@ -16,23 +17,10 @@ pub async fn ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // M1 auth: any non-empty API key maps to the `default` team. M3 will actually look it up.
-    let key = headers
-        .get(HEADER_API_KEY)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    if key.is_empty() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(IngestResponse::Error {
-                message: "missing api key".into(),
-                rejected_line: None,
-            }),
-        )
-            .into_response();
-    }
-    let team_id = "default".to_string();
+    let team_id = match authenticate(&state, &headers).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
 
     // Parse NDJSON: first line = header, rest = events.
     let mut lines = body.split(|b| *b == b'\n');
@@ -208,20 +196,13 @@ pub async fn ingest_subagent_meta(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let key = headers
-        .get(HEADER_API_KEY)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if key.is_empty() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(IngestResponse::Error {
-                message: "missing api key".into(),
-                rejected_line: None,
-            }),
-        )
-            .into_response();
-    }
+    let _team_id = match authenticate(&state, &headers).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    // subagent_meta rows are joined to events via session_key, and session_key already
+    // encodes team boundaries (collector ships under its own team's key). No explicit
+    // team_id needed on these rows for M3.
 
     let mut rows: Vec<SubagentMetaRow> = Vec::new();
     let mut line_no: u64 = 0;
@@ -276,6 +257,27 @@ pub async fn ingest_subagent_meta(
         }),
     )
         .into_response()
+}
+
+/// Pull the API key from the request, look it up, and return the bound team_id.
+/// On failure, returns a fully-rendered 401/500 response the caller can return as-is.
+async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+    let key = headers
+        .get(HEADER_API_KEY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    match auth::lookup(state.pool(), key).await {
+        Ok(Some(ctx)) => Ok(ctx.team_id),
+        Ok(None) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(IngestResponse::Error {
+                message: "invalid or missing api key".into(),
+                rejected_line: None,
+            }),
+        )
+            .into_response()),
+        Err(e) => Err(server_error(&format!("auth lookup failed: {e}"))),
+    }
 }
 
 /// Split a file_relpath like `-workspace/<uuid>.jsonl` or

@@ -29,3 +29,4 @@ clap = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 askama = { workspace = true }
+blake3 = { workspace = true }

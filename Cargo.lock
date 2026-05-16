@@ -1509,6 +1509,7 @@ dependencies = [
  "anyhow",
  "askama",
  "axum",
+ "blake3",
  "chrono",
  "clap",
  "po-k_core",
