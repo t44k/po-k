@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod auth;
 mod distill;
+mod embed;
 mod ingest;
 mod llm;
 mod mcp;
@@ -162,8 +163,24 @@ async fn main() -> Result<()> {
 }
 
 async fn run_server(db: PathBuf, listen: String) -> Result<()> {
-    let state = AppState::open(&db).await.context("opening database")?;
+    let mut state = AppState::open(&db).await.context("opening database")?;
     state.migrate().await.context("running migrations")?;
+
+    // Try to load the embedder. On failure (network, ONNX runtime mismatch, etc.)
+    // we just leave it unset — BM25-only search keeps working.
+    match embed::FastembedEmbedder::try_load().await {
+        Ok(emb) => {
+            let arc: std::sync::Arc<dyn embed::Embedder> = std::sync::Arc::new(emb);
+            state = state.with_embedder(arc.clone());
+            let pool = state.pool().clone();
+            tokio::spawn(async move {
+                embed::run_indexer(pool, arc).await;
+            });
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "embedder unavailable; search will use BM25 only");
+        }
+    }
 
     let app = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))

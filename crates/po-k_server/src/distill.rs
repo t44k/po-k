@@ -173,9 +173,9 @@ pub async fn distill_one(pool: &SqlitePool, topic_id: &str, llm: &dyn Llm) -> Re
 }
 
 /// Pull the *interesting* text out of an event's raw JSONL line so the evidence we
-/// hand the LLM is human-readable instead of escaped JSON. For unknown shapes we
-/// just hand back a truncated version of the raw line.
-fn extract_searchable(raw: &str) -> String {
+/// hand the LLM (or the embedder) is human-readable instead of escaped JSON. For
+/// unknown shapes we just hand back a truncated version of the raw line.
+pub fn extract_searchable(raw: &str) -> String {
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
         return truncate(raw, 1500);
     };

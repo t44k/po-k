@@ -31,3 +31,4 @@ uuid = { workspace = true }
 askama = { workspace = true }
 blake3 = { workspace = true }
 async-trait = { workspace = true }
+fastembed = { workspace = true }

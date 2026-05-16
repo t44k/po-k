@@ -18,7 +18,13 @@
 <div class="turn" style="border-left-color: var(--accent)">
   <header class="role">
     <a href="/ui/session/{{ h.session_key }}">{{ h.sanitized_cwd }} / {{ h.session_uuid }}</a>
-    <span class="muted"> · {{ h.file_relpath }} · line {{ h.line_no }}{% if let Some(s) = h.bm25 %} · bm25 {{ "{:.2}"|format(s) }}{% endif %}</span>
+    {% if !h.source.is_empty() %}
+      <span class="badge" style="border-color:
+        {% if h.source == "both" %}var(--accent)
+        {% else if h.source == "dense" %}var(--sub)
+        {% else %}var(--tool){% endif %}">{{ h.source }}</span>
+    {% endif %}
+    <span class="muted"> · {{ h.file_relpath }} · line {{ h.line_no }}{% if let Some(s) = h.bm25 %} · bm25 {{ "{:.2}"|format(s) }}{% endif %}{% if let Some(d) = h.dense %} · cos {{ "{:.3}"|format(d) }}{% endif %}</span>
   </header>
   <div>{{ h.snippet|safe }}</div>
 </div>

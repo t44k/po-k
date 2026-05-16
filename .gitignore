@@ -1,4 +1,5 @@
 /target/
+/.fastembed_cache/
 **/*.rs.bk
 *.pdb
 

@@ -3,10 +3,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
+
+use crate::embed::Embedder;
 
 #[derive(Clone)]
 pub struct AppState {
     pool: SqlitePool,
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl AppState {
@@ -21,11 +25,23 @@ impl AppState {
             .max_connections(8)
             .connect_with(opts)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            embedder: None,
+        })
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub fn embedder(&self) -> Option<&Arc<dyn Embedder>> {
+        self.embedder.as_ref()
+    }
+
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     pub async fn migrate(&self) -> Result<()> {

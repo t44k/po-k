@@ -298,7 +298,9 @@ struct SearchTpl {
 /// /ui/search?q=... — server-rendered HTML. No auth in v1 (UI is open). All teams.
 pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Response {
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    let hits = match search::bm25(state.pool(), &q.q, q.team.as_deref(), limit).await {
+    let hits = match search::hybrid(state.pool(), state.embedder(), &q.q, q.team.as_deref(), limit)
+        .await
+    {
         Ok(h) => h,
         Err(e) => return server_error(e),
     };
@@ -323,7 +325,8 @@ pub async fn api_search(
         Err(e) => return server_error(e),
     };
     let limit = q.limit.unwrap_or(25).clamp(1, 200);
-    let hits = match search::bm25(state.pool(), &q.q, Some(&team), limit).await {
+    let hits = match search::hybrid(state.pool(), state.embedder(), &q.q, Some(&team), limit).await
+    {
         Ok(h) => h,
         Err(e) => return server_error(e),
     };
