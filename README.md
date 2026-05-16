@@ -53,9 +53,9 @@ po-k_server admin distill --db DB [--id ID] [--backend claude-cli] [--model clau
 
 ## Search
 
-- `/ui/search?q=…` — server-rendered HTML, all teams visible, `<mark>` highlights.
+- `/ui/search?q=…` — server-rendered HTML, all teams visible, `<mark>` highlights, source badges (bm25 / dense / both).
 - `/api/search?q=…&limit=N` — JSON, requires `X-Api-Key`, scoped to the key's team.
-- BM25 over `events_fts` (sqlite fts5). Hybrid retrieval (fastembed-rs + sqlite-vec + RRF) is on the roadmap.
+- Hybrid retrieval: BM25 (sqlite fts5) + dense (fastembed-rs `bge-small-en-v1.5`, 384-dim, brute-force cosine over `events_embedding` BLOBs) fused with Reciprocal Rank Fusion (k=60). The fastembed model is downloaded on first run (~80MB into `~/.cache/fastembed`); if the load fails the server degrades to BM25-only.
 
 ## MCP wiring (Claude Code)
 
@@ -95,7 +95,7 @@ crates/
 | M2 | transcript UI (projects → sessions → collapsed tool/subagent transcript) ✓ |
 | M3 | real auth, hashed API keys, multi-team isolation ✓ |
 | M4.1+4.2 | fts5 BM25 search (UI + JSON API) ✓ |
-| M4.3+4.4 | hybrid retrieval (fastembed + sqlite-vec + RRF) — pending |
+| M4.3+4.4 | hybrid retrieval (fastembed-rs + brute-force cosine + RRF) ✓ |
 | M4.5 | bundled MCP server (5 tools) ✓ |
 | M5 | topic-pinned distillation loop with `claude -p` backend ✓ |
 | M6 | ticketing bridge (Jira / Linear / Asana ↔ git blame) — pending |
