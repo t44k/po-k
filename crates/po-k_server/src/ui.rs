@@ -3,14 +3,17 @@
 use askama::Template;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Json, Response},
 };
 use serde::Deserialize;
 use sqlx::Row;
 
+use crate::auth;
+use crate::search::{self, Hit};
 use crate::state::AppState;
 use crate::transcript::build_turns_html;
+use po_k_proto::HEADER_API_KEY;
 
 const PAGE_SIZE: i64 = 200;
 
@@ -271,6 +274,60 @@ async fn load_page(
     };
 
     Ok((turns_html, next_cursor, remaining))
+}
+
+// ─── Search ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "search.html")]
+struct SearchTpl {
+    query: String,
+    hits: Vec<Hit>,
+}
+
+/// /ui/search?q=... — server-rendered HTML. No auth in v1 (UI is open). All teams.
+pub async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Response {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let hits = match search::bm25(state.pool(), &q.q, q.team.as_deref(), limit).await {
+        Ok(h) => h,
+        Err(e) => return server_error(e),
+    };
+    render(SearchTpl { query: q.q, hits })
+}
+
+/// /api/search?q=... — JSON. Auth-required, team-scoped to the X-Api-Key's team.
+pub async fn api_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SearchQuery>,
+) -> Response {
+    let key = headers
+        .get(HEADER_API_KEY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let team = match auth::lookup(state.pool(), key).await {
+        Ok(Some(ctx)) => ctx.team_id,
+        Ok(None) => {
+            return (StatusCode::UNAUTHORIZED, "invalid or missing api key").into_response();
+        }
+        Err(e) => return server_error(e),
+    };
+    let limit = q.limit.unwrap_or(25).clamp(1, 200);
+    let hits = match search::bm25(state.pool(), &q.q, Some(&team), limit).await {
+        Ok(h) => h,
+        Err(e) => return server_error(e),
+    };
+    Json(hits).into_response()
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

@@ -131,6 +131,23 @@ pub async fn ingest(
             Ok(r) => {
                 if r.rows_affected() == 1 {
                     accepted += 1;
+                    // Mirror into fts5 only on first insert so the index stays in
+                    // sync with the events table. INSERT OR IGNORE already handled
+                    // dedupe above; here we just record the new row.
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO events_fts (session_key, file_relpath, line_no, team_id, raw)
+                         VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(ev.session_key.as_str())
+                    .bind(&ev.file_relpath)
+                    .bind(ev.line_no as i64)
+                    .bind(&team_id)
+                    .bind(&ev.raw)
+                    .execute(&mut *tx)
+                    .await
+                    {
+                        return server_error(&format!("insert fts5: {e}"));
+                    }
                 } else {
                     duplicates += 1;
                 }

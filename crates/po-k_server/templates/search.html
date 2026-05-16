@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}search · po-k{% endblock %}
+{% block crumbs %}<a href="/ui">projects</a> / search{% endblock %}
+{% block content %}
+<form method="get" action="/ui/search" style="margin-bottom:16px">
+  <input type="search" name="q" value="{{ query }}" placeholder="BM25 over event text" autofocus
+         style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg);
+                padding:6px 10px; width:60ch; font-family:inherit; font-size:13px">
+  <button type="submit" class="load-more">search</button>
+</form>
+
+{% if !query.is_empty() %}
+<h2>{{ hits.len() }} hits for &ldquo;{{ query }}&rdquo;</h2>
+{% if hits.is_empty() %}
+<p class="muted">No matches. Try a different query or fewer terms.</p>
+{% else %}
+{% for h in hits %}
+<div class="turn" style="border-left-color: var(--accent)">
+  <header class="role">
+    <a href="/ui/session/{{ h.session_key }}">{{ h.sanitized_cwd }} / {{ h.session_uuid }}</a>
+    <span class="muted"> · {{ h.file_relpath }} · line {{ h.line_no }}{% if let Some(s) = h.bm25 %} · bm25 {{ "{:.2}"|format(s) }}{% endif %}</span>
+  </header>
+  <div>{{ h.snippet|safe }}</div>
+</div>
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endblock %}

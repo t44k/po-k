@@ -85,6 +85,11 @@
 <header>
   <h1><a href="/ui">po-k</a></h1>
   <span class="muted">{% block crumbs %}{% endblock %}</span>
+  <form method="get" action="/ui/search" style="margin-left:auto">
+    <input type="search" name="q" placeholder="search" aria-label="search"
+           style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg);
+                  padding:4px 8px; width:32ch; font-family:inherit; font-size:12px">
+  </form>
 </header>
 <main>
 {% block content %}{% endblock %}

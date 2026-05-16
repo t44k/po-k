@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod auth;
 mod ingest;
+mod search;
 mod state;
 mod transcript;
 mod ui;
@@ -102,6 +103,8 @@ async fn run_server(db: PathBuf, listen: String) -> Result<()> {
             "/ui/session/:session_key/page",
             axum::routing::get(ui::transcript_page),
         )
+        .route("/ui/search", axum::routing::get(ui::search))
+        .route("/api/search", axum::routing::get(ui::api_search))
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(128 * 1024 * 1024))
