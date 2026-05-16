@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}projects · po-k{% endblock %}
+{% block content %}
+<h2>projects ({{ rows.len() }})</h2>
+{% if rows.is_empty() %}
+  <p class="muted">No data yet. Run the collector against ~/.claude/projects.</p>
+{% else %}
+<table>
+  <thead><tr><th>project (sanitized cwd)</th><th>sessions</th><th>events</th><th>last activity</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td><a href="/ui/project/{{ r.sanitized_cwd }}">{{ r.sanitized_cwd }}</a></td>
+      <td>{{ r.session_count }}</td>
+      <td>{{ r.event_count }}</td>
+      <td class="muted">{{ r.last_event_at.as_deref().unwrap_or("—") }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,14 @@
+{# Renders one page of turns plus a "Load more" trigger if there's more. Each turn
+   is pre-rendered to HTML in Rust to avoid askama's recursive-include limitations. #}
+{% for h in turns_html %}{{ h|safe }}
+{% endfor %}
+
+{% if let Some(c) = next_cursor %}
+<a class="load-more"
+   hx-get="/ui/session/{{ session_key }}/page?cursor={{ c }}"
+   hx-trigger="click"
+   hx-swap="outerHTML"
+   href="javascript:void(0)">
+  Load more ({{ remaining }} remaining)
+</a>
+{% endif %}

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}po-k{% endblock %}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://unpkg.com/htmx.org@2.0.3" defer></script>
+<style>
+  :root {
+    --bg: #0f1115;
+    --fg: #d8d8d8;
+    --muted: #7a8590;
+    --rule: #1f242b;
+    --accent: #6cb6ff;
+    --user: #b4e2a3;
+    --assistant: #d8d8d8;
+    --tool: #f5c87a;
+    --sub: #c8a8ff;
+    --warn: #f08c8c;
+    --code-bg: #161a21;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--rule);
+    display: flex; align-items: center; gap: 16px;
+  }
+  header a { color: var(--accent); text-decoration: none; }
+  main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  h2 { font-size: 15px; margin: 24px 0 8px; color: var(--muted); font-weight: 500; }
+  a { color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  .muted { color: var(--muted); }
+  .badge { display: inline-block; padding: 1px 6px; border: 1px solid var(--rule); border-radius: 3px; color: var(--muted); margin-right: 6px; }
+  .turn { padding: 10px 12px; margin: 10px 0; border-left: 2px solid var(--rule); white-space: pre-wrap; word-wrap: break-word; }
+  .turn.user      { border-left-color: var(--user); }
+  .turn.assistant { border-left-color: var(--assistant); }
+  .turn.system    { border-left-color: var(--muted); color: var(--muted); }
+  .turn header.role { color: var(--muted); margin-bottom: 6px; font-size: 12px; padding: 0; border: 0; }
+  details.tool, details.subagent {
+    margin: 6px 0;
+    border-left: 2px solid var(--tool);
+    padding: 4px 10px;
+    background: var(--code-bg);
+    border-radius: 0 4px 4px 0;
+  }
+  details.subagent { border-left-color: var(--sub); }
+  details summary { cursor: pointer; color: var(--muted); }
+  details summary .tool-name { color: var(--tool); font-weight: 600; }
+  details.subagent summary .tool-name { color: var(--sub); }
+  pre.payload {
+    background: var(--code-bg);
+    padding: 8px 10px;
+    margin: 6px 0;
+    overflow-x: auto;
+    border-radius: 3px;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .load-more {
+    display: inline-block;
+    margin: 16px 0;
+    padding: 6px 12px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    color: var(--accent);
+    cursor: pointer;
+    background: transparent;
+  }
+  .load-more:hover { border-color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/ui">po-k</a></h1>
+  <span class="muted">{% block crumbs %}{% endblock %}</span>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}{{ sanitized_cwd }} · po-k{% endblock %}
+{% block crumbs %}<a href="/ui">projects</a> / {{ sanitized_cwd }}{% endblock %}
+{% block content %}
+<h2>sessions in {{ sanitized_cwd }} ({{ rows.len() }})</h2>
+{% if rows.is_empty() %}
+  <p class="muted">No sessions yet.</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>session</th>
+      <th>title</th>
+      <th>events</th>
+      <th>first</th>
+      <th>last</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>
+        <a href="/ui/session/{{ r.session_key }}" title="{{ r.session_uuid }}">
+          {{ r.session_uuid }}
+        </a>
+      </td>
+      <td>{{ r.title.as_deref().unwrap_or("—") }}</td>
+      <td>{{ r.event_count }}</td>
+      <td class="muted">{{ r.first_event_at.as_deref().unwrap_or("—") }}</td>
+      <td class="muted">{{ r.last_event_at.as_deref().unwrap_or("—") }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

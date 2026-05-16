@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}session {{ session_uuid }} · po-k{% endblock %}
+{% block crumbs %}<a href="/ui">projects</a> / <a href="/ui/project/{{ sanitized_cwd }}">{{ sanitized_cwd }}</a> / {{ session_uuid }}{% endblock %}
+{% block content %}
+<h2>{% match title %}{% when Some with (t) %}{{ t }}{% when None %}session{% endmatch %}
+  <span class="muted">· {{ event_count }} events · machine {{ machine_id }}</span>
+</h2>
+
+{% include "transcript_page.html" %}
+{% endblock %}
