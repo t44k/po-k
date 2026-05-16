@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/po-k_core",
+    "crates/po-k_proto",
+    "crates/po-k_collector",
+    "crates/po-k_server",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/t44k/po-k"
+authors = ["t44k <tamas@leftshark.sh>"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+po-k_core = { path = "crates/po-k_core" }
+po-k_proto = { path = "crates/po-k_proto" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "signal", "time", "sync"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["trace", "limit"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+walkdir = "2"
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

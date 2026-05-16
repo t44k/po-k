@@ -1,0 +1,15 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local sqlite databases (collector watermark + server store)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
