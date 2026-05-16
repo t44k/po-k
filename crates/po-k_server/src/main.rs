@@ -24,8 +24,8 @@ enum Cmd {
         /// SQLite path. Created if missing.
         #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
         db: PathBuf,
-        /// Listen address.
-        #[arg(long, env = "PO_K_LISTEN", default_value = "127.0.0.1:8787")]
+        /// Listen address. Default binds all interfaces; tighten in production.
+        #[arg(long, env = "PO_K_LISTEN", default_value = "0.0.0.0:8787")]
         listen: String,
     },
     /// Admin operations.
