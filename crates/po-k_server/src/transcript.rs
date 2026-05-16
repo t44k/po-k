@@ -44,6 +44,15 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PendingSubagent {
+    fallback_desc: String,
+    meta_type: Option<String>,
+    meta_desc: Option<String>,
+    event_count: usize,
+    inner: Vec<Turn>,
+}
+
 impl Turn {
     pub fn to_html(&self) -> String {
         let mut buf = String::new();
@@ -133,24 +142,36 @@ impl Turn {
 pub fn build_turns_html(
     main_rows: Vec<sqlx::sqlite::SqliteRow>,
     side_rows: Vec<sqlx::sqlite::SqliteRow>,
-    _meta_rows: Vec<sqlx::sqlite::SqliteRow>,
+    meta_rows: Vec<sqlx::sqlite::SqliteRow>,
 ) -> Vec<String> {
     // Pair tool_results to their tool_use_id via main_rows.
     let tool_results = collect_tool_results(&main_rows);
 
-    // Group sidechain rows by agent_id. Each agent gets a (prompt_key, description, count, turns) record.
-    // `prompt_key` is a normalized fingerprint of the subagent's first user message,
-    // which matches the Agent tool_use's `input.prompt`. `description` is the readable label
-    // we render on the collapsed summary — we pull it from the matching Agent call's
-    // `input.description` later, falling back to a snippet of the prompt if needed.
+    // Meta lookup keyed by agent_id (extracted from `agent_file` path basename).
+    let mut meta_by_agent_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    for row in &meta_rows {
+        let agent_file: String = row.try_get("agent_file").unwrap_or_default();
+        let agent_type: Option<String> = row.try_get("agent_type").ok();
+        let description: Option<String> = row.try_get("description").ok();
+        if let Some(id) = agent_id_from_path(&agent_file) {
+            meta_by_agent_id.insert(id, (agent_type, description));
+        }
+    }
+
+    // Group sidechain rows by agent_id, then turn each group into a subagent block.
     let mut grouped: HashMap<String, Vec<sqlx::sqlite::SqliteRow>> = HashMap::new();
     for row in side_rows {
         let agent_id: String = row.try_get("agent_id").unwrap_or_default();
         grouped.entry(agent_id).or_default().push(row);
     }
 
-    let mut by_prompt_queue: HashMap<String, Vec<(String, usize, Vec<Turn>)>> = HashMap::new();
-    for (_agent_id, rows) in grouped.into_iter() {
+    // Index of pending subagent blocks. Keyed by the normalized prompt that the
+    // parent Agent tool_use carries — we know the subagent's first user message is
+    // that same prompt (verified empirically), so this is a reliable join key.
+    // `meta_type` / `meta_desc` come from the meta.json sidecar when available and
+    // override the prompt-derived fallback.
+    let mut by_prompt_queue: HashMap<String, Vec<PendingSubagent>> = HashMap::new();
+    for (agent_id, rows) in grouped.into_iter() {
         let count = rows.len();
         let first_prompt = first_user_text(&rows).unwrap_or_default();
         let prompt_key = normalize_prompt(&first_prompt);
@@ -159,10 +180,14 @@ pub fn build_turns_html(
             .iter()
             .filter_map(|r| subagent_row_to_turn(r))
             .collect::<Vec<_>>();
-        by_prompt_queue
-            .entry(prompt_key)
-            .or_default()
-            .push((fallback_desc, count, inner));
+        let (meta_type, meta_desc) = meta_by_agent_id.get(&agent_id).cloned().unwrap_or_default();
+        by_prompt_queue.entry(prompt_key).or_default().push(PendingSubagent {
+            fallback_desc,
+            meta_type,
+            meta_desc,
+            event_count: count,
+            inner,
+        });
     }
 
     let mut out: Vec<String> = Vec::new();
@@ -285,6 +310,14 @@ fn normalize_prompt(s: &str) -> String {
     collapsed.chars().take(256).collect()
 }
 
+/// Extract `<id>` from a path ending in `agent-<id>.jsonl`.
+fn agent_id_from_path(path: &str) -> Option<String> {
+    let basename = path.rsplit('/').next()?;
+    let stem = basename.strip_suffix(".jsonl")?;
+    let id = stem.strip_prefix("agent-")?;
+    Some(id.to_string())
+}
+
 fn render_user_row(raw: &str, ts: Option<String>) -> Option<Turn> {
     let v: Value = serde_json::from_str(raw).ok()?;
     let content = v.pointer("/message/content")?;
@@ -354,7 +387,7 @@ fn subagent_row_to_turn(row: &sqlx::sqlite::SqliteRow) -> Option<Turn> {
 fn build_tool_use(
     item: &Value,
     tool_results: &HashMap<String, ToolResult>,
-    by_prompt_queue: &mut HashMap<String, Vec<(String, usize, Vec<Turn>)>>,
+    by_prompt_queue: &mut HashMap<String, Vec<PendingSubagent>>,
 ) -> Turn {
     let name = item
         .get("name")
@@ -373,23 +406,44 @@ fn build_tool_use(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let key = normalize_prompt(prompt);
-        let description = input
+        let parent_description = input
             .get("description")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let agent_type = input
+        let parent_agent_type = input
             .get("subagent_type")
             .and_then(Value::as_str)
-            .unwrap_or("Agent")
+            .unwrap_or_default()
             .to_string();
         if let Some(q) = by_prompt_queue.get_mut(&key) {
-            if let Some((fallback_desc, count, inner)) = q.pop() {
+            if let Some(p) = q.pop() {
+                // Precedence for the rendered labels: subagent's meta.json (the
+                // authoritative server-side sidecar) > parent Agent call's input >
+                // prompt-derived fallback.
+                let agent_type = p
+                    .meta_type
+                    .unwrap_or_else(|| {
+                        if parent_agent_type.is_empty() {
+                            "Agent".to_string()
+                        } else {
+                            parent_agent_type
+                        }
+                    });
+                let description = p
+                    .meta_desc
+                    .unwrap_or_else(|| {
+                        if parent_description.is_empty() {
+                            p.fallback_desc
+                        } else {
+                            parent_description
+                        }
+                    });
                 return Turn::Subagent {
                     agent_type,
-                    description: if description.is_empty() { fallback_desc } else { description },
-                    event_count: count,
-                    inner,
+                    description,
+                    event_count: p.event_count,
+                    inner: p.inner,
                 };
             }
         }

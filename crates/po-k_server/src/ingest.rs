@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use po_k_core::Event;
-use po_k_proto::{BatchHeader, IngestResponse, HEADER_API_KEY};
+use po_k_proto::{BatchHeader, IngestResponse, SubagentMetaRow, HEADER_API_KEY};
 use sqlx::Acquire;
 
 use crate::state::AppState;
@@ -198,6 +198,81 @@ fn server_error(message: &str) -> Response {
         Json(IngestResponse::Error {
             message: message.to_string(),
             rejected_line: None,
+        }),
+    )
+        .into_response()
+}
+
+pub async fn ingest_subagent_meta(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let key = headers
+        .get(HEADER_API_KEY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if key.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(IngestResponse::Error {
+                message: "missing api key".into(),
+                rejected_line: None,
+            }),
+        )
+            .into_response();
+    }
+
+    let mut rows: Vec<SubagentMetaRow> = Vec::new();
+    let mut line_no: u64 = 0;
+    for raw in body.split(|b| *b == b'\n') {
+        if raw.is_empty() {
+            line_no += 1;
+            continue;
+        }
+        match serde_json::from_slice::<SubagentMetaRow>(raw) {
+            Ok(row) => rows.push(row),
+            Err(e) => return bad_request(&format!("invalid meta line: {e}"), Some(line_no)),
+        }
+        line_no += 1;
+    }
+
+    let mut conn = match state.pool().acquire().await {
+        Ok(c) => c,
+        Err(e) => return server_error(&format!("acquire conn: {e}")),
+    };
+    let mut tx = match conn.begin().await {
+        Ok(t) => t,
+        Err(e) => return server_error(&format!("begin tx: {e}")),
+    };
+    let mut accepted = 0u64;
+    for r in &rows {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO subagent_meta (session_key, agent_file, agent_type, description)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(session_key, agent_file) DO UPDATE SET
+                agent_type = excluded.agent_type,
+                description = excluded.description",
+        )
+        .bind(&r.session_key)
+        .bind(&r.agent_file)
+        .bind(r.agent_type.as_deref())
+        .bind(r.description.as_deref())
+        .execute(&mut *tx)
+        .await
+        {
+            return server_error(&format!("upsert meta: {e}"));
+        }
+        accepted += 1;
+    }
+    if let Err(e) = tx.commit().await {
+        return server_error(&format!("commit: {e}"));
+    }
+    (
+        StatusCode::OK,
+        Json(IngestResponse::Ok {
+            accepted,
+            duplicates: 0,
         }),
     )
         .into_response()

@@ -46,6 +46,19 @@ pub enum IngestResponse {
 pub const HEADER_API_KEY: &str = "x-api-key";
 pub const HEADER_IDEMPOTENCY_KEY: &str = "idempotency-key";
 
+/// One row of the `agent-*.meta.json` sidecar. Shipped via `/ingest/subagent-meta`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentMetaRow {
+    pub session_key: String,
+    /// File path relative to projects root, e.g. `-workspace/<uuid>/subagents/agent-<id>.jsonl`.
+    /// This is the *transcript* path, not the meta.json path — it's what links back to events.
+    pub agent_file: String,
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

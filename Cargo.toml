@@ -36,6 +36,7 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 walkdir = "2"
 clap = { version = "4", features = ["derive", "env"] }
 askama = "0.12"
+notify-debouncer-full = { version = "0.5", default-features = false }
 
 [profile.release]
 lto = "thin"

@@ -74,6 +74,10 @@ async fn run_server(db: PathBuf, listen: String) -> Result<()> {
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .route("/", axum::routing::get(|| async { axum::response::Redirect::to("/ui") }))
         .route("/ingest", axum::routing::post(ingest::ingest))
+        .route(
+            "/ingest/subagent-meta",
+            axum::routing::post(ingest::ingest_subagent_meta),
+        )
         .route("/ui", axum::routing::get(ui::projects))
         .route("/ui/project/:sanitized_cwd", axum::routing::get(ui::sessions))
         .route("/ui/session/:session_key", axum::routing::get(ui::transcript))
@@ -82,6 +86,7 @@ async fn run_server(db: PathBuf, listen: String) -> Result<()> {
             axum::routing::get(ui::transcript_page),
         )
         .with_state(state)
+        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(128 * 1024 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
