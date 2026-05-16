@@ -57,7 +57,23 @@ po-k_server admin distill --db DB [--id ID] [--backend claude-cli] [--model clau
 - `/api/search?q=…&limit=N` — JSON, requires `X-Api-Key`, scoped to the key's team.
 - Hybrid retrieval: BM25 (sqlite fts5) + dense (fastembed-rs `bge-small-en-v1.5`, 384-dim, brute-force cosine over `events_embedding` BLOBs) fused with Reciprocal Rank Fusion (k=60). The fastembed model is downloaded on first run (~80MB into `~/.cache/fastembed`); if the load fails the server degrades to BM25-only.
 
+## Admin UI
+
+Everything in the `admin` CLI subcommands is also reachable in the browser:
+
+- `/ui/login` — log in with any existing API key (sets a HttpOnly cookie).
+- `/ui/admin` — dashboard: events, embeddings %, machines, sessions, keys, topics.
+- `/ui/admin/keys` — mint + revoke keys (plaintext shown once, only blake3 stored).
+- `/ui/admin/topics` — add topics, trigger distillation in the background, read digests.
+- `/ui/admin/mcp` — paste-ready Claude Code wiring with a one-click key for a new device.
+
+The admin UI is gated behind a cookie that holds your API key. The public pages (`/ui`, `/ui/project/*`, `/ui/session/*`, `/ui/search`) stay open.
+
+> **No CSRF in v1.** Admin is intended for trusted networks. Run behind a VPN or reverse-proxy auth before opening it to the wider internet.
+
 ## MCP wiring (Claude Code)
+
+The `/ui/admin/mcp` page generates a paste-ready snippet with your server URL pre-filled and a freshly-minted device key. The structure is:
 
 `~/.claude/mcp_servers.json`:
 
@@ -73,7 +89,7 @@ po-k_server admin distill --db DB [--id ID] [--backend claude-cli] [--model clau
 }
 ```
 
-Once configured, Claude Code can call e.g. `recall_topic(topic_id: "auth-pattern")` and read the maintained digest.
+Once configured and Claude Code is restarted, the agent can call `mcp__po-k__recall_topic("auth-pattern")`, `mcp__po-k__search_sessions(query: "…", limit: 10)`, etc. All tool results are scoped to the team this key belongs to.
 
 ## Layout
 
