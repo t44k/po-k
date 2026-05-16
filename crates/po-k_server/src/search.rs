@@ -30,13 +30,72 @@ fn build_match(q: &str) -> String {
         .join(" ")
 }
 
+/// Like `build_match` but joins content words with OR — used when we want recall
+/// across long natural-language inputs (e.g. distillation topic questions) where
+/// requiring every word to appear in one event is too strict.
+fn build_or_match(q: &str) -> String {
+    q.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|w| w.len() >= 4 && !is_stopword(w))
+        .map(|w| {
+            let lower = w.to_lowercase();
+            format!("\"{}\"", lower.replace('"', "\"\""))
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// English stopwords we don't bother indexing as topic terms.
+fn is_stopword(w: &str) -> bool {
+    matches!(
+        w.to_lowercase().as_str(),
+        "what" | "which" | "where" | "when" | "have" | "been" | "from"
+            | "with" | "this" | "that" | "these" | "those" | "into" | "about"
+            | "your" | "yours" | "ours" | "their" | "them" | "they" | "were"
+            | "will" | "would" | "could" | "should" | "must" | "must've"
+            | "does" | "doing" | "done" | "very" | "much" | "more" | "most"
+            | "some" | "any" | "such" | "also" | "than" | "then" | "just"
+            | "only" | "even" | "still" | "back" | "down" | "over" | "under"
+            | "above" | "below" | "after" | "before" | "between"
+    )
+}
+
 pub async fn bm25(
     pool: &SqlitePool,
     query: &str,
     team_filter: Option<&str>,
     limit: i64,
 ) -> sqlx::Result<Vec<Hit>> {
-    let match_expr = build_match(query);
+    bm25_with_mode(pool, query, team_filter, limit, MatchMode::And).await
+}
+
+/// Variant tuned for long natural-language queries (e.g. topic questions): joins
+/// content words with OR so events that mention only a subset still surface.
+pub async fn bm25_or(
+    pool: &SqlitePool,
+    query: &str,
+    team_filter: Option<&str>,
+    limit: i64,
+) -> sqlx::Result<Vec<Hit>> {
+    bm25_with_mode(pool, query, team_filter, limit, MatchMode::Or).await
+}
+
+#[derive(Copy, Clone)]
+enum MatchMode {
+    And,
+    Or,
+}
+
+async fn bm25_with_mode(
+    pool: &SqlitePool,
+    query: &str,
+    team_filter: Option<&str>,
+    limit: i64,
+    mode: MatchMode,
+) -> sqlx::Result<Vec<Hit>> {
+    let match_expr = match mode {
+        MatchMode::And => build_match(query),
+        MatchMode::Or => build_or_match(query),
+    };
     if match_expr.is_empty() {
         return Ok(Vec::new());
     }

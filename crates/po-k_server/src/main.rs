@@ -3,10 +3,13 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod auth;
+mod distill;
 mod ingest;
+mod llm;
 mod mcp;
 mod search;
 mod state;
+mod topics;
 mod transcript;
 mod ui;
 
@@ -63,6 +66,61 @@ enum AdminCmd {
         #[arg(long)]
         label: String,
     },
+    /// Topic management: define questions whose answers po-k keeps distilled.
+    Topic {
+        #[command(subcommand)]
+        cmd: TopicCmd,
+    },
+    /// Run the distillation loop now. With no --id, processes every topic in turn.
+    Distill {
+        #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
+        db: PathBuf,
+        #[arg(long)]
+        id: Option<String>,
+        /// LLM backend to use. One of: claude-cli, anthropic, openai.
+        #[arg(long, env = "PO_K_LLM_BACKEND", default_value = "claude-cli")]
+        backend: String,
+        /// Override the model for the chosen backend (e.g. claude-opus-4-7).
+        #[arg(long, env = "PO_K_LLM_MODEL")]
+        model: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TopicCmd {
+    /// Add a new topic.
+    Add {
+        #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
+        db: PathBuf,
+        /// kebab-case id, e.g. "auth-pattern".
+        #[arg(long)]
+        id: String,
+        /// The question/prompt the digest should keep answering.
+        #[arg(long)]
+        question: String,
+        /// "team" (default) or "project:<sanitized_cwd>".
+        #[arg(long, default_value = "team")]
+        scope: String,
+        #[arg(long, default_value = "default")]
+        team: String,
+        /// Optional extra system prompt text appended to the LLM's instructions.
+        #[arg(long)]
+        extras: Option<String>,
+    },
+    /// List topics in a team.
+    List {
+        #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
+        db: PathBuf,
+        #[arg(long, default_value = "default")]
+        team: String,
+    },
+    /// Remove a topic (and its digest).
+    Remove {
+        #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
+        db: PathBuf,
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[tokio::main]
@@ -81,6 +139,24 @@ async fn main() -> Result<()> {
             AdminCmd::Keygen { db, team, label } => admin_keygen(db, team, label).await,
             AdminCmd::ListKeys { db, team } => admin_list_keys(db, team).await,
             AdminCmd::Revoke { db, label } => admin_revoke(db, label).await,
+            AdminCmd::Topic { cmd } => match cmd {
+                TopicCmd::Add {
+                    db,
+                    id,
+                    question,
+                    scope,
+                    team,
+                    extras,
+                } => topics::admin_add(db, id, question, scope, team, extras).await,
+                TopicCmd::List { db, team } => topics::admin_list(db, team).await,
+                TopicCmd::Remove { db, id } => topics::admin_remove(db, id).await,
+            },
+            AdminCmd::Distill {
+                db,
+                id,
+                backend,
+                model,
+            } => distill::run_admin(db, id, backend, model).await,
         },
     }
 }

@@ -23,6 +23,7 @@ use sqlx::Row;
 use crate::auth;
 use crate::search;
 use crate::state::AppState;
+use crate::topics;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -146,6 +147,22 @@ fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "list_topics",
+            "description": "List curated topics for the calling team. Each topic has an id, question, scope, the latest digest version (0 if not yet distilled), and when it was last written. Use this to discover what shared knowledge po-k maintains for this team.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "recall_topic",
+            "description": "Fetch the current markdown digest for a topic — the distilled answer the team maintains across sessions. Returns the digest text, version, evidence count, and the topic question/scope. Use this BEFORE asking the user about a topic that may already have a maintained answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic_id": { "type": "string", "description": "The topic's kebab-case id (e.g. \"auth-pattern\")." }
+                },
+                "required": ["topic_id"]
+            }
+        }),
     ]
 }
 
@@ -246,6 +263,66 @@ async fn handle_tool_call(
                 "content": [{ "type": "text", "text": payload }],
                 "isError": false,
                 "structuredContent": { "sessions": sessions }
+            }))
+        }
+        "list_topics" => {
+            let topics = topics::list_with_digests(state.pool(), team)
+                .await
+                .map_err(|e| (-32603, format!("topics list error: {e}")))?;
+            let items: Vec<Value> = topics
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.topic.id,
+                        "question": t.topic.question,
+                        "scope": t.topic.scope,
+                        "version": t.version,
+                        "written_at": t.written_at,
+                        "llm_backend": t.llm_backend,
+                    })
+                })
+                .collect();
+            let payload = serde_json::to_string_pretty(&items).unwrap_or_default();
+            Ok(json!({
+                "content": [{ "type": "text", "text": payload }],
+                "isError": false,
+                "structuredContent": { "topics": items }
+            }))
+        }
+        "recall_topic" => {
+            let topic_id = args
+                .get("topic_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| (-32602, "missing topic_id".to_string()))?;
+            let t = topics::get_with_digest(state.pool(), topic_id)
+                .await
+                .map_err(|e| (-32603, format!("db error: {e}")))?;
+            let Some(t) = t else {
+                return Err((-32004, format!("no topic with id '{topic_id}'")));
+            };
+            if t.topic.team_id != team {
+                return Err((-32001, "topic belongs to a different team".to_string()));
+            }
+            let evidence_count = serde_json::from_str::<Vec<Value>>(&t.evidence_event_ids)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let body = json!({
+                "topic": {
+                    "id": t.topic.id,
+                    "question": t.topic.question,
+                    "scope": t.topic.scope,
+                },
+                "version": t.version,
+                "written_at": t.written_at,
+                "evidence_count": evidence_count,
+                "llm_backend": t.llm_backend,
+                "llm_model": t.llm_model,
+                "digest_markdown": t.digest_markdown,
+            });
+            Ok(json!({
+                "content": [{ "type": "text", "text": t.digest_markdown }],
+                "isError": false,
+                "structuredContent": body
             }))
         }
         other => Err((-32601, format!("tool not found: {other}"))),
