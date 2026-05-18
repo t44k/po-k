@@ -9,7 +9,17 @@
          style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px">
   <input type="text" name="question" required placeholder="The question this digest should answer"
          style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px">
-  <p class="muted" style="margin:0">M9.1 topics are <code>global</code>-scope only. The full quadrant picker (global / global-project / user / user-project) lands in M9.5.</p>
+  <select name="scope_kind"
+         style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px">
+    <option value="global" selected>global — applies to all sessions in the team</option>
+    <option value="global-project">global-project — all sessions in one project</option>
+    <option value="user">user — all sessions of one user, all projects</option>
+    <option value="user-project">user-project — one user × one project</option>
+  </select>
+  <input type="text" name="user_slug" placeholder="user slug (required for user / user-project)"
+         style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px">
+  <input type="text" name="project_slug" placeholder="project slug (required for *-project)"
+         style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px">
   <textarea name="extras" rows="3" placeholder="(optional) extra system-prompt instructions to bias the digest style"
          style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px"></textarea>
   <div><button type="submit" class="load-more">add topic</button></div>

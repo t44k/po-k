@@ -328,6 +328,12 @@ pub struct TopicForm {
     id: String,
     question: String,
     #[serde(default)]
+    scope_kind: String,
+    #[serde(default)]
+    user_slug: String,
+    #[serde(default)]
+    project_slug: String,
+    #[serde(default)]
     extras: String,
 }
 
@@ -365,16 +371,55 @@ pub async fn topics_post(
     } else {
         Some(form.extras.trim().to_string())
     };
-    // M9.1: topics created through the UI are global-only. The scope_kind picker
-    // (with user / project selectors) lands in M9.5.
+    let scope_kind = if form.scope_kind.trim().is_empty() {
+        "global".to_string()
+    } else {
+        form.scope_kind.trim().to_string()
+    };
+    let user_slug = form.user_slug.trim();
+    let project_slug = form.project_slug.trim();
+
+    let user_id = if user_slug.is_empty() {
+        None
+    } else {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT id FROM users WHERE team_id = ? AND slug = ?",
+        )
+        .bind(&admin.team_id)
+        .bind(user_slug)
+        .fetch_optional(state.pool())
+        .await
+        {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => return server_error(format!("no user '{user_slug}' in this team")),
+            Err(e) => return server_error(format!("user lookup: {e}")),
+        }
+    };
+    let project_id = if project_slug.is_empty() {
+        None
+    } else {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT id FROM projects WHERE team_id = ? AND slug = ?",
+        )
+        .bind(&admin.team_id)
+        .bind(project_slug)
+        .fetch_optional(state.pool())
+        .await
+        {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => return server_error(format!("no project '{project_slug}' in this team")),
+            Err(e) => return server_error(format!("project lookup: {e}")),
+        }
+    };
+
     if let Err(e) = topics::add(
         state.pool(),
         &topics::Topic {
             id,
             team_id: admin.team_id,
-            scope_kind: "global".to_string(),
-            user_id: None,
-            project_id: None,
+            scope_kind,
+            user_id,
+            project_id,
             question,
             system_prompt_extras: extras,
         },
@@ -561,4 +606,312 @@ fn render<T: Template>(t: T) -> Response {
 fn server_error(msg: impl std::fmt::Display) -> Response {
     tracing::error!(error = %msg, "admin error");
     (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {msg}")).into_response()
+}
+
+// ─── Users admin ─────────────────────────────────────────────────────────────
+
+#[derive(Template)]
+#[template(path = "admin/users.html")]
+struct UsersTpl {
+    team: String,
+    rows: Vec<UserRow>,
+    minted: Option<MintedKey>,
+}
+
+struct UserRow {
+    slug: String,
+    role: String,
+    label: String,
+    created_at: String,
+    key_count: i64,
+}
+
+#[derive(Deserialize)]
+pub struct UserForm {
+    slug: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    label: String,
+}
+
+pub async fn users_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    render_users(&state, &admin.team_id, None).await
+}
+
+pub async fn users_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UserForm>,
+) -> Response {
+    let admin = match require_admin(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let slug = form.slug.trim().to_string();
+    let role = if form.role == "admin" { "admin" } else { "member" };
+    if slug.is_empty() {
+        return render_users(&state, &admin.team_id, None).await;
+    }
+    let user_id = format!("u_{}", uuid::Uuid::now_v7().simple());
+    if let Err(e) = sqlx::query(
+        "INSERT INTO users (id, team_id, slug, label, role) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&user_id)
+    .bind(&admin.team_id)
+    .bind(&slug)
+    .bind(form.label.trim())
+    .bind(role)
+    .execute(state.pool())
+    .await
+    {
+        return server_error(format!("add user '{slug}': {e}"));
+    }
+    let (plaintext, _hash) = match crate::bootstrap::mint_key_for(&user_id, state.pool(), "first-key").await {
+        Ok(p) => p,
+        Err(e) => return server_error(format!("first key: {e}")),
+    };
+    render_users(
+        &state,
+        &admin.team_id,
+        Some(MintedKey { plaintext, label: format!("{slug} first key") }),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct UserDeleteForm {
+    slug: String,
+}
+
+pub async fn users_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UserDeleteForm>,
+) -> Response {
+    let admin = match require_admin(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    // Don't let an admin delete themselves and lock the team out.
+    if form.slug == admin.user_slug {
+        return server_error("refusing to delete the currently-logged-in admin");
+    }
+    if let Err(e) = sqlx::query(
+        "DELETE FROM users WHERE team_id = ? AND slug = ?",
+    )
+    .bind(&admin.team_id)
+    .bind(&form.slug)
+    .execute(state.pool())
+    .await
+    {
+        return server_error(format!("delete user: {e}"));
+    }
+    Redirect::to("/ui/admin/users").into_response()
+}
+
+async fn render_users(state: &AppState, team: &str, minted: Option<MintedKey>) -> Response {
+    let rows = match sqlx::query(
+        "SELECT u.slug, u.role, u.label, u.created_at,
+                COALESCE(c.cnt, 0) AS key_count
+         FROM users u
+         LEFT JOIN (
+             SELECT user_id, COUNT(*) AS cnt FROM api_keys GROUP BY user_id
+         ) c ON c.user_id = u.id
+         WHERE u.team_id = ?
+         ORDER BY u.created_at DESC",
+    )
+    .bind(team)
+    .fetch_all(state.pool())
+    .await
+    {
+        Ok(r) => r
+            .into_iter()
+            .map(|r| UserRow {
+                slug: r.try_get("slug").unwrap_or_default(),
+                role: r.try_get("role").unwrap_or_default(),
+                label: r.try_get("label").unwrap_or_default(),
+                created_at: r.try_get("created_at").unwrap_or_default(),
+                key_count: r.try_get("key_count").unwrap_or(0),
+            })
+            .collect(),
+        Err(e) => return server_error(format!("list users: {e}")),
+    };
+    render(UsersTpl {
+        team: team.to_string(),
+        rows,
+        minted,
+    })
+}
+
+// ─── Projects admin ──────────────────────────────────────────────────────────
+
+#[derive(Template)]
+#[template(path = "admin/projects.html")]
+struct ProjectsTpl {
+    team: String,
+    rows: Vec<ProjectRow>,
+}
+
+struct ProjectRow {
+    slug: String,
+    label: String,
+    description: String,
+    created_at: String,
+    session_count: i64,
+}
+
+#[derive(Deserialize)]
+pub struct ProjectForm {
+    slug: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    description: String,
+}
+
+pub async fn projects_admin_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    render_projects_admin(&state, &admin.team_id).await
+}
+
+pub async fn projects_admin_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProjectForm>,
+) -> Response {
+    let admin = match require_admin(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let slug = form.slug.trim().to_string();
+    if slug.is_empty() {
+        return Redirect::to("/ui/admin/projects").into_response();
+    }
+    let id = format!("{}__{}", admin.team_id, slug);
+    if let Err(e) = sqlx::query(
+        "INSERT INTO projects (id, team_id, slug, label, description) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET label = excluded.label, description = excluded.description",
+    )
+    .bind(&id)
+    .bind(&admin.team_id)
+    .bind(&slug)
+    .bind(form.label.trim())
+    .bind(form.description.trim())
+    .execute(state.pool())
+    .await
+    {
+        return server_error(format!("upsert project '{slug}': {e}"));
+    }
+    Redirect::to("/ui/admin/projects").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ProjectDeleteForm {
+    slug: String,
+}
+
+pub async fn projects_admin_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProjectDeleteForm>,
+) -> Response {
+    let admin = match require_admin(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    if let Err(e) = sqlx::query(
+        "DELETE FROM projects WHERE team_id = ? AND slug = ?",
+    )
+    .bind(&admin.team_id)
+    .bind(&form.slug)
+    .execute(state.pool())
+    .await
+    {
+        return server_error(format!("delete project: {e}"));
+    }
+    Redirect::to("/ui/admin/projects").into_response()
+}
+
+// ─── Live sessions tile (JSON) ───────────────────────────────────────────────
+
+pub async fn admin_live(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&state, &headers).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let rows = sqlx::query(
+        "SELECT ls.session_key, ls.status, ls.active_subagents,
+                s.session_uuid
+         FROM live_sessions ls
+         LEFT JOIN sessions s ON s.session_key = ls.session_key
+         WHERE s.team_id = ?
+           AND ls.heartbeat_at > datetime('now', '-60 seconds')
+         ORDER BY ls.heartbeat_at DESC
+         LIMIT 10",
+    )
+    .bind(&admin.team_id)
+    .fetch_all(state.pool())
+    .await
+    .unwrap_or_default();
+    let count = rows.len();
+    let detail = rows
+        .iter()
+        .map(|r| {
+            let uuid: String = r.try_get("session_uuid").unwrap_or_default();
+            let status: String = r.try_get("status").unwrap_or_default();
+            let subs: i64 = r.try_get("active_subagents").unwrap_or(0);
+            let short = uuid.chars().take(8).collect::<String>();
+            if subs > 0 {
+                format!("{} ({} · {}s)", short, status, subs)
+            } else {
+                format!("{} ({})", short, status)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    axum::response::Json(serde_json::json!({
+        "count": count,
+        "detail": detail,
+    }))
+    .into_response()
+}
+
+async fn render_projects_admin(state: &AppState, team: &str) -> Response {
+    let rows = match sqlx::query(
+        "SELECT p.slug, p.label, p.description, p.created_at,
+                COALESCE(c.cnt, 0) AS session_count
+         FROM projects p
+         LEFT JOIN (SELECT project_id, COUNT(*) AS cnt FROM sessions GROUP BY project_id) c
+            ON c.project_id = p.id
+         WHERE p.team_id = ?
+         ORDER BY p.created_at DESC",
+    )
+    .bind(team)
+    .fetch_all(state.pool())
+    .await
+    {
+        Ok(r) => r
+            .into_iter()
+            .map(|r| ProjectRow {
+                slug: r.try_get("slug").unwrap_or_default(),
+                label: r.try_get("label").unwrap_or_default(),
+                description: r.try_get("description").unwrap_or_default(),
+                created_at: r.try_get("created_at").unwrap_or_default(),
+                session_count: r.try_get("session_count").unwrap_or(0),
+            })
+            .collect(),
+        Err(e) => return server_error(format!("list projects: {e}")),
+    };
+    render(ProjectsTpl {
+        team: team.to_string(),
+        rows,
+    })
 }

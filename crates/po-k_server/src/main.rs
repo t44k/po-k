@@ -263,6 +263,20 @@ async fn run_server(db: PathBuf, listen: String) -> Result<()> {
         .route("/ui/admin/topic/distill", axum::routing::post(admin::topic_distill))
         .route("/ui/admin/topic/remove", axum::routing::post(admin::topic_remove))
         .route("/ui/admin/mcp", axum::routing::get(admin::mcp_get).post(admin::mcp_keygen))
+        .route(
+            "/ui/admin/users",
+            axum::routing::get(admin::users_get).post(admin::users_post),
+        )
+        .route("/ui/admin/users/delete", axum::routing::post(admin::users_delete))
+        .route(
+            "/ui/admin/projects",
+            axum::routing::get(admin::projects_admin_get).post(admin::projects_admin_post),
+        )
+        .route(
+            "/ui/admin/projects/delete",
+            axum::routing::post(admin::projects_admin_delete),
+        )
+        .route("/api/admin/live", axum::routing::get(admin::admin_live))
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(128 * 1024 * 1024))

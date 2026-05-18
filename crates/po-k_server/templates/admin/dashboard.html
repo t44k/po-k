@@ -14,15 +14,29 @@
   <div class="turn"><header class="role">machines</header><div style="font-size:24px">{{ machines }}</div></div>
   <div class="turn"><header class="role">api keys</header><div style="font-size:24px">{{ keys }}</div></div>
   <div class="turn"><header class="role">topics / digests</header><div style="font-size:24px">{{ topics }} / {{ digests }}</div></div>
+  <div class="turn" id="live-tile"><header class="role">live sessions</header><div style="font-size:24px" id="live-count">…</div><div class="muted" id="live-detail"></div></div>
 </div>
+<script>
+(async function () {
+  try {
+    const r = await fetch('/api/admin/live', { credentials: 'include' });
+    if (!r.ok) return;
+    const data = await r.json();
+    document.getElementById('live-count').textContent = data.count;
+    document.getElementById('live-detail').textContent = data.detail || '';
+  } catch (e) {}
+})();
+</script>
 
 <h2>last activity</h2>
 <p class="muted">{% if let Some(t) = last_activity %}{{ t }}{% else %}—{% endif %}</p>
 
 <h2>admin pages</h2>
 <ul>
-  <li><a href="/ui/admin/keys">API keys</a> — mint and revoke</li>
-  <li><a href="/ui/admin/topics">Topics &amp; digests</a> — define questions, trigger distillation, read digests</li>
+  <li><a href="/ui/admin/users">Users</a> — add / delete, mint first key on creation</li>
+  <li><a href="/ui/admin/projects">Projects</a> — slugs that the collector's projects.toml maps cwd paths onto</li>
+  <li><a href="/ui/admin/keys">API keys</a> — mint and revoke (for the calling admin)</li>
+  <li><a href="/ui/admin/topics">Topics &amp; digests</a> — define questions across the 4 quadrants, trigger distillation, read digests</li>
   <li><a href="/ui/admin/mcp">MCP setup</a> — paste-ready snippet for Claude Code</li>
 </ul>
 {% endblock %}
