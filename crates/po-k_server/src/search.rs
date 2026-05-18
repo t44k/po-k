@@ -99,6 +99,40 @@ async fn bm25_with_mode(
     limit: i64,
     mode: MatchMode,
 ) -> sqlx::Result<Vec<Hit>> {
+    bm25_full(pool, query, team_filter, None, None, limit, mode).await
+}
+
+/// Filtered BM25 over events_fts, scoped by any combination of (team, user, project).
+/// Each filter is "ignore if None, equal if Some". Used by distillation routing.
+pub async fn bm25_or_scoped(
+    pool: &SqlitePool,
+    query: &str,
+    team_filter: Option<&str>,
+    user_filter: Option<&str>,
+    project_filter: Option<&str>,
+    limit: i64,
+) -> sqlx::Result<Vec<Hit>> {
+    bm25_full(
+        pool,
+        query,
+        team_filter,
+        user_filter,
+        project_filter,
+        limit,
+        MatchMode::Or,
+    )
+    .await
+}
+
+async fn bm25_full(
+    pool: &SqlitePool,
+    query: &str,
+    team_filter: Option<&str>,
+    user_filter: Option<&str>,
+    project_filter: Option<&str>,
+    limit: i64,
+    mode: MatchMode,
+) -> sqlx::Result<Vec<Hit>> {
     let match_expr = match mode {
         MatchMode::And => build_match(query),
         MatchMode::Or => build_or_match(query),
@@ -114,18 +148,24 @@ async fn bm25_with_mode(
             f.team_id,
             s.sanitized_cwd,
             s.session_uuid,
-            snippet(events_fts, 4, '<mark>', '</mark>', '…', 12) AS snippet,
+            snippet(events_fts, 6, '<mark>', '</mark>', '…', 12) AS snippet,
             bm25(events_fts) AS score
         FROM events_fts f
         JOIN sessions s USING (session_key)
         WHERE events_fts MATCH ?
-          AND (? IS NULL OR f.team_id = ?)
+          AND (? IS NULL OR f.team_id    = ?)
+          AND (? IS NULL OR f.user_id    = ?)
+          AND (? IS NULL OR f.project_id = ?)
         ORDER BY score
         LIMIT ?";
     let rows = sqlx::query(sql)
         .bind(&match_expr)
         .bind(team_filter)
         .bind(team_filter)
+        .bind(user_filter)
+        .bind(user_filter)
+        .bind(project_filter)
+        .bind(project_filter)
         .bind(limit)
         .fetch_all(pool)
         .await?;

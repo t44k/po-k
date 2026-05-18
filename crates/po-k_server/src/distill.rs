@@ -59,23 +59,26 @@ pub async fn distill_one(pool: &SqlitePool, topic_id: &str, llm: &dyn Llm) -> Re
         .with_context(|| format!("no topic with id '{topic_id}'"))?;
     info!(topic = topic_id, "starting distill");
 
-    // BM25 hits scoped to the topic's team. project / user filtering for the other
-    // three scope_kinds lands in M9.4 — for now we only support 'global'.
-    match topic.scope_kind.as_str() {
-        "global" => {}
-        "global-project" | "user" | "user-project" => {
-            info!(
-                topic = topic_id,
-                scope_kind = %topic.scope_kind,
-                "scope_kind not yet implemented by distillation (M9.4); skipping"
-            );
-            return Ok(());
-        }
+    // Pick BM25 filters per quadrant. The events.user_id / project_id columns are
+    // populated since M9.2 (collector) so each scope_kind maps cleanly onto a where
+    // clause via search::bm25_or_scoped.
+    let (user_filter, project_filter) = match topic.scope_kind.as_str() {
+        "global" => (None, None),
+        "global-project" => (None, topic.project_id.as_deref()),
+        "user" => (topic.user_id.as_deref(), None),
+        "user-project" => (topic.user_id.as_deref(), topic.project_id.as_deref()),
         other => anyhow::bail!("unknown scope_kind '{other}' on topic '{topic_id}'"),
-    }
-    let hits = search::bm25_or(pool, &topic.question, Some(&topic.team_id), EVIDENCE_HIT_LIMIT)
-        .await
-        .context("bm25 retrieval")?;
+    };
+    let hits = search::bm25_or_scoped(
+        pool,
+        &topic.question,
+        Some(&topic.team_id),
+        user_filter,
+        project_filter,
+        EVIDENCE_HIT_LIMIT,
+    )
+    .await
+    .context("bm25 retrieval")?;
     if hits.is_empty() {
         info!(topic = topic_id, "no evidence found, skipping");
         return Ok(());

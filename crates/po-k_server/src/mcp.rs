@@ -49,8 +49,8 @@ pub async fn handle(
         .get(HEADER_API_KEY)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let team_id: Option<String> = match auth::lookup(state.pool(), presented).await {
-        Ok(Some(ctx)) => Some(ctx.team_id),
+    let auth_ctx: Option<crate::auth::AuthCtx> = match auth::lookup(state.pool(), presented).await {
+        Ok(Some(ctx)) => Some(ctx),
         Ok(None) => None,
         Err(e) => {
             tracing::error!(error = %e, "mcp auth lookup failed");
@@ -94,9 +94,9 @@ pub async fn handle(
         // Common no-op notifications / pings we want to ack cleanly.
         "notifications/initialized" | "ping" => jsonrpc_ok(id, json!({})),
         "tools/list" => jsonrpc_ok(id, json!({ "tools": tool_definitions() })),
-        "tools/call" => match team_id.as_deref() {
-            Some(team) => {
-                let resp = handle_tool_call(&state, team, &req.params).await;
+        "tools/call" => match auth_ctx.as_ref() {
+            Some(ctx) => {
+                let resp = handle_tool_call(&state, ctx, &req.params).await;
                 match resp {
                     Ok(v) => jsonrpc_ok(id, v),
                     Err((code, msg)) => jsonrpc_error_resp(id, code, &msg, StatusCode::OK),
@@ -168,9 +168,12 @@ fn tool_definitions() -> Vec<Value> {
 
 async fn handle_tool_call(
     state: &AppState,
-    team: &str,
+    ctx: &crate::auth::AuthCtx,
     params: &Value,
 ) -> Result<Value, (i64, String)> {
+    let team = ctx.team_id.as_str();
+    let caller_user_id = ctx.user_id.as_str();
+    let is_admin = ctx.role.is_admin();
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -266,10 +269,27 @@ async fn handle_tool_call(
             }))
         }
         "list_topics" => {
-            let topics = topics::list_with_digests(state.pool(), team)
+            let all = topics::list_with_digests(state.pool(), team)
                 .await
                 .map_err(|e| (-32603, format!("topics list error: {e}")))?;
-            let items: Vec<Value> = topics
+            // Members see global / global-project topics and their own user-scoped
+            // ones; admin sees everything in the team.
+            let filtered: Vec<_> = all
+                .into_iter()
+                .filter(|t| {
+                    if is_admin {
+                        return true;
+                    }
+                    match t.topic.scope_kind.as_str() {
+                        "global" | "global-project" => true,
+                        "user" | "user-project" => {
+                            t.topic.user_id.as_deref() == Some(caller_user_id)
+                        }
+                        _ => false,
+                    }
+                })
+                .collect();
+            let items: Vec<Value> = filtered
                 .iter()
                 .map(|t| {
                     json!({
@@ -304,6 +324,14 @@ async fn handle_tool_call(
             };
             if t.topic.team_id != team {
                 return Err((-32001, "topic belongs to a different team".to_string()));
+            }
+            // Members can only read their own user-scoped topics.
+            let user_scoped = matches!(t.topic.scope_kind.as_str(), "user" | "user-project");
+            if user_scoped
+                && !is_admin
+                && t.topic.user_id.as_deref() != Some(caller_user_id)
+            {
+                return Err((-32001, "topic belongs to a different user".to_string()));
             }
             let evidence_count = serde_json::from_str::<Vec<Value>>(&t.evidence_event_ids)
                 .map(|v| v.len())
