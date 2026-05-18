@@ -50,6 +50,24 @@ pub struct Event {
     #[serde(default)]
     pub agent_id: String,
 
+    /// `last-prompt.leafUuid` of the most recent prompt boundary at the time this
+    /// event was read, threaded by the collector so every event in a turn shares
+    /// the same id. Empty when no prompt boundary has been observed yet.
+    #[serde(default)]
+    pub turn_id: String,
+
+    /// Original (unsanitized) `cwd` from the event when it carried one. `last-prompt`
+    /// / `permission-mode` events don't, so this is best-effort and inherits the
+    /// session's last seen cwd at the collector when missing.
+    #[serde(default)]
+    pub original_cwd: String,
+
+    /// Project slug resolved by the collector from `original_cwd` against its local
+    /// projects.toml. Empty when no rule matched — the server falls back to its
+    /// project_aliases table and ultimately to "unassigned".
+    #[serde(default)]
+    pub project_id: String,
+
     /// The original JSONL line, sans trailing newline.
     pub raw: String,
 }
@@ -108,8 +126,31 @@ impl Event {
             kind,
             is_sidechain,
             agent_id,
+            turn_id: String::new(),
+            original_cwd: String::new(),
+            project_id: String::new(),
             raw: text.to_string(),
         })
+    }
+
+    /// Pull the top-level `cwd` field out of the parsed raw line if present. Best-effort.
+    pub fn extract_cwd(&self) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(&self.raw).ok()?;
+        v.get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Pull `leafUuid` from a `last-prompt` event. Used by the collector to seed
+    /// the running turn_id for the file.
+    pub fn extract_last_prompt_leaf(&self) -> Option<String> {
+        if self.kind != kind::LAST_PROMPT {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(&self.raw).ok()?;
+        v.get("leafUuid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
     }
 }
 

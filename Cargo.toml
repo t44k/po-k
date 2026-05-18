@@ -38,6 +38,7 @@ clap = { version = "4", features = ["derive", "env"] }
 askama = "0.12"
 notify-debouncer-full = { version = "0.5", default-features = false }
 async-trait = "0.1"
+toml = "0.8"
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 
 [profile.release]

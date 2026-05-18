@@ -19,6 +19,10 @@ pub struct Watermark {
     pub head_hash: String,
     pub byte_offset: u64,
     pub line_no: u64,
+    /// Most recent `last-prompt.leafUuid` observed in this file, threaded through
+    /// across scan_file invocations so events after a resume still get the right
+    /// turn_id.
+    pub last_turn_id: String,
 }
 
 #[derive(Clone)]
@@ -44,45 +48,53 @@ impl WatermarkStore {
             .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS watermarks (
-                abs_path     TEXT PRIMARY KEY,
-                inode        INTEGER NOT NULL,
-                head_hash    TEXT NOT NULL,
-                byte_offset  INTEGER NOT NULL,
-                line_no      INTEGER NOT NULL,
-                updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+                abs_path      TEXT PRIMARY KEY,
+                inode         INTEGER NOT NULL,
+                head_hash     TEXT NOT NULL,
+                byte_offset   INTEGER NOT NULL,
+                line_no       INTEGER NOT NULL,
+                last_turn_id  TEXT NOT NULL DEFAULT '',
+                updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
             )",
         )
         .execute(&pool)
         .await?;
+        // Schema extension for collectors that already have a watermarks table from a
+        // previous version — additive, idempotent.
+        let _ = sqlx::query("ALTER TABLE watermarks ADD COLUMN last_turn_id TEXT NOT NULL DEFAULT ''")
+            .execute(&pool)
+            .await;
         Ok(Self { pool })
     }
 
     pub async fn get(&self, abs_path: &str) -> Result<Option<Watermark>> {
-        let row = sqlx::query_as::<_, (String, i64, String, i64, i64)>(
-            "SELECT abs_path, inode, head_hash, byte_offset, line_no
+        let row = sqlx::query_as::<_, (String, i64, String, i64, i64, String)>(
+            "SELECT abs_path, inode, head_hash, byte_offset, line_no, last_turn_id
              FROM watermarks WHERE abs_path = ?",
         )
         .bind(abs_path)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(abs_path, inode, head_hash, off, ln)| Watermark {
+        Ok(row.map(|(abs_path, inode, head_hash, off, ln, turn)| Watermark {
             abs_path,
             inode,
             head_hash,
             byte_offset: off as u64,
             line_no: ln as u64,
+            last_turn_id: turn,
         }))
     }
 
     pub async fn upsert(&self, wm: &Watermark) -> Result<()> {
         sqlx::query(
-            "INSERT INTO watermarks (abs_path, inode, head_hash, byte_offset, line_no)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO watermarks (abs_path, inode, head_hash, byte_offset, line_no, last_turn_id)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(abs_path) DO UPDATE SET
                 inode = excluded.inode,
                 head_hash = excluded.head_hash,
                 byte_offset = excluded.byte_offset,
                 line_no = excluded.line_no,
+                last_turn_id = excluded.last_turn_id,
                 updated_at = datetime('now')",
         )
         .bind(&wm.abs_path)
@@ -90,6 +102,7 @@ impl WatermarkStore {
         .bind(&wm.head_hash)
         .bind(wm.byte_offset as i64)
         .bind(wm.line_no as i64)
+        .bind(&wm.last_turn_id)
         .execute(&self.pool)
         .await?;
         Ok(())

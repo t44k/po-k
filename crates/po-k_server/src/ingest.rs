@@ -84,6 +84,37 @@ pub async fn ingest(
         return server_error(&format!("upsert machine: {e}"));
     }
 
+    // The collector ships project slugs; the schema stores deterministic ids
+    // (team || '__' || slug). Auto-create rows for any never-before-seen slug in
+    // this batch — admin can rename the label later via the projects UI.
+    let mut project_slugs: std::collections::HashSet<&str> = events
+        .iter()
+        .map(|e| e.project_id.as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for slug in project_slugs.drain() {
+        let pid = format!("{team_id}__{slug}");
+        if let Err(e) = sqlx::query(
+            "INSERT OR IGNORE INTO projects (id, team_id, slug, label) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&pid)
+        .bind(&team_id)
+        .bind(slug)
+        .bind(slug)
+        .execute(&mut *tx)
+        .await
+        {
+            return server_error(&format!("upsert project {slug}: {e}"));
+        }
+    }
+    let project_id_for = |slug: &str| -> Option<String> {
+        if slug.is_empty() {
+            None
+        } else {
+            Some(format!("{team_id}__{slug}"))
+        }
+    };
+
     let mut accepted: u64 = 0;
     let mut duplicates: u64 = 0;
     let mut to_publish: Vec<(String, String, String, Option<String>)> = Vec::new();
@@ -91,26 +122,43 @@ pub async fn ingest(
     for ev in &events {
         // Upsert session aggregate.
         let (sanitized_cwd, session_uuid) = split_session_path(&ev.file_relpath);
-        let original_cwd = extract_cwd_from_raw(&ev.raw);
+        // The collector now stamps original_cwd / project_id directly on the event.
+        // Fall back to extracting from raw only if the collector left it empty (older
+        // collectors). Empty strings → NULL in the column.
+        let original_cwd_owned;
+        let original_cwd: Option<&str> = if !ev.original_cwd.is_empty() {
+            Some(ev.original_cwd.as_str())
+        } else {
+            original_cwd_owned = extract_cwd_from_raw(&ev.raw);
+            original_cwd_owned.as_deref()
+        };
+        let project_id = project_id_for(&ev.project_id);
+        let turn_id: Option<&str> = if ev.turn_id.is_empty() {
+            None
+        } else {
+            Some(ev.turn_id.as_str())
+        };
 
         if let Err(e) = sqlx::query(
             "INSERT INTO sessions
-                (session_key, team_id, user_id, machine_id,
+                (session_key, team_id, user_id, project_id, machine_id,
                  sanitized_cwd, session_uuid, original_cwd,
                  first_event_at, last_event_at, event_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
              ON CONFLICT(session_key) DO UPDATE SET
                 first_event_at = COALESCE(MIN(first_event_at, excluded.first_event_at), first_event_at, excluded.first_event_at),
                 last_event_at  = COALESCE(MAX(last_event_at,  excluded.last_event_at),  last_event_at,  excluded.last_event_at),
-                original_cwd   = COALESCE(sessions.original_cwd, excluded.original_cwd)",
+                original_cwd   = COALESCE(sessions.original_cwd, excluded.original_cwd),
+                project_id     = COALESCE(sessions.project_id, excluded.project_id)",
         )
         .bind(ev.session_key.as_str())
         .bind(&team_id)
         .bind(&user_id)
+        .bind(project_id.as_deref())
         .bind(header.machine_id.as_str())
         .bind(&sanitized_cwd)
         .bind(&session_uuid)
-        .bind(original_cwd.as_deref())
+        .bind(original_cwd)
         .bind(&ev.timestamp)
         .bind(&ev.timestamp)
         .execute(&mut *tx)
@@ -123,8 +171,8 @@ pub async fn ingest(
             "INSERT OR IGNORE INTO events
              (session_key, file_relpath, line_no, byte_offset,
               team_id, user_id, project_id, original_cwd,
-              timestamp, kind, is_sidechain, agent_id, raw)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              timestamp, kind, is_sidechain, agent_id, turn_id, raw)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(ev.session_key.as_str())
         .bind(&ev.file_relpath)
@@ -132,12 +180,13 @@ pub async fn ingest(
         .bind(ev.byte_offset as i64)
         .bind(&team_id)
         .bind(&user_id)
-        .bind(Option::<String>::None) // project_id resolved in M9.2 from the collector's mapping
-        .bind(original_cwd.as_deref())
+        .bind(project_id.as_deref())
+        .bind(original_cwd)
         .bind(&ev.timestamp)
         .bind(&ev.kind)
         .bind(ev.is_sidechain as i64)
         .bind(&ev.agent_id)
+        .bind(turn_id)
         .bind(ev.raw.as_bytes())
         .execute(&mut *tx)
         .await;
@@ -156,7 +205,7 @@ pub async fn ingest(
                     .bind(ev.line_no as i64)
                     .bind(&team_id)
                     .bind(&user_id)
-                    .bind(Option::<String>::None)
+                    .bind(project_id.as_deref())
                     .bind(&ev.raw)
                     .execute(&mut *tx)
                     .await
