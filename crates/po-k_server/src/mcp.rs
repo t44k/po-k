@@ -153,6 +153,11 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
+            "name": "live_sessions",
+            "description": "List the team's currently-active Claude Code sessions with status (working / idle / waiting / stale / exited), active subagent counts, and running background-task counts. Heartbeats are reported by collectors every 5s; sessions with no heartbeat in the last 60s drop out. Use this to answer 'what is the user working on right now?'.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
             "name": "recall_topic",
             "description": "Fetch the current markdown digest for a topic — the distilled answer the team maintains across sessions. Returns the digest text, version, evidence count, and the topic question/scope. Use this BEFORE asking the user about a topic that may already have a maintained answer.",
             "inputSchema": {
@@ -229,6 +234,44 @@ async fn handle_tool_call(
                 "content": [{ "type": "text", "text": payload }],
                 "isError": false,
                 "structuredContent": { "projects": projects }
+            }))
+        }
+        "live_sessions" => {
+            let rows = sqlx::query(
+                "SELECT ls.session_key, ls.status, ls.active_subagents, ls.background_tasks,
+                        ls.updated_at, ls.heartbeat_at,
+                        s.session_uuid, s.sanitized_cwd, s.project_id
+                 FROM live_sessions ls
+                 JOIN sessions s ON s.session_key = ls.session_key
+                 WHERE s.team_id = ?
+                   AND ls.heartbeat_at > datetime('now', '-60 seconds')
+                 ORDER BY ls.heartbeat_at DESC",
+            )
+            .bind(team)
+            .fetch_all(state.pool())
+            .await
+            .map_err(|e| (-32603, format!("db error: {e}")))?;
+            let sessions: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "session_key":      r.try_get::<String, _>("session_key").unwrap_or_default(),
+                        "session_uuid":     r.try_get::<String, _>("session_uuid").unwrap_or_default(),
+                        "sanitized_cwd":    r.try_get::<String, _>("sanitized_cwd").unwrap_or_default(),
+                        "project_id":       r.try_get::<Option<String>, _>("project_id").unwrap_or_default(),
+                        "status":           r.try_get::<String, _>("status").unwrap_or_default(),
+                        "active_subagents": r.try_get::<i64, _>("active_subagents").unwrap_or(0),
+                        "background_tasks": r.try_get::<i64, _>("background_tasks").unwrap_or(0),
+                        "updated_at":       r.try_get::<Option<String>, _>("updated_at").unwrap_or_default(),
+                        "heartbeat_at":     r.try_get::<Option<String>, _>("heartbeat_at").unwrap_or_default(),
+                    })
+                })
+                .collect();
+            let payload = serde_json::to_string_pretty(&sessions).unwrap_or_default();
+            Ok(json!({
+                "content": [{ "type": "text", "text": payload }],
+                "isError": false,
+                "structuredContent": { "sessions": sessions }
             }))
         }
         "recent_sessions" => {
