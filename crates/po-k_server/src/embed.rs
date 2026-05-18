@@ -149,7 +149,7 @@ async fn index_one_batch(
 ) -> Result<usize> {
     // Pull a batch of un-embedded events. Skip noisy event kinds.
     let rows = sqlx::query(
-        "SELECT e.session_key, e.file_relpath, e.line_no, e.team_id, e.kind,
+        "SELECT e.session_key, e.file_relpath, e.line_no, e.team_id, e.user_id, e.project_id, e.kind,
                 CAST(e.raw AS TEXT) AS raw
          FROM events e
          LEFT JOIN events_embedding ev USING (session_key, file_relpath, line_no)
@@ -167,13 +167,16 @@ async fn index_one_batch(
     }
 
     // Build inputs by extracting searchable text from each event's raw line.
-    let mut keys: Vec<(String, String, i64, String)> = Vec::with_capacity(rows.len());
+    let mut keys: Vec<(String, String, i64, String, String, Option<String>)> =
+        Vec::with_capacity(rows.len());
     let mut inputs: Vec<String> = Vec::with_capacity(rows.len());
     for r in &rows {
         let session_key: String = r.try_get("session_key").unwrap_or_default();
         let file_relpath: String = r.try_get("file_relpath").unwrap_or_default();
         let line_no: i64 = r.try_get("line_no").unwrap_or(0);
         let team_id: String = r.try_get("team_id").unwrap_or_default();
+        let user_id: String = r.try_get("user_id").unwrap_or_default();
+        let project_id: Option<String> = r.try_get("project_id").ok();
         let raw: String = r.try_get("raw").unwrap_or_default();
         let extracted = distill::extract_searchable(&raw);
         // Embedders choke on empty inputs; replace with a sentinel.
@@ -182,7 +185,7 @@ async fn index_one_batch(
         } else {
             extracted
         };
-        keys.push((session_key, file_relpath, line_no, team_id));
+        keys.push((session_key, file_relpath, line_no, team_id, user_id, project_id));
         inputs.push(text);
     }
 
@@ -196,17 +199,21 @@ async fn index_one_batch(
     }
 
     let mut tx = pool.begin().await?;
-    for ((session_key, file_relpath, line_no, team_id), vec) in keys.iter().zip(vectors.iter()) {
+    for ((session_key, file_relpath, line_no, team_id, user_id, project_id), vec) in
+        keys.iter().zip(vectors.iter())
+    {
         let blob = encode_vec(vec);
         sqlx::query(
             "INSERT OR REPLACE INTO events_embedding
-             (session_key, file_relpath, line_no, team_id, vec, model)
-             VALUES (?, ?, ?, ?, ?, ?)",
+             (session_key, file_relpath, line_no, team_id, user_id, project_id, vec, model)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(session_key)
         .bind(file_relpath)
         .bind(line_no)
         .bind(team_id)
+        .bind(user_id)
+        .bind(project_id.as_deref())
         .bind(&blob)
         .bind(embedder.model_label())
         .execute(&mut *tx)
