@@ -25,11 +25,12 @@
 <p class="muted">No keys yet for this team.</p>
 {% else %}
 <table>
-  <thead><tr><th>hash prefix</th><th>label</th><th>created</th><th></th></tr></thead>
+  <thead><tr><th>hash prefix</th><th>user</th><th>label</th><th>created</th><th></th></tr></thead>
   <tbody>
   {% for r in rows %}
   <tr>
     <td><code>{{ r.hash_prefix }}…</code></td>
+    <td><code>{{ r.user_slug }}</code></td>
     <td>{{ r.label }}</td>
     <td class="muted">{{ r.created_at }}</td>
     <td>

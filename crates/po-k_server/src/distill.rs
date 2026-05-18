@@ -59,16 +59,23 @@ pub async fn distill_one(pool: &SqlitePool, topic_id: &str, llm: &dyn Llm) -> Re
         .with_context(|| format!("no topic with id '{topic_id}'"))?;
     info!(topic = topic_id, "starting distill");
 
-    // BM25 hits scoped to the topic's team. Project scoping is enforced after the
-    // BM25 query by filtering on sanitized_cwd — fts5 has no GROUP BY-friendly way
-    // to do this in a single query without joining sessions.
-    let mut hits = search::bm25_or(pool, &topic.question, Some(&topic.team_id), EVIDENCE_HIT_LIMIT)
+    // BM25 hits scoped to the topic's team. project / user filtering for the other
+    // three scope_kinds lands in M9.4 — for now we only support 'global'.
+    match topic.scope_kind.as_str() {
+        "global" => {}
+        "global-project" | "user" | "user-project" => {
+            info!(
+                topic = topic_id,
+                scope_kind = %topic.scope_kind,
+                "scope_kind not yet implemented by distillation (M9.4); skipping"
+            );
+            return Ok(());
+        }
+        other => anyhow::bail!("unknown scope_kind '{other}' on topic '{topic_id}'"),
+    }
+    let hits = search::bm25_or(pool, &topic.question, Some(&topic.team_id), EVIDENCE_HIT_LIMIT)
         .await
         .context("bm25 retrieval")?;
-    if topic.scope.starts_with("project:") {
-        let cwd = topic.scope.trim_start_matches("project:");
-        hits.retain(|h| h.sanitized_cwd == cwd);
-    }
     if hits.is_empty() {
         info!(topic = topic_id, "no evidence found, skipping");
         return Ok(());

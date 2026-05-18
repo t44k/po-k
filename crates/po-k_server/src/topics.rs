@@ -1,6 +1,6 @@
 //! Topics CRUD and read helpers shared between admin CLI, distillation, and MCP.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use std::path::PathBuf;
@@ -11,10 +11,37 @@ use crate::state::AppState;
 pub struct Topic {
     pub id: String,
     pub team_id: String,
-    pub scope: String,
+    pub scope_kind: String, // 'global' | 'global-project' | 'user' | 'user-project'
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub question: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt_extras: Option<String>,
+}
+
+impl Topic {
+    pub fn validate(&self) -> Result<()> {
+        let has_user = self.user_id.is_some();
+        let has_project = self.project_id.is_some();
+        let ok = match self.scope_kind.as_str() {
+            "global" => !has_user && !has_project,
+            "global-project" => !has_user && has_project,
+            "user" => has_user && !has_project,
+            "user-project" => has_user && has_project,
+            _ => false,
+        };
+        if !ok {
+            anyhow::bail!(
+                "scope_kind '{}' doesn't match (user_id is {:?}, project_id is {:?})",
+                self.scope_kind,
+                self.user_id,
+                self.project_id
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,25 +56,40 @@ pub struct TopicWithDigest {
     pub llm_model: String,
 }
 
+const TOPIC_COLUMNS: &str =
+    "id, team_id, scope_kind, user_id, project_id, question, system_prompt_extras";
+
+fn row_to_topic(r: &sqlx::sqlite::SqliteRow) -> Topic {
+    Topic {
+        id: r.try_get("id").unwrap_or_default(),
+        team_id: r.try_get("team_id").unwrap_or_default(),
+        scope_kind: r.try_get("scope_kind").unwrap_or_default(),
+        user_id: r.try_get("user_id").ok(),
+        project_id: r.try_get("project_id").ok(),
+        question: r.try_get("question").unwrap_or_default(),
+        system_prompt_extras: r.try_get("system_prompt_extras").ok(),
+    }
+}
+
 pub async fn add(pool: &SqlitePool, t: &Topic) -> Result<()> {
-    sqlx::query("INSERT OR IGNORE INTO teams (id, label) VALUES (?, ?)")
-        .bind(&t.team_id)
-        .bind(&t.team_id)
-        .execute(pool)
-        .await?;
+    t.validate()?;
     sqlx::query(
-        "INSERT INTO topics (id, team_id, scope, question, system_prompt_extras)
-         VALUES (?, ?, ?, ?, ?)
+        "INSERT INTO topics (id, team_id, scope_kind, user_id, project_id, question, system_prompt_extras)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             team_id = excluded.team_id,
-            scope = excluded.scope,
+            scope_kind = excluded.scope_kind,
+            user_id = excluded.user_id,
+            project_id = excluded.project_id,
             question = excluded.question,
             system_prompt_extras = excluded.system_prompt_extras,
             updated_at = datetime('now')",
     )
     .bind(&t.id)
     .bind(&t.team_id)
-    .bind(&t.scope)
+    .bind(&t.scope_kind)
+    .bind(t.user_id.as_deref())
+    .bind(t.project_id.as_deref())
     .bind(&t.question)
     .bind(t.system_prompt_extras.as_deref())
     .execute(pool)
@@ -56,48 +98,24 @@ pub async fn add(pool: &SqlitePool, t: &Topic) -> Result<()> {
 }
 
 pub async fn list(pool: &SqlitePool, team: Option<&str>) -> Result<Vec<Topic>> {
-    let rows = match team {
-        Some(t) => sqlx::query(
-            "SELECT id, team_id, scope, question, system_prompt_extras
-             FROM topics WHERE team_id = ? ORDER BY id",
-        )
-        .bind(t)
-        .fetch_all(pool)
-        .await?,
-        None => sqlx::query(
-            "SELECT id, team_id, scope, question, system_prompt_extras
-             FROM topics ORDER BY team_id, id",
-        )
-        .fetch_all(pool)
-        .await?,
-    };
-    Ok(rows
-        .into_iter()
-        .map(|r| Topic {
-            id: r.try_get("id").unwrap_or_default(),
-            team_id: r.try_get("team_id").unwrap_or_default(),
-            scope: r.try_get("scope").unwrap_or_default(),
-            question: r.try_get("question").unwrap_or_default(),
-            system_prompt_extras: r.try_get("system_prompt_extras").ok(),
-        })
-        .collect())
+    let sql = format!(
+        "SELECT {TOPIC_COLUMNS} FROM topics {} ORDER BY team_id, id",
+        if team.is_some() { "WHERE team_id = ?" } else { "" }
+    );
+    let mut q = sqlx::query(&sql);
+    if let Some(t) = team {
+        q = q.bind(t);
+    }
+    let rows = q.fetch_all(pool).await?;
+    Ok(rows.iter().map(row_to_topic).collect())
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Topic>> {
-    let row = sqlx::query(
-        "SELECT id, team_id, scope, question, system_prompt_extras
-         FROM topics WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|r| Topic {
-        id: r.try_get("id").unwrap_or_default(),
-        team_id: r.try_get("team_id").unwrap_or_default(),
-        scope: r.try_get("scope").unwrap_or_default(),
-        question: r.try_get("question").unwrap_or_default(),
-        system_prompt_extras: r.try_get("system_prompt_extras").ok(),
-    }))
+    let row = sqlx::query(&format!("SELECT {TOPIC_COLUMNS} FROM topics WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_topic))
 }
 
 pub async fn list_with_digests(
@@ -105,7 +123,8 @@ pub async fn list_with_digests(
     team: &str,
 ) -> Result<Vec<TopicWithDigest>> {
     let rows = sqlx::query(
-        "SELECT t.id, t.team_id, t.scope, t.question, t.system_prompt_extras,
+        "SELECT t.id, t.team_id, t.scope_kind, t.user_id, t.project_id,
+                t.question, t.system_prompt_extras,
                 COALESCE(d.version, 0) AS version,
                 COALESCE(d.digest_markdown, '') AS digest_markdown,
                 COALESCE(d.evidence_event_ids, '[]') AS evidence_event_ids,
@@ -123,13 +142,7 @@ pub async fn list_with_digests(
     Ok(rows
         .into_iter()
         .map(|r| TopicWithDigest {
-            topic: Topic {
-                id: r.try_get("id").unwrap_or_default(),
-                team_id: r.try_get("team_id").unwrap_or_default(),
-                scope: r.try_get("scope").unwrap_or_default(),
-                question: r.try_get("question").unwrap_or_default(),
-                system_prompt_extras: r.try_get("system_prompt_extras").ok(),
-            },
+            topic: row_to_topic(&r),
             version: r.try_get("version").unwrap_or(0),
             digest_markdown: r.try_get("digest_markdown").unwrap_or_default(),
             evidence_event_ids: r.try_get("evidence_event_ids").unwrap_or_default(),
@@ -145,7 +158,8 @@ pub async fn get_with_digest(
     id: &str,
 ) -> Result<Option<TopicWithDigest>> {
     let row = sqlx::query(
-        "SELECT t.id, t.team_id, t.scope, t.question, t.system_prompt_extras,
+        "SELECT t.id, t.team_id, t.scope_kind, t.user_id, t.project_id,
+                t.question, t.system_prompt_extras,
                 COALESCE(d.version, 0) AS version,
                 COALESCE(d.digest_markdown, '') AS digest_markdown,
                 COALESCE(d.evidence_event_ids, '[]') AS evidence_event_ids,
@@ -159,14 +173,8 @@ pub async fn get_with_digest(
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| TopicWithDigest {
-        topic: Topic {
-            id: r.try_get("id").unwrap_or_default(),
-            team_id: r.try_get("team_id").unwrap_or_default(),
-            scope: r.try_get("scope").unwrap_or_default(),
-            question: r.try_get("question").unwrap_or_default(),
-            system_prompt_extras: r.try_get("system_prompt_extras").ok(),
-        },
+    Ok(row.as_ref().map(|r| TopicWithDigest {
+        topic: row_to_topic(r),
         version: r.try_get("version").unwrap_or(0),
         digest_markdown: r.try_get("digest_markdown").unwrap_or_default(),
         evidence_event_ids: r.try_get("evidence_event_ids").unwrap_or_default(),
@@ -176,24 +184,72 @@ pub async fn get_with_digest(
     }))
 }
 
+/// Resolve `(user slug, project slug)` to their internal ids, looked up within the team.
+async fn resolve_scope_targets(
+    pool: &SqlitePool,
+    team: &str,
+    user_slug: Option<&str>,
+    project_slug: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    let user_id = match user_slug {
+        None => None,
+        Some(slug) => Some(
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM users WHERE team_id = ? AND slug = ?",
+            )
+            .bind(team)
+            .bind(slug)
+            .fetch_optional(pool)
+            .await?
+            .with_context(|| format!("no user '{slug}' in team '{team}'"))?,
+        ),
+    };
+    let project_id = match project_slug {
+        None => None,
+        Some(slug) => Some(
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM projects WHERE team_id = ? AND slug = ?",
+            )
+            .bind(team)
+            .bind(slug)
+            .fetch_optional(pool)
+            .await?
+            .with_context(|| format!("no project '{slug}' in team '{team}'"))?,
+        ),
+    };
+    Ok((user_id, project_id))
+}
+
 // ─── Admin CLI handlers ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn admin_add(
     db: PathBuf,
     id: String,
     question: String,
-    scope: String,
+    scope_kind: String,
     team: String,
+    user_slug: Option<String>,
+    project_slug: Option<String>,
     extras: Option<String>,
 ) -> Result<()> {
     let state = AppState::open(&db).await?;
     state.migrate().await?;
+    let (user_id, project_id) = resolve_scope_targets(
+        state.pool(),
+        &team,
+        user_slug.as_deref(),
+        project_slug.as_deref(),
+    )
+    .await?;
     add(
         state.pool(),
         &Topic {
             id: id.clone(),
             team_id: team,
-            scope,
+            scope_kind,
+            user_id,
+            project_id,
             question,
             system_prompt_extras: extras,
         },
@@ -212,8 +268,8 @@ pub async fn admin_list(db: PathBuf, team: String) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24}{:<10}{:<28}{:<8}{}",
-        "id", "ver", "scope", "team", "question"
+        "{:<24}{:<6}{:<16}{:<12}{:<12}{}",
+        "id", "ver", "scope_kind", "user", "project", "question"
     );
     for t in topics {
         let v = if t.version == 0 {
@@ -221,9 +277,11 @@ pub async fn admin_list(db: PathBuf, team: String) -> Result<()> {
         } else {
             t.version.to_string()
         };
+        let user = t.topic.user_id.as_deref().unwrap_or("—");
+        let proj = t.topic.project_id.as_deref().unwrap_or("—");
         println!(
-            "{:<24}{:<10}{:<28}{:<8}{}",
-            t.topic.id, v, t.topic.scope, t.topic.team_id, t.topic.question
+            "{:<24}{:<6}{:<16}{:<12}{:<12}{}",
+            t.topic.id, v, t.topic.scope_kind, user, proj, t.topic.question
         );
     }
     Ok(())

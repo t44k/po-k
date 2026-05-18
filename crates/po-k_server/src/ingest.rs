@@ -9,7 +9,7 @@ use po_k_core::Event;
 use po_k_proto::{BatchHeader, IngestResponse, SubagentMetaRow, HEADER_API_KEY};
 use sqlx::Acquire;
 
-use crate::auth;
+use crate::auth::{self, AuthCtx};
 use crate::state::AppState;
 
 pub async fn ingest(
@@ -17,10 +17,11 @@ pub async fn ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let team_id = match authenticate(&state, &headers).await {
-        Ok(t) => t,
+    let ctx = match authenticate(&state, &headers).await {
+        Ok(c) => c,
         Err(resp) => return resp,
     };
+    let AuthCtx { team_id, user_id, .. } = ctx;
 
     // Parse NDJSON: first line = header, rest = events.
     let mut lines = body.split(|b| *b == b'\n');
@@ -85,26 +86,31 @@ pub async fn ingest(
 
     let mut accepted: u64 = 0;
     let mut duplicates: u64 = 0;
-    // (session_key, kind, raw, timestamp) for events we accepted (not duplicates),
-    // so we can publish them onto the bus after commit. Sidechain events aren't
-    // published in v1 — live updates are main-session only.
     let mut to_publish: Vec<(String, String, String, Option<String>)> = Vec::new();
 
     for ev in &events {
         // Upsert session aggregate.
         let (sanitized_cwd, session_uuid) = split_session_path(&ev.file_relpath);
+        let original_cwd = extract_cwd_from_raw(&ev.raw);
+
         if let Err(e) = sqlx::query(
-            "INSERT INTO sessions (session_key, team_id, machine_id, sanitized_cwd, session_uuid, first_event_at, last_event_at, event_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            "INSERT INTO sessions
+                (session_key, team_id, user_id, machine_id,
+                 sanitized_cwd, session_uuid, original_cwd,
+                 first_event_at, last_event_at, event_count)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
              ON CONFLICT(session_key) DO UPDATE SET
                 first_event_at = COALESCE(MIN(first_event_at, excluded.first_event_at), first_event_at, excluded.first_event_at),
-                last_event_at  = COALESCE(MAX(last_event_at,  excluded.last_event_at),  last_event_at,  excluded.last_event_at)",
+                last_event_at  = COALESCE(MAX(last_event_at,  excluded.last_event_at),  last_event_at,  excluded.last_event_at),
+                original_cwd   = COALESCE(sessions.original_cwd, excluded.original_cwd)",
         )
         .bind(ev.session_key.as_str())
         .bind(&team_id)
+        .bind(&user_id)
         .bind(header.machine_id.as_str())
         .bind(&sanitized_cwd)
         .bind(&session_uuid)
+        .bind(original_cwd.as_deref())
         .bind(&ev.timestamp)
         .bind(&ev.timestamp)
         .execute(&mut *tx)
@@ -115,14 +121,19 @@ pub async fn ingest(
 
         let res = sqlx::query(
             "INSERT OR IGNORE INTO events
-             (session_key, file_relpath, line_no, byte_offset, team_id, timestamp, kind, is_sidechain, agent_id, raw)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (session_key, file_relpath, line_no, byte_offset,
+              team_id, user_id, project_id, original_cwd,
+              timestamp, kind, is_sidechain, agent_id, raw)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(ev.session_key.as_str())
         .bind(&ev.file_relpath)
         .bind(ev.line_no as i64)
         .bind(ev.byte_offset as i64)
         .bind(&team_id)
+        .bind(&user_id)
+        .bind(Option::<String>::None) // project_id resolved in M9.2 from the collector's mapping
+        .bind(original_cwd.as_deref())
         .bind(&ev.timestamp)
         .bind(&ev.kind)
         .bind(ev.is_sidechain as i64)
@@ -135,17 +146,17 @@ pub async fn ingest(
             Ok(r) => {
                 if r.rows_affected() == 1 {
                     accepted += 1;
-                    // Mirror into fts5 only on first insert so the index stays in
-                    // sync with the events table. INSERT OR IGNORE already handled
-                    // dedupe above; here we just record the new row.
                     if let Err(e) = sqlx::query(
-                        "INSERT INTO events_fts (session_key, file_relpath, line_no, team_id, raw)
-                         VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO events_fts
+                            (session_key, file_relpath, line_no, team_id, user_id, project_id, raw)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)",
                     )
                     .bind(ev.session_key.as_str())
                     .bind(&ev.file_relpath)
                     .bind(ev.line_no as i64)
                     .bind(&team_id)
+                    .bind(&user_id)
+                    .bind(Option::<String>::None)
                     .bind(&ev.raw)
                     .execute(&mut *tx)
                     .await
@@ -168,8 +179,7 @@ pub async fn ingest(
         }
     }
 
-    // Recompute event_count per touched session in this batch (small N per batch).
-    // For correctness over speed in M1; M2+ can incrementalize.
+    // Recompute event_count per touched session.
     let mut keys: Vec<&str> = events.iter().map(|e| e.session_key.as_str()).collect();
     keys.sort();
     keys.dedup();
@@ -190,8 +200,6 @@ pub async fn ingest(
         return server_error(&format!("commit: {e}"));
     }
 
-    // Publish accepted events onto the live bus. Render each to HTML on the way
-    // out so WebSocket subscribers can append it directly.
     for (session_key, kind, raw, ts) in &to_publish {
         if let Some(html) = crate::transcript::render_event_to_html(kind, raw, ts.as_deref()) {
             state.bus().publish(session_key, html);
@@ -233,13 +241,10 @@ pub async fn ingest_subagent_meta(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _team_id = match authenticate(&state, &headers).await {
-        Ok(t) => t,
+    let _ctx = match authenticate(&state, &headers).await {
+        Ok(c) => c,
         Err(resp) => return resp,
     };
-    // subagent_meta rows are joined to events via session_key, and session_key already
-    // encodes team boundaries (collector ships under its own team's key). No explicit
-    // team_id needed on these rows for M3.
 
     let mut rows: Vec<SubagentMetaRow> = Vec::new();
     let mut line_no: u64 = 0;
@@ -296,15 +301,15 @@ pub async fn ingest_subagent_meta(
         .into_response()
 }
 
-/// Pull the API key from the request, look it up, and return the bound team_id.
+/// Pull the API key from the request, look it up, and return the bound AuthCtx.
 /// On failure, returns a fully-rendered 401/500 response the caller can return as-is.
-async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthCtx, Response> {
     let key = headers
         .get(HEADER_API_KEY)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     match auth::lookup(state.pool(), key).await {
-        Ok(Some(ctx)) => Ok(ctx.team_id),
+        Ok(Some(ctx)) => Ok(ctx),
         Ok(None) => Err((
             StatusCode::UNAUTHORIZED,
             Json(IngestResponse::Error {
@@ -325,4 +330,14 @@ fn split_session_path(rel: &str) -> (String, String) {
     let second = it.next().unwrap_or("");
     let uuid = second.strip_suffix(".jsonl").unwrap_or(second).to_string();
     (cwd, uuid)
+}
+
+/// Pull the top-level `cwd` field out of a JSONL line if present. Not every event
+/// kind carries it (last-prompt, permission-mode don't), so the caller treats it
+/// as best-effort.
+fn extract_cwd_from_raw(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    v.get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }

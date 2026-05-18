@@ -9,8 +9,7 @@
          style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px">
   <input type="text" name="question" required placeholder="The question this digest should answer"
          style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px">
-  <input type="text" name="scope" placeholder="scope (default: team; or project:&lt;sanitized_cwd&gt;)"
-         style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px">
+  <p class="muted" style="margin:0">M9.1 topics are <code>global</code>-scope only. The full quadrant picker (global / global-project / user / user-project) lands in M9.5.</p>
   <textarea name="extras" rows="3" placeholder="(optional) extra system-prompt instructions to bias the digest style"
          style="background:var(--code-bg); border:1px solid var(--rule); color:var(--fg); padding:6px 10px; font-family:inherit; font-size:13px"></textarea>
   <div><button type="submit" class="load-more">add topic</button></div>
@@ -27,7 +26,7 @@
   <tr>
     <td><a href="/ui/admin/topic/{{ t.topic.id }}"><code>{{ t.topic.id }}</code></a></td>
     <td>{{ t.topic.question }}</td>
-    <td class="muted">{{ t.topic.scope }}</td>
+    <td class="muted">{{ t.topic.scope_kind }}{% if let Some(p) = t.topic.project_id.as_ref() %} · {{ p }}{% endif %}{% if let Some(u) = t.topic.user_id.as_ref() %} · {{ u }}{% endif %}</td>
     <td>{% if t.version == 0 %}<span class="muted">—</span>{% else %}{{ t.version }}{% endif %}</td>
     <td class="muted">{% if let Some(w) = t.written_at %}{{ w }}{% else %}—{% endif %}</td>
     <td class="muted">{{ t.llm_backend }}</td>

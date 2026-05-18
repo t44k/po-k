@@ -50,7 +50,8 @@ async fn current_admin(state: &AppState, headers: &HeaderMap) -> Option<AuthCtx>
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthCtx, Response> {
     match current_admin(state, headers).await {
-        Some(ctx) => Ok(ctx),
+        Some(ctx) if ctx.role.is_admin() => Ok(ctx),
+        Some(_) => Err((StatusCode::FORBIDDEN, "admin role required").into_response()),
         None => Err(Redirect::to("/ui/login").into_response()),
     }
 }
@@ -143,7 +144,12 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     let events = count_team(pool, "SELECT COUNT(*) FROM events WHERE team_id = ?", &team).await;
     let embedded = count_team(pool, "SELECT COUNT(*) FROM events_embedding WHERE team_id = ?", &team).await;
     let machines = count_team(pool, "SELECT COUNT(*) FROM machines WHERE team_id = ?", &team).await;
-    let keys = count_team(pool, "SELECT COUNT(*) FROM api_keys WHERE team_id = ?", &team).await;
+    let keys = count_team(
+        pool,
+        "SELECT COUNT(*) FROM api_keys k JOIN users u ON u.id = k.user_id WHERE u.team_id = ?",
+        &team,
+    )
+    .await;
     let topics = count_team(pool, "SELECT COUNT(*) FROM topics WHERE team_id = ?", &team).await;
     let digests = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM digests d JOIN topics t ON t.id = d.topic_id WHERE t.team_id = ?",
@@ -195,6 +201,7 @@ struct KeyRow {
     hash_prefix: String,
     label: String,
     created_at: String,
+    user_slug: String,
 }
 
 struct MintedKey {
@@ -228,24 +235,15 @@ pub async fn keys_post(
     if label.is_empty() {
         return render_keys(&state, &admin.team_id, None).await;
     }
-    let key = format!("pk_{}", uuid::Uuid::now_v7().simple());
-    let hash = auth::hash_api_key(&key);
-    if let Err(e) = sqlx::query(
-        "INSERT INTO api_keys (key_hash, team_id, label) VALUES (?, ?, ?)",
-    )
-    .bind(&hash)
-    .bind(&admin.team_id)
-    .bind(&label)
-    .execute(state.pool())
-    .await
-    {
-        return server_error(format!("insert key: {e}"));
-    }
+    let (plaintext, _hash) = match crate::bootstrap::mint_key_for(&admin.user_id, state.pool(), &label).await {
+        Ok(p) => p,
+        Err(e) => return server_error(format!("insert key: {e}")),
+    };
     render_keys(
         &state,
         &admin.team_id,
         Some(MintedKey {
-            plaintext: key,
+            plaintext,
             label,
         }),
     )
@@ -267,7 +265,8 @@ pub async fn keys_revoke(
         Err(r) => return r,
     };
     if let Err(e) = sqlx::query(
-        "DELETE FROM api_keys WHERE label = ? AND team_id = ?",
+        "DELETE FROM api_keys
+         WHERE label = ? AND user_id IN (SELECT id FROM users WHERE team_id = ?)",
     )
     .bind(&form.label)
     .bind(&admin.team_id)
@@ -281,8 +280,10 @@ pub async fn keys_revoke(
 
 async fn render_keys(state: &AppState, team: &str, minted: Option<MintedKey>) -> Response {
     let rows = match sqlx::query(
-        "SELECT substr(key_hash, 1, 12) AS hash_prefix, label, created_at
-         FROM api_keys WHERE team_id = ? ORDER BY created_at DESC",
+        "SELECT substr(k.key_hash, 1, 12) AS hash_prefix, k.label, k.created_at, u.slug AS user_slug
+         FROM api_keys k JOIN users u ON u.id = k.user_id
+         WHERE u.team_id = ?
+         ORDER BY k.created_at DESC",
     )
     .bind(team)
     .fetch_all(state.pool())
@@ -294,6 +295,7 @@ async fn render_keys(state: &AppState, team: &str, minted: Option<MintedKey>) ->
                 hash_prefix: r.try_get("hash_prefix").unwrap_or_default(),
                 label: r.try_get("label").unwrap_or_default(),
                 created_at: r.try_get("created_at").unwrap_or_default(),
+                user_slug: r.try_get("user_slug").unwrap_or_default(),
             })
             .collect(),
         Err(e) => return server_error(format!("list keys: {e}")),
@@ -325,8 +327,6 @@ struct TopicTpl {
 pub struct TopicForm {
     id: String,
     question: String,
-    #[serde(default)]
-    scope: String,
     #[serde(default)]
     extras: String,
 }
@@ -360,22 +360,21 @@ pub async fn topics_post(
     if id.is_empty() || question.is_empty() {
         return Redirect::to("/ui/admin/topics").into_response();
     }
-    let scope = if form.scope.trim().is_empty() {
-        "team".to_string()
-    } else {
-        form.scope.trim().to_string()
-    };
     let extras = if form.extras.trim().is_empty() {
         None
     } else {
         Some(form.extras.trim().to_string())
     };
+    // M9.1: topics created through the UI are global-only. The scope_kind picker
+    // (with user / project selectors) lands in M9.5.
     if let Err(e) = topics::add(
         state.pool(),
         &topics::Topic {
             id,
             team_id: admin.team_id,
-            scope,
+            scope_kind: "global".to_string(),
+            user_id: None,
+            project_id: None,
             question,
             system_prompt_extras: extras,
         },
@@ -511,25 +510,16 @@ pub async fn mcp_keygen(
     if label.is_empty() {
         return Redirect::to("/ui/admin/mcp").into_response();
     }
-    let key = format!("pk_{}", uuid::Uuid::now_v7().simple());
-    let hash = auth::hash_api_key(&key);
-    if let Err(e) = sqlx::query(
-        "INSERT INTO api_keys (key_hash, team_id, label) VALUES (?, ?, ?)",
-    )
-    .bind(&hash)
-    .bind(&admin.team_id)
-    .bind(&label)
-    .execute(state.pool())
-    .await
-    {
-        return server_error(format!("insert key: {e}"));
-    }
+    let (plaintext, _hash) = match crate::bootstrap::mint_key_for(&admin.user_id, state.pool(), &label).await {
+        Ok(p) => p,
+        Err(e) => return server_error(format!("insert key: {e}")),
+    };
     let server_url = detect_server_url(&headers);
     render(McpSetupTpl {
         team: admin.team_id,
         server_url,
         minted: Some(MintedKey {
-            plaintext: key,
+            plaintext,
             label,
         }),
     })

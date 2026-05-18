@@ -275,7 +275,9 @@ async fn handle_tool_call(
                     json!({
                         "id": t.topic.id,
                         "question": t.topic.question,
-                        "scope": t.topic.scope,
+                        "scope_kind": t.topic.scope_kind,
+                        "user_id": t.topic.user_id,
+                        "project_id": t.topic.project_id,
                         "version": t.version,
                         "written_at": t.written_at,
                         "llm_backend": t.llm_backend,
@@ -310,7 +312,9 @@ async fn handle_tool_call(
                 "topic": {
                     "id": t.topic.id,
                     "question": t.topic.question,
-                    "scope": t.topic.scope,
+                    "scope_kind": t.topic.scope_kind,
+                    "user_id": t.topic.user_id,
+                    "project_id": t.topic.project_id,
                 },
                 "version": t.version,
                 "written_at": t.written_at,

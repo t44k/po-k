@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod admin;
 mod auth;
+mod bootstrap;
 mod bus;
 mod distill;
 mod embed;
@@ -18,7 +19,7 @@ mod ui;
 
 use state::AppState;
 
-/// po-k_server — accepts NDJSON event batches from collectors and (later) serves UI + MCP.
+/// po-k_server — accepts NDJSON event batches from collectors and serves the UI + MCP.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -46,16 +47,38 @@ enum Cmd {
 
 #[derive(Debug, Subcommand)]
 enum AdminCmd {
-    /// Generate and print a new API key. The plaintext is shown ONCE — we store only its blake3 hash.
+    /// Create a user (and auto-mint their first API key, printed once).
+    UserAdd {
+        #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
+        db: PathBuf,
+        #[arg(long, default_value = "default")]
+        team: String,
+        #[arg(long)]
+        slug: String,
+        #[arg(long, value_parser = ["admin", "member"], default_value = "member")]
+        role: String,
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// List all users (optionally scoped to one team).
+    UserList {
+        #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
+        db: PathBuf,
+        #[arg(long)]
+        team: Option<String>,
+    },
+    /// Mint an additional API key for an existing user.
     Keygen {
         #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
         db: PathBuf,
         #[arg(long, default_value = "default")]
         team: String,
+        #[arg(long)]
+        user: String,
         #[arg(long, default_value = "")]
         label: String,
     },
-    /// List all stored API keys (label, team, created_at). No plaintext is recoverable.
+    /// List all stored API keys (hash prefix, user, label, created_at). No plaintext.
     ListKeys {
         #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
         db: PathBuf,
@@ -74,16 +97,14 @@ enum AdminCmd {
         #[command(subcommand)]
         cmd: TopicCmd,
     },
-    /// Run the distillation loop now. With no --id, processes every topic in turn.
+    /// Run the distillation loop now. With no --id, processes every topic.
     Distill {
         #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
         db: PathBuf,
         #[arg(long)]
         id: Option<String>,
-        /// LLM backend to use. One of: claude-cli, anthropic, openai.
         #[arg(long, env = "PO_K_LLM_BACKEND", default_value = "claude-cli")]
         backend: String,
-        /// Override the model for the chosen backend (e.g. claude-opus-4-7).
         #[arg(long, env = "PO_K_LLM_MODEL")]
         model: Option<String>,
     },
@@ -95,18 +116,25 @@ enum TopicCmd {
     Add {
         #[arg(long, env = "PO_K_DB", default_value = "po-k.db")]
         db: PathBuf,
-        /// kebab-case id, e.g. "auth-pattern".
         #[arg(long)]
         id: String,
-        /// The question/prompt the digest should keep answering.
         #[arg(long)]
         question: String,
-        /// "team" (default) or "project:<sanitized_cwd>".
-        #[arg(long, default_value = "team")]
-        scope: String,
+        /// One of: global, global-project, user, user-project.
+        #[arg(
+            long,
+            value_parser = ["global", "global-project", "user", "user-project"],
+            default_value = "global"
+        )]
+        scope_kind: String,
         #[arg(long, default_value = "default")]
         team: String,
-        /// Optional extra system prompt text appended to the LLM's instructions.
+        /// User slug (required when scope_kind starts with `user`).
+        #[arg(long)]
+        user: Option<String>,
+        /// Project slug (required when scope_kind ends with `project`).
+        #[arg(long)]
+        project: Option<String>,
         #[arg(long)]
         extras: Option<String>,
     },
@@ -139,27 +167,32 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Serve { db, listen } => run_server(db, listen).await,
         Cmd::Admin { cmd } => match cmd {
-            AdminCmd::Keygen { db, team, label } => admin_keygen(db, team, label).await,
-            AdminCmd::ListKeys { db, team } => admin_list_keys(db, team).await,
-            AdminCmd::Revoke { db, label } => admin_revoke(db, label).await,
+            AdminCmd::UserAdd { db, team, slug, role, label } => {
+                bootstrap::admin_user_add(db, team, slug, role, label).await
+            }
+            AdminCmd::UserList { db, team } => bootstrap::admin_user_list(db, team).await,
+            AdminCmd::Keygen { db, team, user, label } => {
+                bootstrap::admin_keygen(db, team, user, label).await
+            }
+            AdminCmd::ListKeys { db, team } => bootstrap::admin_list_keys(db, team).await,
+            AdminCmd::Revoke { db, label } => bootstrap::admin_revoke(db, label).await,
             AdminCmd::Topic { cmd } => match cmd {
                 TopicCmd::Add {
                     db,
                     id,
                     question,
-                    scope,
+                    scope_kind,
                     team,
+                    user,
+                    project,
                     extras,
-                } => topics::admin_add(db, id, question, scope, team, extras).await,
+                } => topics::admin_add(db, id, question, scope_kind, team, user, project, extras).await,
                 TopicCmd::List { db, team } => topics::admin_list(db, team).await,
                 TopicCmd::Remove { db, id } => topics::admin_remove(db, id).await,
             },
-            AdminCmd::Distill {
-                db,
-                id,
-                backend,
-                model,
-            } => distill::run_admin(db, id, backend, model).await,
+            AdminCmd::Distill { db, id, backend, model } => {
+                distill::run_admin(db, id, backend, model).await
+            }
         },
     }
 }
@@ -167,6 +200,9 @@ async fn main() -> Result<()> {
 async fn run_server(db: PathBuf, listen: String) -> Result<()> {
     let mut state = AppState::open(&db).await.context("opening database")?;
     state.migrate().await.context("running migrations")?;
+    bootstrap::ensure_bootstrap(state.pool())
+        .await
+        .context("bootstrap")?;
 
     // Try to load the embedder. On failure (network, ONNX runtime mismatch, etc.)
     // we just leave it unset — BM25-only search keeps working.
@@ -229,68 +265,5 @@ async fn run_server(db: PathBuf, listen: String) -> Result<()> {
         .with_context(|| format!("binding {listen}"))?;
     tracing::info!(%listen, "po-k_server listening");
     axum::serve(listener, app).await?;
-    Ok(())
-}
-
-async fn admin_keygen(db: PathBuf, team: String, label: String) -> Result<()> {
-    let state = AppState::open(&db).await?;
-    state.migrate().await?;
-    // Make sure the team exists; create it on the fly if not (the `default` team is
-    // already seeded, but operators may want named teams).
-    sqlx::query("INSERT OR IGNORE INTO teams (id, label) VALUES (?, ?)")
-        .bind(&team)
-        .bind(&team)
-        .execute(state.pool())
-        .await?;
-    let key = format!("pk_{}", uuid::Uuid::now_v7().simple());
-    let key_hash = auth::hash_api_key(&key);
-    sqlx::query("INSERT INTO api_keys (key_hash, team_id, label) VALUES (?, ?, ?)")
-        .bind(&key_hash)
-        .bind(&team)
-        .bind(&label)
-        .execute(state.pool())
-        .await?;
-    println!("{key}");
-    eprintln!("# saved with team={team} label={label}. This is shown ONCE.");
-    Ok(())
-}
-
-async fn admin_list_keys(db: PathBuf, team: Option<String>) -> Result<()> {
-    let state = AppState::open(&db).await?;
-    state.migrate().await?;
-    let rows = match team.as_deref() {
-        Some(t) => sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT substr(key_hash, 1, 12), team_id, label, created_at
-             FROM api_keys WHERE team_id = ? ORDER BY created_at",
-        )
-        .bind(t)
-        .fetch_all(state.pool())
-        .await?,
-        None => sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT substr(key_hash, 1, 12), team_id, label, created_at
-             FROM api_keys ORDER BY team_id, created_at",
-        )
-        .fetch_all(state.pool())
-        .await?,
-    };
-    if rows.is_empty() {
-        println!("(no keys)");
-    } else {
-        println!("{:<14}{:<14}{:<24}{}", "hash_prefix", "team", "label", "created_at");
-        for (h, team, label, created) in rows {
-            println!("{:<14}{:<14}{:<24}{}", h, team, label, created);
-        }
-    }
-    Ok(())
-}
-
-async fn admin_revoke(db: PathBuf, label: String) -> Result<()> {
-    let state = AppState::open(&db).await?;
-    state.migrate().await?;
-    let r = sqlx::query("DELETE FROM api_keys WHERE label = ?")
-        .bind(&label)
-        .execute(state.pool())
-        .await?;
-    println!("revoked {} key(s) with label '{label}'", r.rows_affected());
     Ok(())
 }
