@@ -3,7 +3,13 @@
 {% block crumbs %}<a href="/ui">projects</a> / <a href="/ui/project/{{ sanitized_cwd }}">{{ sanitized_cwd }}</a> / {{ session_uuid }}{% endblock %}
 {% block content %}
 <h2>{% match title %}{% when Some with (t) %}{{ t }}{% when None %}session{% endmatch %}
-  <span class="muted">· <span id="event-count">{{ event_count }}</span> events · machine {{ machine_id }} · <span id="live-status" class="muted">connecting…</span></span>
+  <span class="muted">·
+    <span id="event-count">{{ event_count }}</span> events ·
+    machine {{ machine_id }} ·
+    <span id="live-status" class="muted">connecting…</span> ·
+    <span id="cc-status" class="muted">cc&nbsp;status…</span>
+    <span id="cc-extras" class="muted"></span>
+  </span>
 </h2>
 
 <div id="transcript"
@@ -36,6 +42,37 @@
   function nearBottom() {
     return (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 80);
   }
+
+  // ── CC live status (3s poll of /api/sessions/:key/live) ────────────────────
+  const ccStatus = document.getElementById('cc-status');
+  const ccExtras = document.getElementById('cc-extras');
+  const PILL_COLOR = {
+    working:  'var(--user)',
+    idle:     'var(--muted)',
+    waiting:  'var(--accent)',
+    stale:    'var(--warn)',
+    exited:   'var(--muted)',
+    unknown:  'var(--muted)',
+  };
+  async function refreshCcStatus() {
+    try {
+      const r = await fetch(`/api/sessions/${sessionKey}/live`, { credentials: 'include' });
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      const data = await r.json();
+      const d = data.derived_status || 'unknown';
+      ccStatus.textContent = `cc ${d}`;
+      ccStatus.style.color = PILL_COLOR[d] || 'var(--muted)';
+      const bits = [];
+      if (data.active_subagents > 0) bits.push(`${data.active_subagents} subagent${data.active_subagents > 1 ? 's' : ''}`);
+      if (data.background_tasks > 0) bits.push(`${data.background_tasks} bg task${data.background_tasks > 1 ? 's' : ''}`);
+      ccExtras.textContent = bits.length ? ` · ${bits.join(' · ')}` : '';
+    } catch (e) {
+      ccStatus.textContent = 'cc ?';
+      ccStatus.style.color = 'var(--muted)';
+    }
+  }
+  refreshCcStatus();
+  setInterval(refreshCcStatus, 3000);
 
   // ── Live tail via WebSocket ────────────────────────────────────────────────
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';

@@ -59,6 +59,31 @@ pub struct SubagentMetaRow {
     pub description: Option<String>,
 }
 
+/// One heartbeat row, shipped via `POST /ingest/heartbeat`. Derived by the collector
+/// from `~/.claude/sessions/<pid>.json` plus a tiny fs stat over the session's
+/// subagent transcripts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRow {
+    pub session_key: String,
+    /// Original CC status string, e.g. "waiting", "exited". Empty if unknown.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub pid: Option<i64>,
+    /// CC's `startedAt` / `updatedAt` from sessions/<pid>.json (epoch ms or ISO; we
+    /// store as text — the server treats them as opaque).
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// agent-*.jsonl files modified in the recent past (default 30s window).
+    #[serde(default)]
+    pub active_subagents: u32,
+    /// Open tool_use events without a tool_result. v1 collectors report 0 here.
+    #[serde(default)]
+    pub background_tasks: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

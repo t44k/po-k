@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use po_k_core::Event;
-use po_k_proto::{BatchHeader, IngestResponse, SubagentMetaRow, HEADER_API_KEY};
+use po_k_proto::{BatchHeader, HeartbeatRow, IngestResponse, SubagentMetaRow, HEADER_API_KEY};
 use sqlx::Acquire;
 
 use crate::auth::{self, AuthCtx};
@@ -339,6 +339,80 @@ pub async fn ingest_subagent_meta(
     }
     if let Err(e) = tx.commit().await {
         return server_error(&format!("commit: {e}"));
+    }
+    (
+        StatusCode::OK,
+        Json(IngestResponse::Ok {
+            accepted,
+            duplicates: 0,
+        }),
+    )
+        .into_response()
+}
+
+pub async fn ingest_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let _ctx = match authenticate(&state, &headers).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    let mut rows: Vec<HeartbeatRow> = Vec::new();
+    let mut line_no: u64 = 0;
+    for raw in body.split(|b| *b == b'\n') {
+        if raw.is_empty() {
+            line_no += 1;
+            continue;
+        }
+        match serde_json::from_slice::<HeartbeatRow>(raw) {
+            Ok(r) => rows.push(r),
+            Err(e) => return bad_request(&format!("invalid heartbeat line: {e}"), Some(line_no)),
+        }
+        line_no += 1;
+    }
+
+    let mut conn = match state.pool().acquire().await {
+        Ok(c) => c,
+        Err(e) => return server_error(&format!("acquire conn: {e}")),
+    };
+    let mut tx = match conn.begin().await {
+        Ok(t) => t,
+        Err(e) => return server_error(&format!("begin tx: {e}")),
+    };
+    let mut accepted = 0u64;
+    for r in &rows {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO live_sessions
+                (session_key, status, pid, started_at, updated_at, background_tasks, active_subagents, heartbeat_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(session_key) DO UPDATE SET
+                status            = excluded.status,
+                pid               = excluded.pid,
+                started_at        = COALESCE(live_sessions.started_at, excluded.started_at),
+                updated_at        = excluded.updated_at,
+                background_tasks  = excluded.background_tasks,
+                active_subagents  = excluded.active_subagents,
+                heartbeat_at      = datetime('now')",
+        )
+        .bind(&r.session_key)
+        .bind(&r.status)
+        .bind(r.pid)
+        .bind(r.started_at.as_deref())
+        .bind(r.updated_at.as_deref())
+        .bind(r.background_tasks as i64)
+        .bind(r.active_subagents as i64)
+        .execute(&mut *tx)
+        .await
+        {
+            return server_error(&format!("upsert heartbeat: {e}"));
+        }
+        accepted += 1;
+    }
+    if let Err(e) = tx.commit().await {
+        return server_error(&format!("commit heartbeat: {e}"));
     }
     (
         StatusCode::OK,

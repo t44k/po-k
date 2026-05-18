@@ -12,6 +12,7 @@ use po_k_core::MachineId;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+mod heartbeat;
 mod meta;
 mod projects;
 mod scan;
@@ -98,6 +99,17 @@ async fn main() -> Result<()> {
 
     if cli.once {
         return Ok(());
+    }
+
+    // Heartbeat publisher runs alongside the live tailer. Skipped in --once mode
+    // (no live status to report when we're about to exit).
+    {
+        let shipper = shipper.clone();
+        let machine_id = machine_id.clone();
+        let projects_root = root.clone();
+        tokio::spawn(async move {
+            heartbeat::run(shipper, machine_id, projects_root, Duration::from_secs(5)).await;
+        });
     }
 
     run_live(root, store, shipper, machine_id, projects).await

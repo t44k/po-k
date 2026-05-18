@@ -228,6 +228,14 @@ async fn run_server(db: PathBuf, listen: String) -> Result<()> {
             "/ingest/subagent-meta",
             axum::routing::post(ingest::ingest_subagent_meta),
         )
+        .route(
+            "/ingest/heartbeat",
+            axum::routing::post(ingest::ingest_heartbeat),
+        )
+        .route(
+            "/api/sessions/:session_key/live",
+            axum::routing::get(ui::session_live),
+        )
         .route("/ui", axum::routing::get(ui::projects))
         .route("/ui/project/:sanitized_cwd", axum::routing::get(ui::sessions))
         .route("/ui/session/:session_key", axum::routing::get(ui::transcript))

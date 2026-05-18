@@ -340,6 +340,122 @@ async fn ws_loop(state: AppState, session_key: String, mut socket: WebSocket) {
     }
 }
 
+// ─── Live status JSON ────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, Default)]
+struct LiveStatus {
+    /// Pre-computed pill label: "working" | "idle" | "stale" | "exited" | "unknown".
+    derived_status: String,
+    /// Raw status from CC's sessions/<pid>.json (e.g. "waiting").
+    status: String,
+    pid: Option<i64>,
+    started_at: Option<String>,
+    updated_at: Option<String>,
+    active_subagents: i64,
+    background_tasks: i64,
+    heartbeat_at: Option<String>,
+}
+
+pub async fn session_live(
+    State(state): State<AppState>,
+    Path(session_key): Path<String>,
+) -> Response {
+    let row = match sqlx::query(
+        "SELECT status, pid, started_at, updated_at, active_subagents,
+                background_tasks, heartbeat_at
+         FROM live_sessions WHERE session_key = ?",
+    )
+    .bind(&session_key)
+    .fetch_optional(state.pool())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+    let payload = match row {
+        Some(r) => {
+            let status: String = r.try_get("status").unwrap_or_default();
+            let updated_at: Option<String> = r.try_get("updated_at").ok();
+            let heartbeat_at: Option<String> = r.try_get("heartbeat_at").ok();
+            let derived = derive_status(&status, updated_at.as_deref(), heartbeat_at.as_deref());
+            LiveStatus {
+                derived_status: derived,
+                status,
+                pid: r.try_get("pid").ok(),
+                started_at: r.try_get("started_at").ok(),
+                updated_at,
+                active_subagents: r.try_get("active_subagents").unwrap_or(0),
+                background_tasks: r.try_get("background_tasks").unwrap_or(0),
+                heartbeat_at,
+            }
+        }
+        None => LiveStatus {
+            derived_status: "unknown".into(),
+            status: "unknown".into(),
+            ..Default::default()
+        },
+    };
+    Json(payload).into_response()
+}
+
+fn derive_status(status: &str, updated_at: Option<&str>, heartbeat_at: Option<&str>) -> String {
+    let now = chrono::Utc::now();
+    let stale = match heartbeat_at.and_then(parse_text_to_epoch_secs) {
+        Some(t) => (now.timestamp() - t) > 30,
+        None => true,
+    };
+    if stale {
+        return "stale".into();
+    }
+    let lc = status.to_ascii_lowercase();
+    if lc == "exited" {
+        return "exited".into();
+    }
+    if lc == "busy" || lc == "working" || lc == "running" {
+        return "working".into();
+    }
+    if lc == "waiting" || lc == "idle" {
+        return "idle".into();
+    }
+    // Fall back to the "recently written" heuristic for CC versions that don't carry
+    // a busy/waiting distinction in sessions/<pid>.json.
+    let working = match updated_at.and_then(parse_text_to_epoch_secs) {
+        Some(t) => (now.timestamp() - t) < 5,
+        None => false,
+    };
+    if working {
+        "working".into()
+    } else if status.is_empty() {
+        "idle".into()
+    } else {
+        status.to_string()
+    }
+}
+
+/// Parse either epoch-ms (e.g. "1779107797964"), epoch-seconds, or an ISO-8601
+/// timestamp into Unix seconds. Best-effort; returns None on parse failure.
+fn parse_text_to_epoch_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        // Heuristic: anything bigger than year-3000 seconds is probably milliseconds.
+        if n > 32_503_680_000 {
+            return Some(n / 1000);
+        }
+        return Some(n);
+    }
+    // sqlite datetime('now') format: "YYYY-MM-DD HH:MM:SS"
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(dt.and_utc().timestamp());
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+    None
+}
+
 // ─── Search ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
