@@ -13,6 +13,7 @@ mod llm;
 mod mcp;
 mod search;
 mod state;
+mod stream;
 mod topics;
 mod transcript;
 mod ui;
@@ -277,6 +278,7 @@ async fn run_server(db: PathBuf, listen: String) -> Result<()> {
             axum::routing::post(admin::projects_admin_delete),
         )
         .route("/api/admin/live", axum::routing::get(admin::admin_live))
+        .route("/api/stream", axum::routing::get(stream::stream))
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(128 * 1024 * 1024))

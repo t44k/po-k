@@ -32,3 +32,5 @@ askama = { workspace = true }
 blake3 = { workspace = true }
 async-trait = { workspace = true }
 fastembed = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
