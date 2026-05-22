@@ -12,9 +12,13 @@ use clap::{Parser, Subcommand};
 
 mod cmd;
 mod config;
+mod distill;
 mod git;
 mod ipc;
+mod llm;
 mod state;
+mod text;
+mod turn;
 
 /// po-k — Claude Code companion (tap, distill, serve, bridge).
 #[derive(Debug, Parser)]

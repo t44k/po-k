@@ -30,6 +30,9 @@ struct Ctx {
     socket_path: PathBuf,
     state_path: PathBuf,
     state: Arc<Mutex<State>>,
+    /// Set when distillation has written something; the debounced pusher polls
+    /// this and runs `git push` once the debounce window expires.
+    push_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub async fn run(_args: Args) -> Result<()> {
@@ -63,12 +66,19 @@ pub async fn run(_args: Args) -> Result<()> {
         socket_path: socket_path.clone(),
         state_path: state_path.clone(),
         state: state.clone(),
+        push_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // Background tick: periodic git pull.
     {
         let ctx = ctx.clone();
         tokio::spawn(async move { periodic_pull(ctx).await });
+    }
+
+    // Background tick: debounced git push when distillation has written.
+    {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { periodic_push(ctx).await });
     }
 
     // Cleanly remove the socket on Ctrl-C / SIGTERM.
@@ -164,12 +174,100 @@ async fn dispatch(req: Request, ctx: &Ctx) -> Reply {
             Reply::Ok
         }
         Request::Hook { event, payload } => {
-            // M10.4 will route this; for now just log it so the wire round-trip
-            // is visible during smoke tests.
-            tracing::debug!(event = %event, payload = %payload, "received hook");
+            // Hook handling is fire-and-forget from the caller's perspective —
+            // CC blocks on the hook exit code. The actual distillation runs on
+            // a background task so the hook returns immediately.
+            let ctx2 = ctx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = on_hook(&event, &payload, &ctx2).await {
+                    let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+                    warn!(event = %event, chain = ?chain, "hook handler failed");
+                }
+            });
             Reply::Ok
         }
     }
+}
+
+async fn on_hook(event: &str, payload: &serde_json::Value, ctx: &Ctx) -> Result<()> {
+    // We only act on Stop today; UserPromptSubmit / PostToolUse / SubagentStop
+    // become inputs for the gateway in M10.7. Watermark + extract regardless of
+    // event so the gateway gets a free fan-out later.
+    if event != "Stop" {
+        tracing::debug!(event, "hook noted but not acted on");
+        return Ok(());
+    }
+    let Some(transcript_path) = payload.get("transcript_path").and_then(|x| x.as_str()) else {
+        warn!(event, "Stop hook missing transcript_path; skipping");
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(transcript_path);
+
+    // 1. Read the new JSONL slice since our last watermark for this file.
+    let prev_offset = {
+        let st = ctx.state.lock().await;
+        st.jsonl.get(&path).copied().unwrap_or(0)
+    };
+    let tail = tokio::task::spawn_blocking({
+        let p = path.clone();
+        move || crate::turn::tail(&p, prev_offset)
+    })
+    .await??;
+    if tail.turns.is_empty() {
+        tracing::debug!(transcript = %path.display(), "no new turns since last watermark");
+        // Persist the watermark anyway so a re-fire doesn't re-read.
+        let mut st = ctx.state.lock().await;
+        st.jsonl.insert(path.clone(), tail.new_offset);
+        let _ = crate::state::save(&ctx.state_path, &st);
+        return Ok(());
+    }
+    let last_turn = tail.turns.last().unwrap().clone();
+
+    // 2. If a repo is configured, run the distillation loop against the
+    //    last turn (the one this Stop event closes).
+    let Some(repo) = ctx.cfg.repo.as_ref() else {
+        tracing::debug!("no repo configured; skipping distillation");
+        let mut st = ctx.state.lock().await;
+        st.jsonl.insert(path.clone(), tail.new_offset);
+        let _ = crate::state::save(&ctx.state_path, &st);
+        return Ok(());
+    };
+    let repo_path = crate::config::expand_path(&repo.path);
+    if !repo_path.join(".git").exists() {
+        warn!(repo = %repo_path.display(), "repo not cloned yet; skipping distillation");
+        return Ok(());
+    }
+
+    let llm = match crate::llm::from_config(&ctx.cfg.llm.backend, ctx.cfg.llm.model.clone()) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(error = %e, "llm config failed; skipping distillation");
+            return Ok(());
+        }
+    };
+    let outcome = crate::distill::distill_turn(&repo_path, &ctx.cfg.topics, &last_turn, llm.as_ref())
+        .await
+        .context("distill_turn")?;
+    if !outcome.topics_updated.is_empty() {
+        info!(
+            turn = %last_turn.turn_id,
+            updated = ?outcome.topics_updated,
+            "distillation wrote topics; push scheduled"
+        );
+        ctx.push_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // 3. Commit the new watermark.
+    let mut st = ctx.state.lock().await;
+    st.jsonl.insert(path.clone(), tail.new_offset);
+    for id in &outcome.topics_updated {
+        st.topics
+            .entry(id.clone())
+            .or_default()
+            .last_distill_at = Some(crate::state::now_iso());
+    }
+    let _ = crate::state::save(&ctx.state_path, &st);
+    Ok(())
 }
 
 fn repo_counts(cfg: &Effective) -> (usize, usize) {
@@ -200,6 +298,52 @@ async fn periodic_pull(ctx: Ctx) {
     loop {
         tick.tick().await;
         do_pull(&ctx).await;
+    }
+}
+
+async fn periodic_push(ctx: Ctx) {
+    let Some(repo) = ctx.cfg.repo.as_ref() else { return };
+    let interval = repo.push_debounce;
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        if !ctx.push_pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        do_push(&ctx).await;
+    }
+}
+
+async fn do_push(ctx: &Ctx) {
+    let Some(repo_cfg) = ctx.cfg.repo.as_ref() else { return };
+    if !repo_cfg.push {
+        tracing::debug!("repo.push = false; skipping push");
+        return;
+    }
+    let path = crate::config::expand_path(&repo_cfg.path);
+    let result = tokio::task::spawn_blocking({
+        let p = path.clone();
+        move || git::push(&p)
+    })
+    .await;
+    match result {
+        Ok(Ok(out)) if out.ok() => {
+            info!(repo = %path.display(), "pushed");
+            let mut st = ctx.state.lock().await;
+            st.repos.entry(path.clone()).or_default().last_push_at = Some(state::now_iso());
+            let _ = state::save(&ctx.state_path, &st);
+        }
+        Ok(Ok(out)) => {
+            warn!(repo = %path.display(), stderr = %out.stderr.trim(), "git push failed");
+            // Retry next tick if the failure was transient.
+            ctx.push_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Err(e)) => {
+            warn!(repo = %path.display(), error = %e, "git push spawn failed");
+            ctx.push_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(e) => warn!(repo = %path.display(), error = %e, "push task panicked"),
     }
 }
 
