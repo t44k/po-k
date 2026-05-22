@@ -1,14 +1,16 @@
-//! `po-k mcp` — stdio JSON-RPC MCP server for Claude Code. M10.5 fills this in.
+//! `po-k mcp` — stdio JSON-RPC MCP server for Claude Code.
+//!
+//! Designed to be launched via `claude mcp add po-k -- po-k mcp`. Reads JSON-RPC
+//! requests from stdin (one per line) and writes responses to stdout.
 
 use anyhow::Result;
 use clap::Args as ClapArgs;
 
-/// Stdio MCP server. Designed to be launched by Claude Code via
-/// `claude mcp add po-k -- po-k mcp`. Exposes memory + skills as tools.
+use crate::mcp_server;
+
 #[derive(Debug, ClapArgs)]
 pub struct Args {}
 
 pub async fn run(_args: Args) -> Result<()> {
-    println!("po-k mcp — not yet implemented (M10.5)");
-    Ok(())
+    mcp_server::run().await
 }

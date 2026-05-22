@@ -16,6 +16,7 @@ mod distill;
 mod git;
 mod ipc;
 mod llm;
+mod mcp_server;
 mod state;
 mod text;
 mod turn;
