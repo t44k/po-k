@@ -349,6 +349,23 @@ async fn on_hook(event: &str, payload: &serde_json::Value, ctx: &Ctx) -> Result<
         ctx.push_pending.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // Skills auto-extraction. Best-effort and gated by a procedural-text
+    // heuristic so most turns short-circuit before reaching the LLM.
+    match crate::distill::extract_skill(&repo_path, &last_turn, llm.as_ref()).await {
+        Ok(Some(p)) => {
+            match crate::distill::apply_skill(&repo_path, &p, &last_turn.turn_id) {
+                Ok(true) => {
+                    info!(turn = %last_turn.turn_id, skill = %p.id, "extracted new skill");
+                    ctx.push_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(false) => tracing::debug!(skill = %p.id, "skill exists; left as-is"),
+                Err(e) => warn!(skill = %p.id, error = %e, "apply_skill failed"),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "extract_skill failed"),
+    }
+
     // 3. Commit the new watermark.
     let mut st = ctx.state.lock().await;
     st.jsonl.insert(path.clone(), tail.new_offset);

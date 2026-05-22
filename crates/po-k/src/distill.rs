@@ -133,6 +133,135 @@ fn git_commit_topic(repo_root: &Path, target: &PathBuf, topic_id: &str, turn_id:
     Ok(())
 }
 
+// ─── skills auto-extraction ──────────────────────────────────────────────────
+
+/// Heuristic gate: only ask the LLM for skill extraction if the turn looks
+/// procedural (mentions a verb like deploy / restart / build / test / run AND
+/// references at least one shell command snippet).
+fn looks_procedural(turn: &Turn) -> bool {
+    let lower = turn.searchable.to_lowercase();
+    let has_verb = ["deploy", "restart", "build", "test", "release", "rollback", "install", "configure", "migrate"]
+        .iter()
+        .any(|v| lower.contains(v));
+    let has_command = lower.contains('`')
+        || lower.contains("./")
+        || lower.contains("$ ")
+        || lower.contains("cargo ")
+        || lower.contains("make ")
+        || lower.contains("npm ");
+    has_verb && has_command
+}
+
+/// Output of one skill-extraction call.
+#[derive(Debug, Clone)]
+pub struct SkillProposal {
+    pub id: String,
+    pub markdown: String,
+}
+
+/// Ask the LLM whether this turn introduces a reusable how-to. If yes, return
+/// a (skill_id, markdown) pair; if not (or on parse failure), return None.
+pub async fn extract_skill(
+    repo_root: &Path,
+    turn: &Turn,
+    llm: &dyn Llm,
+) -> Result<Option<SkillProposal>> {
+    if !looks_procedural(turn) {
+        return Ok(None);
+    }
+    let skills_dir = repo_root.join("skills");
+    std::fs::create_dir_all(&skills_dir).ok();
+    let existing_ids = list_md_ids(&skills_dir);
+    let existing_list = if existing_ids.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        existing_ids.join(", ")
+    };
+    let system = "You extract reusable team SKILLS — small how-to procedures (deploy, restart, \
+                   migrate, etc.) — from a Claude Code turn.\n\
+                   If the turn covers a procedure NOT already in the existing skills list, \
+                   reply with EXACTLY this format:\n\n\
+                   <kebab-case-id>\n\
+                   ---\n\
+                   <full markdown body, no preface>\n\n\
+                   Otherwise reply with the single word NOSKILL.";
+    let user = format!(
+        "# Existing skill ids\n{existing_list}\n\n# Turn evidence\n{evidence}",
+        evidence = trim_to_budget(&turn.searchable, EVIDENCE_BUDGET_CHARS),
+    );
+    let raw = llm.complete(system, &user).await?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "NOSKILL" || trimmed.starts_with("NOSKILL") {
+        return Ok(None);
+    }
+    let (id_line, body) = match trimmed.split_once("\n---\n") {
+        Some((a, b)) => (a.trim(), b.trim()),
+        // Fall back: first line = id, rest = body.
+        None => match trimmed.split_once('\n') {
+            Some((a, b)) => (a.trim(), b.trim()),
+            None => return Ok(None),
+        },
+    };
+    let id = id_line.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
+    if id.is_empty() || body.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SkillProposal {
+        id: id.to_string(),
+        markdown: body.to_string(),
+    }))
+}
+
+/// Apply a skill proposal: write the file if it doesn't already exist (we never
+/// overwrite existing skills automatically — that's a user-driven concern), git
+/// add + commit on a new file.
+pub fn apply_skill(
+    repo_root: &Path,
+    proposal: &SkillProposal,
+    turn_id: &str,
+) -> Result<bool> {
+    let skills_dir = repo_root.join("skills");
+    std::fs::create_dir_all(&skills_dir).ok();
+    let target = skills_dir.join(format!("{}.md", proposal.id));
+    if target.exists() {
+        return Ok(false);
+    }
+    std::fs::write(&target, format!("{}\n", proposal.markdown))
+        .with_context(|| format!("writing {}", target.display()))?;
+    let pathspec = target
+        .strip_prefix(repo_root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| target.to_string_lossy().to_string());
+    let add = git::add(repo_root, &pathspec)?;
+    if !add.ok() {
+        anyhow::bail!("git add failed: {}", add.stderr.trim());
+    }
+    let msg = if turn_id.is_empty() {
+        format!("po-k: add skill {}", proposal.id)
+    } else {
+        format!("po-k: add skill {} after turn {turn_id}", proposal.id)
+    };
+    let commit = git::commit(repo_root, &msg)?;
+    if !commit.ok() {
+        let s = commit.stderr.clone() + &commit.stdout;
+        if s.contains("nothing to commit") {
+            return Ok(true);
+        }
+        anyhow::bail!("git commit failed: {}", s.trim());
+    }
+    Ok(true)
+}
+
+fn list_md_ids(dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    rd.flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".md").map(str::to_string)
+        })
+        .collect()
+}
+
 fn trim_to_budget(s: &str, budget: usize) -> String {
     if s.len() <= budget {
         return s.to_string();
@@ -223,6 +352,47 @@ mod tests {
             .unwrap();
         let log = String::from_utf8_lossy(&log.stdout);
         assert!(log.contains("update testing-conventions"), "log was:\n{log}");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[tokio::test]
+    async fn skill_proposal_written_when_procedural() {
+        let repo = tmp_repo();
+        let turn = Turn {
+            turn_id: "t-skill".into(),
+            raw_lines: vec![],
+            // Procedural verb + a command snippet trip looks_procedural.
+            searchable: "To deploy run `make deploy` after CI is green.".into(),
+        };
+        let llm = MockLlm {
+            reply: "deploy-prod\n---\n# Deploy to prod\n\n- Wait for CI green\n- Run `make deploy`".into(),
+        };
+        let proposal = extract_skill(&repo, &turn, &llm).await.unwrap().unwrap();
+        assert_eq!(proposal.id, "deploy-prod");
+        let landed = apply_skill(&repo, &proposal, &turn.turn_id).unwrap();
+        assert!(landed);
+        let written = std::fs::read_to_string(repo.join("skills/deploy-prod.md")).unwrap();
+        assert!(written.contains("make deploy"));
+        // Second apply with the same id is a no-op.
+        let again = apply_skill(&repo, &proposal, "").unwrap();
+        assert!(!again);
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[tokio::test]
+    async fn skill_skipped_when_not_procedural() {
+        let repo = tmp_repo();
+        let turn = Turn {
+            turn_id: "t-x".into(),
+            raw_lines: vec![],
+            searchable: "Just a chat about the weather.".into(),
+        };
+        // LLM should NOT be called; reply would be ignored anyway.
+        let llm = MockLlm {
+            reply: "should not be used".into(),
+        };
+        let p = extract_skill(&repo, &turn, &llm).await.unwrap();
+        assert!(p.is_none());
         std::fs::remove_dir_all(&repo).ok();
     }
 
