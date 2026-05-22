@@ -1,18 +1,42 @@
 //! Bare `po-k` — prints help context + a one-screen status block.
 //!
-//! Right now the status is sparse because the service / config / repo aren't wired
-//! up yet (M10.2+). The shape is locked: `service · repo · topics · skills`.
+//! Reads `~/.config/po-k/po-k.yaml` (treats missing as "not yet init'd") and reports:
+//!   service state (M10.3), repo presence + last-pull (M10.2 partial), topic + skill
+//!   counts derived from markdown files in the cloned repo.
 
 use anyhow::Result;
 
+use crate::config;
+
 pub async fn run() -> Result<()> {
+    let s = config::status();
+
     println!("po-k {} — Claude Code companion", env!("CARGO_PKG_VERSION"));
     println!();
     println!("status");
+    if !s.config_exists {
+        println!(
+            "  config:  missing — run `po-k init` (would write {})",
+            s.config_path.display()
+        );
+    } else {
+        println!("  config:  {}", s.config_path.display());
+    }
     println!("  service: not-yet-implemented (M10.3)");
-    println!("  repo:    not-yet-cloned     (M10.2)");
-    println!("  topics:  0                  (M10.4)");
-    println!("  skills:  0                  (M10.8)");
+    match (s.repo_path.as_ref(), s.repo_present) {
+        (Some(p), true) => {
+            let last = s.last_pull.as_deref().unwrap_or("unknown");
+            println!("  repo:    {} (last pull: {last})", p.display());
+        }
+        (Some(p), false) => {
+            println!("  repo:    {} (not cloned — run `po-k init`)", p.display());
+        }
+        (None, _) => {
+            println!("  repo:    (no `repo:` block in config)");
+        }
+    }
+    println!("  topics:  {}", s.topic_count);
+    println!("  skills:  {}", s.skill_count);
     println!();
     println!("subcommands  (`po-k <subcommand> --help` for details)");
     println!("  init      first-run setup: config, repo clone, hook install");

@@ -11,6 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod cmd;
+mod config;
 
 /// po-k — Claude Code companion (tap, distill, serve, bridge).
 #[derive(Debug, Parser)]
