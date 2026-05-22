@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 mod cmd;
 mod config;
 mod distill;
+mod gateway_proto;
 mod git;
 mod ipc;
 mod llm;

@@ -25,6 +25,10 @@ pub enum Request {
     },
     /// Trigger an immediate `git pull` of the primary + nested repos.
     PullNow,
+    /// Long-lived gateway connection: opens a stream of `Event` JSONL frames.
+    /// Replies aren't structured Reply enum values — we hijack the socket for
+    /// streaming. The handler stays in `on_subscribe` until the client closes.
+    Subscribe,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -16,6 +16,7 @@ use crate::config::{self, Effective};
 use crate::git;
 use crate::ipc::{self, Reply, Request};
 use crate::state::{self, State};
+use tokio::sync::broadcast;
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -33,6 +34,8 @@ struct Ctx {
     /// Set when distillation has written something; the debounced pusher polls
     /// this and runs `git push` once the debounce window expires.
     push_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// In-memory broadcast of hook + tail events for gateway subscribers.
+    events: broadcast::Sender<String>,
 }
 
 pub async fn run(_args: Args) -> Result<()> {
@@ -61,12 +64,14 @@ pub async fn run(_args: Args) -> Result<()> {
         .with_context(|| format!("binding {}", socket_path.display()))?;
     info!(socket = %socket_path.display(), pid = std::process::id(), "po-k service listening");
 
+    let (event_tx, _) = broadcast::channel::<String>(256);
     let ctx = Ctx {
         cfg,
         socket_path: socket_path.clone(),
         state_path: state_path.clone(),
         state: state.clone(),
         push_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        events: event_tx,
     };
 
     // Background tick: periodic git pull.
@@ -127,8 +132,44 @@ async fn handle_connection(stream: UnixStream, ctx: Ctx) -> Result<()> {
         }
     };
 
+    // Streaming Subscribe gets a dedicated handler; everything else is single
+    // request → single reply → close.
+    if matches!(req, Request::Subscribe) {
+        return on_subscribe(wh, &ctx).await;
+    }
     let reply = dispatch(req, &ctx).await;
     write_reply(&mut wh, &reply).await?;
+    Ok(())
+}
+
+async fn on_subscribe(
+    mut wh: tokio::net::unix::OwnedWriteHalf,
+    ctx: &Ctx,
+) -> Result<()> {
+    let mut rx = ctx.events.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(frame) => {
+                if wh.write_all(frame.as_bytes()).await.is_err() {
+                    break;
+                }
+                if wh.write_all(b"\n").await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                let _ = wh
+                    .write_all(
+                        format!(
+                            "{{\"type\":\"event\",\"kind\":\"lag\",\"missed\":{n}}}\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
     Ok(())
 }
 
@@ -179,6 +220,9 @@ async fn dispatch(req: Request, ctx: &Ctx) -> Reply {
             // a background task so the hook returns immediately.
             let ctx2 = ctx.clone();
             tokio::spawn(async move {
+                // Publish raw hook to gateway subscribers first; even if
+                // distillation fails the remote should still see the event.
+                publish_hook_to_gateway(&event, &payload, &ctx2);
                 if let Err(e) = on_hook(&event, &payload, &ctx2).await {
                     let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
                     warn!(event = %event, chain = ?chain, "hook handler failed");
@@ -186,6 +230,54 @@ async fn dispatch(req: Request, ctx: &Ctx) -> Reply {
             });
             Reply::Ok
         }
+        Request::Subscribe => unreachable!("handled in handle_connection"),
+    }
+}
+
+/// Convert a hook payload into one or more outbound JSONL frames for the
+/// gateway subscribers. For Stop / SubagentStop we surface the assistant text;
+/// for UserPromptSubmit the user prompt; PostToolUse the tool input + result
+/// snippet. Per-tool details that CC doesn't put in the hook payload are
+/// streamed separately by the JSONL-tail step inside on_hook.
+fn publish_hook_to_gateway(event: &str, payload: &serde_json::Value, ctx: &Ctx) {
+    if ctx.events.receiver_count() == 0 {
+        return;
+    }
+    let project = payload
+        .get("cwd")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    let session_id = payload
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    let kind = match event {
+        "Stop" => "assistant_message",
+        "SubagentStop" => "subagent_stop",
+        "UserPromptSubmit" => "user_prompt",
+        "PostToolUse" => "tool_result",
+        other => other,
+    };
+    let mut value = serde_json::json!({
+        "type": "event",
+        "kind": kind,
+        "session_id": session_id,
+    });
+    if let Some(p) = project {
+        value["project_cwd"] = serde_json::Value::String(p);
+    }
+    // Pull the most useful per-event field from the payload directly.
+    if let Some(text) = payload.get("last_assistant_message").and_then(|x| x.as_str()) {
+        value["text"] = serde_json::Value::String(text.to_string());
+    }
+    if let Some(text) = payload.get("user_prompt").and_then(|x| x.as_str()) {
+        value["text"] = serde_json::Value::String(text.to_string());
+    }
+    if let Some(name) = payload.get("tool_name").and_then(|x| x.as_str()) {
+        value["tool_name"] = serde_json::Value::String(name.to_string());
+    }
+    if let Ok(line) = serde_json::to_string(&value) {
+        let _ = ctx.events.send(line);
     }
 }
 
