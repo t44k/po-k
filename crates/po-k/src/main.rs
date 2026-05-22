@@ -17,9 +17,11 @@ mod git;
 mod ipc;
 mod llm;
 mod mcp_server;
+mod project_discovery;
 mod state;
 mod text;
 mod turn;
+mod zellij;
 
 /// po-k — Claude Code companion (tap, distill, serve, bridge).
 #[derive(Debug, Parser)]
