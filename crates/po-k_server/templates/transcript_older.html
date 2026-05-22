@@ -1,6 +1,0 @@
-{# Fragment response: chronologically ordered turns plus an HTML comment carrying
-   the new oldest-cursor for the client. The browser parses that comment with a
-   regex; it survives askama escaping because we're not in an HTML attribute. #}
-{% for h in turns_html %}{{ h|safe }}
-{% endfor %}
-<!-- oldest-cursor: {% if let Some(c) = oldest_cursor %}{{ c }}{% else %}-1{% endif %} -->
