@@ -1,6 +1,6 @@
-//! POST /sessions/:id/messages — write text into the pane (with trailing \n).
+//! POST /sessions/:id/messages — write text into the pane (with trailing \r).
 //! POST /sessions/:id/interrupt — write ESC.
-//! POST /sessions/:id/clear     — write `/clear\n`.
+//! POST /sessions/:id/clear     — write `/clear\r`.
 //! POST /sessions/:id/files     — drop a base64 file into <cwd>/.po-k-inbox/.
 
 use axum::extract::{Path, State};
@@ -11,9 +11,15 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::state::AppState;
 use crate::zellij;
+
+/// How long to wait for CC's `❯` prompt before giving up on a write. Generous
+/// because a cold opus boot — or finishing a long in-flight turn — can take a
+/// while, and silently dropping the input is worse than blocking.
+const READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Deserialize)]
 pub struct MessageBody {
@@ -26,8 +32,12 @@ pub async fn message(
     Json(body): Json<MessageBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let zs = require_session(&state, &sid).await?.zellij_session;
-    let payload = format!("{}\n", body.text);
-    zellij::write_chars(&zs, &payload).await.map_err(zellij_err)?;
+    // CC silently drops input typed before its REPL is ready, and it only
+    // writes the transcript JSONL after the first *submitted* prompt — so block
+    // until the ❯ prompt is on screen before sending anything.
+    zellij::wait_for_cc_prompt(&zs, READY_TIMEOUT).await.map_err(zellij_err)?;
+    let payload = format!("{}\r", body.text);
+    zellij::write_to_focused_pane(&zs, &payload).await.map_err(zellij_err)?;
     Ok(Json(json!({ "ok": true, "bytes": payload.len() })))
 }
 
@@ -36,7 +46,7 @@ pub async fn interrupt(
     Path(sid): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let zs = require_session(&state, &sid).await?.zellij_session;
-    zellij::write_chars(&zs, "\x1b").await.map_err(zellij_err)?;
+    zellij::send_escape(&zs).await.map_err(zellij_err)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -45,7 +55,8 @@ pub async fn clear(
     Path(sid): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let zs = require_session(&state, &sid).await?.zellij_session;
-    zellij::write_chars(&zs, "/clear\n").await.map_err(zellij_err)?;
+    zellij::wait_for_cc_prompt(&zs, READY_TIMEOUT).await.map_err(zellij_err)?;
+    zellij::write_to_focused_pane(&zs, "/clear\r").await.map_err(zellij_err)?;
     Ok(Json(json!({ "ok": true })))
 }
 

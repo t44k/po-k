@@ -8,6 +8,13 @@
 //! for the file to appear, opens it, reads new bytes as CC appends, parses
 //! each line as JSON, and projects each into a typed event in the `events`
 //! table.
+//!
+//! **Timing:** CC does *not* create the transcript at launch — it appears only
+//! ~immediately after the first *submitted* prompt. A freshly spawned session
+//! can therefore sit idle (no transcript on disk) for as long as the
+//! orchestrator takes to send its first message. So we wait for the file for
+//! as long as the session is alive rather than against a fixed deadline; the
+//! tailer exits cleanly if the session is killed before it ever sends input.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -18,37 +25,26 @@ use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom};
 
 use crate::event_bus::EventBus;
 use crate::events_store::{self, Db};
+use crate::session::Registry;
 
-const FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub fn spawn(db: Db, bus: EventBus, sid: String, cwd: String) {
+pub fn spawn(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String) {
     tokio::spawn(async move {
-        if let Err(e) = run(db, bus, sid.clone(), cwd).await {
+        if let Err(e) = run(db, bus, sessions, sid.clone(), cwd).await {
             tracing::warn!(sid, error = %e, "jsonl tailer exited");
         }
     });
 }
 
-async fn run(db: Db, bus: EventBus, sid: String, cwd: String) -> Result<()> {
+async fn run(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String) -> Result<()> {
     let path = transcript_path(&cwd, &sid)?;
-    let path = match wait_for_file(&path).await {
+    let path = match wait_for_file(&path, &sessions, &sid).await {
         Some(p) => p,
         None => {
-            if events_store::append_event(
-                &db,
-                &sid,
-                &events_store::now_iso(),
-                "cc_failed_to_start",
-                &json!({
-                    "expected_transcript": path.to_string_lossy(),
-                    "reason": "jsonl never appeared",
-                }),
-            )
-            .await
-            .is_ok()
-            {
-                bus.notify(&sid).await;
-            }
+            // Session was killed before it ever submitted a prompt, so no
+            // transcript was created. Normal lifecycle, not a failure.
+            tracing::info!(sid, "session ended before a transcript appeared");
             return Ok(());
         }
     };
@@ -65,7 +61,12 @@ async fn run(db: Db, bus: EventBus, sid: String, cwd: String) -> Result<()> {
         line.clear();
         match reader.read_line(&mut line).await {
             Ok(0) => {
-                // EOF — sleep, then check for new bytes.
+                // EOF — if the session is gone, stop; otherwise sleep and
+                // check for newly appended bytes.
+                if sessions.get(&sid).await.is_none() {
+                    tracing::info!(sid, "session ended; jsonl tailer stopping");
+                    return Ok(());
+                }
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
@@ -107,15 +108,20 @@ pub fn sanitize_cwd(cwd: &str) -> String {
         .collect()
 }
 
-async fn wait_for_file(path: &std::path::Path) -> Option<PathBuf> {
-    let deadline = std::time::Instant::now() + FILE_WAIT_TIMEOUT;
-    while std::time::Instant::now() < deadline {
+/// Wait for CC's transcript to appear. CC creates it only after the first
+/// submitted prompt, so there is no useful fixed deadline while the session is
+/// alive — we poll until the file shows up, or give up once the session has
+/// been removed from the registry (killed before sending anything).
+async fn wait_for_file(path: &std::path::Path, sessions: &Registry, sid: &str) -> Option<PathBuf> {
+    loop {
         if path.exists() {
             return Some(path.to_path_buf());
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        if sessions.get(sid).await.is_none() {
+            return None;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
-    None
 }
 
 /// Map a raw JSONL line from CC's transcript into a typed event.

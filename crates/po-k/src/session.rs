@@ -70,6 +70,8 @@ impl Registry {
 pub enum SpawnError {
     #[error("project {0:?} not found in config")]
     UnknownProject(String),
+    #[error("a session for project {project:?} is already running (sid {sid})")]
+    AlreadyRunning { project: String, sid: String },
     #[error("spawning session: {0}")]
     Other(#[from] anyhow::Error),
 }
@@ -82,6 +84,22 @@ pub async fn spawn(state: &AppState, project_name: &str) -> Result<RunningSessio
         .find(|p| p.name == project_name)
         .ok_or_else(|| SpawnError::UnknownProject(project_name.to_string()))?
         .clone();
+    // One CC per project: every session for a project shares one zellij session
+    // (and pane), so a second spawn would type its bootstrap into the pane
+    // already running the first session's CC. Refuse instead of clobbering —
+    // callers must DELETE the existing session first.
+    if let Some(sid) = state
+        .sessions
+        .ids_for_project(&project.name)
+        .await
+        .into_iter()
+        .next()
+    {
+        return Err(SpawnError::AlreadyRunning {
+            project: project.name.clone(),
+            sid,
+        });
+    }
     spawn_for_project(state, &snapshot, &project)
         .await
         .map_err(SpawnError::Other)
@@ -129,10 +147,11 @@ async fn spawn_for_project(
         &hooks_path,
         &mcp_path,
     );
-    // Submit the bootstrap line into the pane. Single write_chars with a
-    // trailing newline so the shell submits immediately.
+    // Submit the bootstrap line into the pane via the per-session MCP
+    // socket. write_to_focused_pane resolves the right terminal pane on the
+    // first tab and forwards the bytes verbatim.
     let payload = format!("{cmd}\n");
-    zellij::write_chars(&zellij_session_name, &payload).await?;
+    zellij::write_to_focused_pane(&zellij_session_name, &payload).await?;
 
     let started_at = events_store::now_iso();
     let row = SessionRow {
@@ -178,9 +197,12 @@ async fn spawn_for_project(
     state.bus.notify(&sid).await;
 
     // Per-session JSONL tailer projects CC's transcript lines into events rows.
+    // It waits for the transcript as long as the session is alive (CC only
+    // writes it after the first submitted prompt), so it gets the Registry.
     crate::jsonl_tail::spawn(
         state.db.clone(),
         state.bus.clone(),
+        state.sessions.clone(),
         sid.clone(),
         project.cwd.clone(),
     );
@@ -196,7 +218,7 @@ pub async fn kill(state: &AppState, sid: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("session {sid} not found"))?;
 
     // Try graceful exit first: /exit\n into the pane.
-    let _ = zellij::write_chars(&running.zellij_session, "/exit\n").await;
+    let _ = zellij::write_to_focused_pane(&running.zellij_session, "/exit\n").await;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Always reap the zellij session so a future start re-creates it cleanly.
@@ -416,6 +438,34 @@ mod tests {
             std::path::Path::new("/tmp/m.json"),
         );
         assert!(bash.contains("'/home/me/with space'"));
+    }
+
+    fn sample_session(sid: &str, project: &str) -> RunningSession {
+        RunningSession {
+            sid: sid.into(),
+            project: project.into(),
+            cwd: "/workspace".into(),
+            zellij_session: "po-k-po-k".into(),
+            model: "opus".into(),
+            effort: "xhigh".into(),
+            started_at: "now".into(),
+            hooks_path: "/h".into(),
+            mcp_path: "/m".into(),
+            pid: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_reports_sessions_per_project() {
+        // The spawn() conflict guard keys off ids_for_project, so verify it
+        // returns inserted sessions and stays empty for unknown projects.
+        let reg = Registry::default();
+        assert!(reg.ids_for_project("po-k").await.is_empty());
+        reg.insert(sample_session("s1", "po-k")).await;
+        assert_eq!(reg.ids_for_project("po-k").await, vec!["s1".to_string()]);
+        assert!(reg.ids_for_project("other").await.is_empty());
+        reg.remove("s1").await;
+        assert!(reg.ids_for_project("po-k").await.is_empty());
     }
 
     #[test]

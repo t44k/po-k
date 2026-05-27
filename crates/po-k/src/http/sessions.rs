@@ -24,6 +24,13 @@ pub async fn create(
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("unknown project {name:?}") })),
         )),
+        Err(SpawnError::AlreadyRunning { project, sid }) => Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("a session for project {project:?} is already running"),
+                "session_id": sid,
+            })),
+        )),
         Err(SpawnError::Other(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("{e}") })),
