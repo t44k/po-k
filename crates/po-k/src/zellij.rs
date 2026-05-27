@@ -78,54 +78,44 @@ fn strip_ansi(s: &str) -> String {
 ///
 /// Returns `Ok(true)` if the session pre-existed, `Ok(false)` if we created it.
 ///
-/// **Session creation:** zellij needs a real PTY. The po-k server itself runs
-/// inside a `setsid` container with `stdin=/dev/null`, so the tokio process
-/// has no TTY. `setsid -f zellij --session NAME` forks a child that inherits
-/// `/dev/null` as stdin → zellij's `isatty` check fails → silent death.
+/// **Session creation:** `zellij --session NAME` (or `zellij attach --create`)
+/// attaches to the *foreground* terminal and, on startup, queries the terminal
+/// for its colours and cell size and blocks waiting for the reply. The po-k
+/// server runs detached (no responsive TTY — stdio is `/dev/null`), so that
+/// reply never comes and zellij hangs at boot, never starting its MCP server.
+/// Wrapping it in `script`/`setsid` to fake a PTY is racy for the same reason.
 ///
-/// The workaround: `setsid -f script -q -c 'exec zellij --session NAME' /dev/null`.
-///
-/// - `setsid -f` forks into a new session; the parent process exits immediately.
-/// - The forked child runs `script` which allocates a child PTY.
-/// - Inside the script PTY, `exec zellij --session NAME` runs.
-/// - `.spawn()` (not `.status()`) — we don't wait for it; the grandchild
-///   persists in its own process group.
+/// `zellij attach --create-background NAME` sidesteps all of that: it spins up a
+/// *detached* session (no foreground terminal, no colour query), returns
+/// immediately, and starts the in-session MCP server. It's reliable even with
+/// stdio wired to `/dev/null`.
 pub async fn ensure_session(name: &str) -> Result<bool> {
     if list_sessions().await?.iter().any(|s| s == name) {
-        wait_for_socket(name).await?;
-        return Ok(true);
+        // `list-sessions` also reports EXITED (resurrectable) sessions, whose
+        // MCP socket is dead. Reuse only if the socket actually answers;
+        // otherwise delete the corpse and fall through to recreate it.
+        if is_socket_alive(name).await {
+            return Ok(true);
+        }
+        kill_session(name).await?;
     }
-    // Spawn in the background — we'll poll for the socket below.
-    Command::new("setsid")
-        .args([
-            "-f",
-            "script",
-            "-q",
-            "-c",
-            &format!("exec zellij --session {name}"),
-            "/dev/null",
-        ])
+    let out = Command::new("zellij")
+        .args(["attach", "--create-background", name])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn `setsid -f script -q -c 'exec zellij --session NAME' /dev/null`")?;
-
-    // The script process exits immediately (setsid -f). The grandchild
-    // zellij is starting up in its own PTY session. Poll for both the
-    // session listing AND a live MCP socket.
-    let deadline = std::time::Instant::now() + SOCKET_WAIT_TOTAL;
-    while std::time::Instant::now() < deadline {
-        let listed = list_sessions().await?.iter().any(|s| s == name);
-        if listed && is_socket_alive(name).await {
-            return Ok(false);
-        }
-        tokio::time::sleep(SOCKET_POLL).await;
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("spawn `zellij attach --create-background NAME`")?;
+    // `--create-background` exits non-zero if the session already exists; a
+    // concurrent caller racing us is fine, so only treat it as fatal when the
+    // session genuinely isn't there afterwards.
+    if !out.status.success() && !list_sessions().await?.iter().any(|s| s == name) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("zellij attach --create-background {name}: {stderr}");
     }
-    anyhow::bail!(
-        "zellij session {name:?} created but MCP socket did not become ready at {}",
-        mcp_socket_path(name).display()
-    )
+    wait_for_socket(name).await?;
+    Ok(false)
 }
 
 /// Check if the MCP socket is actually alive (connectable Unix socket).
@@ -159,22 +149,29 @@ async fn wait_for_socket(name: &str) -> Result<()> {
     )
 }
 
+/// Fully tear down a session. `delete-session --force` kills it if running
+/// *and* removes the resurrectable "EXITED" entry that `kill-session` leaves
+/// behind — that leftover entry still shows up in `list-sessions`, so without
+/// the delete a future `ensure_session` would mistake a dead session for a live
+/// one and then fail probing its (dead) socket.
 pub async fn kill_session(name: &str) -> Result<()> {
     let out = Command::new("zellij")
-        .args(["kill-session", name])
+        .args(["delete-session", "--force", name])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
         .await
-        .context("spawn `zellij kill-session NAME`")?;
+        .context("spawn `zellij delete-session --force NAME`")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("not found") || stderr.contains("No such") {
+        if stderr.contains("not found") || stderr.contains("No such") || stderr.contains("No session") {
             return Ok(());
         }
-        anyhow::bail!("zellij kill-session {name}: {stderr}");
+        anyhow::bail!("zellij delete-session --force {name}: {stderr}");
     }
+    // Stale socket files survive deletion; drop ours so liveness probes are honest.
+    let _ = std::fs::remove_file(mcp_socket_path(name));
     Ok(())
 }
 

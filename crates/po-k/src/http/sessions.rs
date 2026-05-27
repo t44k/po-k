@@ -33,7 +33,7 @@ pub async fn create(
         )),
         Err(SpawnError::Other(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("{e}") })),
+            Json(json!({ "error": format!("{e:#}") })),
         )),
     }
 }
