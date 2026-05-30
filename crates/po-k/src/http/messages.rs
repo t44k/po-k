@@ -36,9 +36,16 @@ pub async fn message(
     // writes the transcript JSONL after the first *submitted* prompt — so block
     // until the ❯ prompt is on screen before sending anything.
     zellij::wait_for_cc_prompt(&zs, READY_TIMEOUT).await.map_err(zellij_err)?;
-    let payload = format!("{}\r", body.text);
-    zellij::write_to_focused_pane(&zs, &payload).await.map_err(zellij_err)?;
-    Ok(Json(json!({ "ok": true, "bytes": payload.len() })))
+    // Capture the cursor BEFORE writing: CC records this turn's `user_prompt`
+    // asynchronously (via the JSONL tailer) only after the pane receives the
+    // text, so this seq cleanly precedes the new turn. The orchestrator passes
+    // it to `GET /wait?since=<cursor>` for a race-free "block until CC stops".
+    let cursor = crate::events_store::current_cursor(&state.db, &sid)
+        .await
+        .map_err(crate::http::events::internal)?
+        .unwrap_or(0);
+    zellij::submit_text(&zs, &body.text).await.map_err(zellij_err)?;
+    Ok(Json(json!({ "ok": true, "bytes": body.text.len(), "cursor": cursor })))
 }
 
 pub async fn interrupt(
@@ -56,7 +63,7 @@ pub async fn clear(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let zs = require_session(&state, &sid).await?.zellij_session;
     zellij::wait_for_cc_prompt(&zs, READY_TIMEOUT).await.map_err(zellij_err)?;
-    zellij::write_to_focused_pane(&zs, "/clear\r").await.map_err(zellij_err)?;
+    zellij::submit_text(&zs, "/clear").await.map_err(zellij_err)?;
     Ok(Json(json!({ "ok": true })))
 }
 

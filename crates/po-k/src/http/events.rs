@@ -18,9 +18,9 @@ use tokio_stream::StreamExt;
 use crate::events_store::{self, EventRow};
 use crate::state::AppState;
 
-const DEFAULT_WAIT: u64 = 30;
-const MAX_WAIT: u64 = 60;
-const PAGE_LIMIT: i64 = 500;
+pub(crate) const DEFAULT_WAIT: u64 = 30;
+pub(crate) const MAX_WAIT: u64 = 60;
+pub(crate) const PAGE_LIMIT: i64 = 500;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct PollQuery {
@@ -93,7 +93,7 @@ pub async fn stream(
         loop {
             let rows = events_store::select_events_since(&state.db, &sid, cursor, PAGE_LIMIT)
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             for row in &rows {
                 let value = render_row(row);
                 let ev = Event::default()
@@ -181,7 +181,100 @@ pub async fn cost(
     })))
 }
 
-fn render_row(r: &EventRow) -> Value {
+/// Long-poll over the transcript-only view (the conversational record). Same
+/// cursor/wait contract as [`poll`], filtered to message kinds. A bus wake for
+/// a non-transcript event can yield an empty page — callers re-poll with the
+/// unchanged cursor.
+pub async fn messages_poll(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+    Query(q): Query<PollQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if events_store::get_session(&state.db, &sid)
+        .await
+        .map_err(internal)?
+        .is_none()
+    {
+        return Err(not_found(&sid));
+    }
+
+    let since = q.since.unwrap_or(0);
+    let wait = q.wait.unwrap_or(DEFAULT_WAIT).min(MAX_WAIT);
+    let mut rows = events_store::select_messages_since(&state.db, &sid, since, PAGE_LIMIT)
+        .await
+        .map_err(internal)?;
+
+    if rows.is_empty() && wait > 0 {
+        let notify = state.bus.subscribe(&sid).await;
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        let _ = tokio::time::timeout(Duration::from_secs(wait), notified).await;
+        rows = events_store::select_messages_since(&state.db, &sid, since, PAGE_LIMIT)
+            .await
+            .map_err(internal)?;
+    }
+
+    let next_cursor = rows.last().map(|r| r.seq).unwrap_or(since);
+    Ok(Json(json!({
+        "messages": rows.iter().map(render_row).collect::<Vec<_>>(),
+        "next_cursor": next_cursor,
+    })))
+}
+
+/// SSE variant of [`messages_poll`] — same as [`stream`] but transcript-only.
+pub async fn messages_stream(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+    Query(q): Query<PollQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
+    if events_store::get_session(&state.db, &sid)
+        .await
+        .map_err(internal)?
+        .is_none()
+    {
+        return Err(not_found(&sid));
+    }
+
+    let notify = state.bus.subscribe(&sid).await;
+    let start = q.since.unwrap_or(0);
+
+    let s = async_stream::try_stream! {
+        let mut cursor = start;
+        loop {
+            let rows = events_store::select_messages_since(&state.db, &sid, cursor, PAGE_LIMIT)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            for row in &rows {
+                let value = render_row(row);
+                let ev = Event::default()
+                    .event(row.kind.as_str())
+                    .data(serde_json::to_string(&value).unwrap_or_else(|_| "{}".into()))
+                    .id(row.seq.to_string());
+                cursor = row.seq;
+                yield ev;
+            }
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            let _ = tokio::time::timeout(Duration::from_secs(30), notified).await;
+        }
+    };
+
+    let mapped = s.filter_map(|res: Result<Event, std::io::Error>| match res {
+        Ok(ev) => Some(Ok::<Event, Infallible>(ev)),
+        Err(e) => {
+            tracing::warn!(error = %e, "sse messages stream error");
+            None
+        }
+    });
+
+    let heartbeat = IntervalStream::new(tokio::time::interval(Duration::from_secs(15)))
+        .map(|_| Ok::<Event, Infallible>(Event::default().comment("keepalive")));
+
+    let merged = mapped.merge(heartbeat);
+    Ok(Sse::new(merged).keep_alive(KeepAlive::default()))
+}
+
+pub(crate) fn render_row(r: &EventRow) -> Value {
     let mut out = json!({
         "seq": r.seq,
         "ts": r.ts,
@@ -199,14 +292,14 @@ fn render_row(r: &EventRow) -> Value {
     out
 }
 
-fn not_found(sid: &str) -> (StatusCode, Json<Value>) {
+pub(crate) fn not_found(sid: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_FOUND,
         Json(json!({ "error": format!("session {sid} not found") })),
     )
 }
 
-fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
+pub(crate) fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": format!("{e}") })),

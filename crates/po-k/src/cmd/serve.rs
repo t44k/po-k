@@ -60,6 +60,13 @@ pub async fn run(args: Args) -> Result<()> {
 
     let state = AppState::new(token, cfg, cfg_path.clone(), db);
 
+    // Rebuild the Registry from the DB before serving requests, so /sessions
+    // and /status reflect surviving CC subprocesses immediately on first GET.
+    // Best-effort: a failure here logs and we keep serving (empty registry).
+    if let Err(e) = crate::recovery::recover_sessions(&state).await {
+        tracing::warn!(error = %e, "session recovery failed; starting clean");
+    }
+
     if reload_on_change {
         config_watch::spawn(cfg_path.clone(), state.config.clone());
     }

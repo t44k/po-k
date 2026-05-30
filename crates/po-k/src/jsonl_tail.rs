@@ -53,8 +53,21 @@ async fn run(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String
     let file = File::open(&path)
         .await
         .with_context(|| format!("opening {}", path.display()))?;
+    // Resume past lines already ingested in a previous po-k run. The offset
+    // is bumped atomically with each append in `append_jsonl_event`, so a
+    // crash between the two can't leave us re-ingesting. If the file shrank
+    // since we last tailed (shouldn't happen for CC — it never truncates),
+    // fall back to the current end of file rather than EBADF on the seek.
+    let file_size = file
+        .metadata()
+        .await
+        .ok()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let stored = events_store::get_jsonl_offset(&db, &sid).await.unwrap_or(0) as u64;
+    let mut offset: u64 = if stored > file_size { file_size } else { stored };
     let mut reader = BufReader::new(file);
-    reader.seek(SeekFrom::Start(0)).await.ok();
+    reader.seek(SeekFrom::Start(offset)).await.ok();
 
     let mut line = String::new();
     loop {
@@ -70,17 +83,35 @@ async fn run(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
-            Ok(_) => {
+            Ok(n) => {
+                let next_offset = offset + n as u64;
                 let trimmed = line.trim_end();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if let Some((kind, payload)) = project_event(trimmed) {
-                    let ts = events_store::now_iso();
-                    if events_store::append_event(&db, &sid, &ts, &kind, &payload).await.is_ok() {
-                        bus.notify(&sid).await;
+                if !trimmed.is_empty() {
+                    if let Some((kind, payload)) = project_event(trimmed) {
+                        let ts = events_store::now_iso();
+                        if events_store::append_jsonl_event(
+                            &db,
+                            &sid,
+                            &ts,
+                            &kind,
+                            &payload,
+                            next_offset as i64,
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            bus.notify(&sid).await;
+                        }
+                    } else {
+                        // Unprojectable line: still advance the offset so we
+                        // don't re-read it next restart.
+                        let _ = events_store::set_jsonl_offset(&db, &sid, next_offset as i64).await;
                     }
+                } else {
+                    // Blank line: advance past it too.
+                    let _ = events_store::set_jsonl_offset(&db, &sid, next_offset as i64).await;
                 }
+                offset = next_offset;
             }
             Err(e) => {
                 tracing::warn!(sid, error = %e, "jsonl read error; backing off");
@@ -89,6 +120,7 @@ async fn run(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String
         }
     }
 }
+
 
 pub fn transcript_path(cwd: &str, sid: &str) -> Result<PathBuf> {
     let home = std::env::var_os("HOME")

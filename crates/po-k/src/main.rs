@@ -21,8 +21,10 @@ mod events_store;
 mod http;
 mod jsonl_tail;
 mod permissions;
+mod recovery;
 mod session;
 mod state;
+mod status;
 mod systemd_install;
 mod zellij;
 

@@ -120,7 +120,7 @@ pub async fn ensure_session(name: &str) -> Result<bool> {
 
 /// Check if the MCP socket is actually alive (connectable Unix socket).
 /// Stale .mcp.sock files survive `zellij kill-session` so we probe, not stat.
-async fn is_socket_alive(name: &str) -> bool {
+pub(crate) async fn is_socket_alive(name: &str) -> bool {
     let path = mcp_socket_path(name);
     if !path.exists() {
         return false;
@@ -266,6 +266,19 @@ pub async fn write_to_focused_pane(session: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Type `text` into the focused pane, then submit it with a *separate* Enter.
+///
+/// CC's TUI detects text and a carriage return arriving in one write as a paste
+/// and leaves the CR in the buffer instead of submitting — the line just sits in
+/// the input box. Sending the `\r` as its own write (after a brief settle so it
+/// isn't coalesced into the same read) registers as the Enter keypress.
+pub async fn submit_text(session: &str, text: &str) -> Result<()> {
+    write_to_focused_pane(session, text).await?;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    write_to_focused_pane(session, "\r").await?;
+    Ok(())
+}
+
 pub async fn send_escape(session: &str) -> Result<()> {
     let (tab_index, pane_id) = focused_terminal_pane(session).await?;
     mcp_call(
@@ -301,7 +314,7 @@ pub async fn read_focused_pane(session: &str) -> Result<String> {
 /// prompt in our setup (`exec claude` replaces a bash/fish shell) emits that
 /// glyph at the start of a line, so its presence is a reliable "CC has booted
 /// and is ready to accept input" signal.
-fn shows_cc_prompt(content: &str) -> bool {
+pub(crate) fn shows_cc_prompt(content: &str) -> bool {
     content.lines().any(|l| l.trim_start().starts_with('❯'))
 }
 

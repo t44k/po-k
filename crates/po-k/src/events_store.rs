@@ -10,6 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -60,6 +61,14 @@ pub async fn open(path: &Path) -> Result<Db> {
         .execute(&pool)
         .await
         .context("applying schema")?;
+    // Additive migrations. `CREATE TABLE IF NOT EXISTS` doesn't update an
+    // existing table, so add new columns separately and tolerate the
+    // "duplicate column name" error on second+ run.
+    let _ = sqlx::query(
+        "ALTER TABLE sessions ADD COLUMN last_jsonl_offset INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(&pool)
+    .await;
     Ok(pool)
 }
 
@@ -213,6 +222,155 @@ pub async fn select_events_since(
         .collect())
 }
 
+/// Transcript-only events (the conversational record an orchestrator consumes)
+/// with `seq > since`, ASC, capped at `limit`. Filters at the SQL level so a
+/// full page is `limit` *transcript* rows rather than mostly lifecycle/raw_*
+/// noise — keeping `/messages` pagination correct.
+pub async fn select_messages_since(
+    db: &Db,
+    sid: &str,
+    since: i64,
+    limit: i64,
+) -> Result<Vec<EventRow>> {
+    let rows: Vec<(String, i64, String, String, String)> = sqlx::query_as(
+        r#"SELECT sid, seq, ts, kind, payload FROM events
+           WHERE sid = ?1 AND seq > ?2
+             AND kind IN ('user_prompt','assistant_message','tool_use','tool_result','turn_end')
+           ORDER BY seq ASC LIMIT ?3"#,
+    )
+    .bind(sid)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .context("SELECT messages since")?;
+    Ok(rows
+        .into_iter()
+        .map(|(sid, seq, ts, kind, payload)| EventRow {
+            sid,
+            seq,
+            ts,
+            kind,
+            payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+        })
+        .collect())
+}
+
+/// The latest `seq` of each status-relevant event kind for a session, in one
+/// round-trip. Feeds [`crate::status::derive_status`].
+pub async fn latest_status_seqs(db: &Db, sid: &str) -> Result<HashMap<String, i64>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT kind, MAX(seq) FROM events
+           WHERE sid = ?1
+             AND kind IN (
+               'user_prompt','assistant_message','tool_use','tool_result',
+               'stop','subagent_stop','turn_end','notification',
+               'session_end','cc_exited','permission_request','permission_decision'
+             )
+           GROUP BY kind"#,
+    )
+    .bind(sid)
+    .fetch_all(db)
+    .await
+    .context("SELECT latest_status_seqs")?;
+    Ok(rows.into_iter().collect())
+}
+
+/// The session's current max event seq (the canonical monotonic cursor), or
+/// `None` if the session row doesn't exist.
+pub async fn current_cursor(db: &Db, sid: &str) -> Result<Option<i64>> {
+    let row: Option<(i64,)> =
+        sqlx::query_as(r#"SELECT last_event_seq FROM sessions WHERE sid = ?1"#)
+            .bind(sid)
+            .fetch_optional(db)
+            .await
+            .context("SELECT last_event_seq")?;
+    Ok(row.map(|(seq,)| seq))
+}
+
+/// Sessions po-k still thinks are running (`ended_at IS NULL`). The recovery
+/// pass on startup walks these and reconciles them against zellij.
+pub async fn unended_sessions(db: &Db) -> Result<Vec<SessionRow>> {
+    let rows: Vec<(String, String, String, String, Option<String>, Option<String>, String, Option<String>, Option<i64>, i64)> =
+        sqlx::query_as(
+            r#"SELECT sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq
+               FROM sessions WHERE ended_at IS NULL ORDER BY started_at"#,
+        )
+        .fetch_all(db)
+        .await
+        .context("SELECT FROM sessions WHERE ended_at IS NULL")?;
+    Ok(rows
+        .into_iter()
+        .map(|(sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq)| SessionRow {
+            sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq,
+        })
+        .collect())
+}
+
+/// The byte position the JSONL tailer left off at for this session, or 0 if
+/// unknown. Used to resume the tailer past already-ingested lines after a
+/// po-k restart.
+pub async fn get_jsonl_offset(db: &Db, sid: &str) -> Result<i64> {
+    let row: Option<(i64,)> =
+        sqlx::query_as(r#"SELECT last_jsonl_offset FROM sessions WHERE sid = ?1"#)
+            .bind(sid)
+            .fetch_optional(db)
+            .await
+            .context("SELECT last_jsonl_offset")?;
+    Ok(row.map(|(o,)| o).unwrap_or(0))
+}
+
+/// Just advance the JSONL offset (no event append). Used for blank /
+/// unprojectable lines the tailer must still skip past on restart.
+pub async fn set_jsonl_offset(db: &Db, sid: &str, offset: i64) -> Result<()> {
+    sqlx::query(r#"UPDATE sessions SET last_jsonl_offset = ?1 WHERE sid = ?2"#)
+        .bind(offset)
+        .bind(sid)
+        .execute(db)
+        .await
+        .context("UPDATE last_jsonl_offset")?;
+    Ok(())
+}
+
+/// Append a JSONL-tailer event AND advance `last_jsonl_offset` atomically.
+/// Doing both in one transaction means a crash between them can't leave the
+/// tailer in a state where it re-ingests the same line on restart.
+pub async fn append_jsonl_event(
+    db: &Db,
+    sid: &str,
+    ts: &str,
+    kind: &str,
+    payload: &Value,
+    new_offset: i64,
+) -> Result<i64> {
+    let mut tx = db.begin().await.context("begin tx")?;
+    sqlx::query(r#"UPDATE sessions SET last_event_seq = last_event_seq + 1, last_jsonl_offset = ?2 WHERE sid = ?1"#)
+        .bind(sid)
+        .bind(new_offset)
+        .execute(&mut *tx)
+        .await
+        .context("UPDATE last_event_seq + last_jsonl_offset")?;
+    let (seq,): (i64,) =
+        sqlx::query_as(r#"SELECT last_event_seq FROM sessions WHERE sid = ?1"#)
+            .bind(sid)
+            .fetch_one(&mut *tx)
+            .await
+            .context("SELECT last_event_seq")?;
+    sqlx::query(
+        r#"INSERT INTO events (sid, seq, ts, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5)"#,
+    )
+    .bind(sid)
+    .bind(seq)
+    .bind(ts)
+    .bind(kind)
+    .bind(serde_json::to_string(payload).context("serialize payload")?)
+    .execute(&mut *tx)
+    .await
+    .context("INSERT INTO events")?;
+    tx.commit().await.context("commit tx")?;
+    Ok(seq)
+}
+
 /// UTC ISO-8601 with second precision; matches what we emit in events.
 pub fn now_iso() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -325,5 +483,77 @@ mod tests {
         mark_session_ended(&db, "s3", "2026-05-25T13:00:00Z").await.unwrap();
         let got = get_session(&db, "s3").await.unwrap().unwrap();
         assert_eq!(got.ended_at.as_deref(), Some("2026-05-25T13:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn current_cursor_tracks_last_event_seq() {
+        let db = fresh_db().await;
+        assert_eq!(current_cursor(&db, "nope").await.unwrap(), None);
+        insert_session(&db, &row("s4")).await.unwrap();
+        assert_eq!(current_cursor(&db, "s4").await.unwrap(), Some(0));
+        append_event(&db, "s4", "t", "user_prompt", &json!({})).await.unwrap();
+        append_event(&db, "s4", "t", "stop", &json!({})).await.unwrap();
+        assert_eq!(current_cursor(&db, "s4").await.unwrap(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn latest_status_seqs_groups_and_excludes() {
+        let db = fresh_db().await;
+        insert_session(&db, &row("s5")).await.unwrap();
+        append_event(&db, "s5", "t", "user_prompt", &json!({})).await.unwrap(); // 1
+        append_event(&db, "s5", "t", "raw", &json!({})).await.unwrap();          // 2 (excluded)
+        append_event(&db, "s5", "t", "tool_use", &json!({})).await.unwrap();     // 3
+        append_event(&db, "s5", "t", "stop", &json!({})).await.unwrap();         // 4
+        let latest = latest_status_seqs(&db, "s5").await.unwrap();
+        assert_eq!(latest.get("user_prompt"), Some(&1));
+        assert_eq!(latest.get("tool_use"), Some(&3));
+        assert_eq!(latest.get("stop"), Some(&4));
+        assert_eq!(latest.get("raw"), None); // not a status-relevant kind
+    }
+
+    #[tokio::test]
+    async fn unended_sessions_filters_correctly() {
+        let db = fresh_db().await;
+        insert_session(&db, &row("alive1")).await.unwrap();
+        insert_session(&db, &row("alive2")).await.unwrap();
+        insert_session(&db, &row("dead")).await.unwrap();
+        mark_session_ended(&db, "dead", "2026-05-29T01:00:00Z").await.unwrap();
+        let unended: Vec<String> = unended_sessions(&db).await.unwrap().into_iter().map(|s| s.sid).collect();
+        assert!(unended.contains(&"alive1".to_string()));
+        assert!(unended.contains(&"alive2".to_string()));
+        assert!(!unended.contains(&"dead".to_string()));
+    }
+
+    #[tokio::test]
+    async fn append_jsonl_event_bumps_both_counters_atomically() {
+        let db = fresh_db().await;
+        insert_session(&db, &row("j1")).await.unwrap();
+        let seq1 = append_jsonl_event(&db, "j1", "t", "user_prompt", &json!({"text":"a"}), 120).await.unwrap();
+        let seq2 = append_jsonl_event(&db, "j1", "t", "assistant_message", &json!({"text":"b"}), 250).await.unwrap();
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        assert_eq!(current_cursor(&db, "j1").await.unwrap(), Some(2));
+        assert_eq!(get_jsonl_offset(&db, "j1").await.unwrap(), 250);
+        // Plain append_event still works alongside; offset does NOT advance.
+        let seq3 = append_event(&db, "j1", "t", "stop", &json!({})).await.unwrap();
+        assert_eq!(seq3, 3);
+        assert_eq!(get_jsonl_offset(&db, "j1").await.unwrap(), 250);
+    }
+
+    #[tokio::test]
+    async fn select_messages_since_filters_to_transcript() {
+        let db = fresh_db().await;
+        insert_session(&db, &row("s6")).await.unwrap();
+        append_event(&db, "s6", "t", "user_prompt", &json!({"text":"hi"})).await.unwrap(); // 1
+        append_event(&db, "s6", "t", "notification", &json!({})).await.unwrap();            // 2 (excluded)
+        append_event(&db, "s6", "t", "assistant_message", &json!({"text":"yo"})).await.unwrap(); // 3
+        append_event(&db, "s6", "t", "permission_request", &json!({})).await.unwrap();      // 4 (excluded)
+        append_event(&db, "s6", "t", "turn_end", &json!({})).await.unwrap();                // 5
+        let msgs = select_messages_since(&db, "s6", 0, 100).await.unwrap();
+        let kinds: Vec<&str> = msgs.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["user_prompt", "assistant_message", "turn_end"]);
+        // `since` cursor and ordering hold.
+        let after = select_messages_since(&db, "s6", 1, 100).await.unwrap();
+        assert_eq!(after.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 5]);
     }
 }

@@ -55,7 +55,7 @@ impl Registry {
             .collect()
     }
 
-    async fn insert(&self, s: RunningSession) {
+    pub async fn insert(&self, s: RunningSession) {
         self.inner.lock().await.insert(s.sid.clone(), s);
     }
 
@@ -237,7 +237,7 @@ pub async fn kill(state: &AppState, sid: &str) -> Result<()> {
     Ok(())
 }
 
-async fn append_lifecycle_event(db: &Db, sid: &str, kind: &str, payload: &Value) -> Result<()> {
+pub(crate) async fn append_lifecycle_event(db: &Db, sid: &str, kind: &str, payload: &Value) -> Result<()> {
     let ts = events_store::now_iso();
     events_store::append_event(db, sid, &ts, kind, payload).await?;
     Ok(())
@@ -246,8 +246,13 @@ async fn append_lifecycle_event(db: &Db, sid: &str, kind: &str, payload: &Value)
 pub fn render_hooks_json(base_url: &str, sid: &str, token: &str) -> String {
     let mk = |event: &str| -> Value {
         let url = format!("{base_url}/sessions/{sid}/hooks/{event}");
+        // `content-type: application/json` is REQUIRED: the ingest handler uses
+        // axum's `Json` extractor, which 415s any other content type. Without
+        // it the hook silently no-ops (curl still exits 0, so CC logs the hook
+        // as a success) and lifecycle events like `stop`/`notification` never
+        // reach the server.
         let command = format!(
-            "curl -sX POST '{url}' -H 'authorization: bearer {token}' --data-binary @-",
+            "curl -sX POST '{url}' -H 'authorization: bearer {token}' -H 'content-type: application/json' --data-binary @-",
         );
         json!({
             "matcher": "",
@@ -357,6 +362,8 @@ mod tests {
         let s = render_hooks_json("http://127.0.0.1:7070", "abc-123", "TOK");
         assert!(s.contains("http://127.0.0.1:7070/sessions/abc-123/hooks/Stop"));
         assert!(s.contains("authorization: bearer TOK"));
+        // The ingest handler's Json extractor 415s without this header.
+        assert!(s.contains("content-type: application/json"));
         // Every hook event we promise to install must be present.
         for event in [
             "UserPromptSubmit",
