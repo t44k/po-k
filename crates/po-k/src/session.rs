@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::config::{Config, Project};
-use crate::events_store::{self, Db, SessionRow};
+use crate::events_store::{self, SessionRow};
 use crate::state::AppState;
 use crate::zellij;
 
@@ -254,7 +254,7 @@ async fn spawn_for_project(
     events_store::insert_session(&state.db, &row).await?;
 
     append_lifecycle_event(
-        &state.db,
+        state,
         &sid,
         "cc_started",
         &json!({
@@ -282,18 +282,11 @@ async fn spawn_for_project(
         plugin_dir: plugin_dir_str,
     };
     state.sessions.insert(running.clone()).await;
-    state.bus.notify(&sid).await;
 
     // Per-session JSONL tailer projects CC's transcript lines into events rows.
     // It waits for the transcript as long as the session is alive (CC only
     // writes it after the first submitted prompt), so it gets the Registry.
-    crate::jsonl_tail::spawn(
-        state.db.clone(),
-        state.bus.clone(),
-        state.sessions.clone(),
-        sid.clone(),
-        project.cwd.clone(),
-    );
+    crate::jsonl_tail::spawn(state.clone(), sid.clone(), project.cwd.clone());
 
     Ok(running)
 }
@@ -318,16 +311,21 @@ pub async fn kill(state: &AppState, sid: &str) -> Result<()> {
 
     state.sessions.remove(sid).await;
     let ts = events_store::now_iso();
-    let _ = append_lifecycle_event(&state.db, sid, "cc_exited", &json!({})).await;
-    state.bus.notify(sid).await;
+    let _ = append_lifecycle_event(state, sid, "cc_exited", &json!({})).await;
     events_store::mark_session_ended(&state.db, sid, &ts).await?;
     state.bus.drop_session(sid).await;
     Ok(())
 }
 
-pub(crate) async fn append_lifecycle_event(db: &Db, sid: &str, kind: &str, payload: &Value) -> Result<()> {
-    let ts = events_store::now_iso();
-    events_store::append_event(db, sid, &ts, kind, payload).await?;
+/// Append a lifecycle event through the central [`crate::core::events::record`]
+/// choke point (DB + bus wake + Xpo-k forward).
+pub(crate) async fn append_lifecycle_event(
+    state: &AppState,
+    sid: &str,
+    kind: &str,
+    payload: &Value,
+) -> Result<()> {
+    crate::core::events::record(state, sid, kind, payload).await?;
     Ok(())
 }
 

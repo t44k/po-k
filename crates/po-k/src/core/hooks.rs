@@ -4,7 +4,6 @@
 use serde_json::Value;
 
 use super::{internal, CoreError, CoreResponse, CoreResult};
-use crate::events_store;
 use crate::state::AppState;
 
 /// Map a CC hook event name to po-k's canonical event kind.
@@ -30,9 +29,8 @@ pub async fn ingest(
         return Err(CoreError::not_found(sid));
     }
     let kind = hook_kind(event);
-    let seq = events_store::append_event(&state.db, sid, &events_store::now_iso(), &kind, &payload)
+    let seq = super::events::record(state, sid, &kind, &payload)
         .await
         .map_err(internal)?;
-    state.bus.notify(sid).await;
     Ok(CoreResponse::ok(serde_json::json!({ "ok": true, "seq": seq })))
 }

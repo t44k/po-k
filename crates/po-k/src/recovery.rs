@@ -42,13 +42,12 @@ pub async fn recover_sessions(state: &AppState) -> Result<()> {
             let ts = events_store::now_iso();
             let _ = events_store::mark_session_ended(&state.db, &row.sid, &ts).await;
             let _ = session::append_lifecycle_event(
-                &state.db,
+                state,
                 &row.sid,
                 "cc_lost",
                 &json!({ "reason": "zellij not alive at recovery", "zellij_session": zname }),
             )
             .await;
-            state.bus.notify(&row.sid).await;
             lost += 1;
             tracing::info!(sid = %row.sid, zellij_session = %zname, "session ended at recovery");
             continue;
@@ -89,22 +88,9 @@ pub async fn recover_sessions(state: &AppState) -> Result<()> {
             plugin_dir: row.plugin_dir.clone(),
         };
         state.sessions.insert(running).await;
-        let _ = session::append_lifecycle_event(
-            &state.db,
-            &row.sid,
-            "cc_recovered",
-            &json!({}),
-        )
-        .await;
+        let _ = session::append_lifecycle_event(state, &row.sid, "cc_recovered", &json!({})).await;
         // Restart the tailer — it resumes from `sessions.last_jsonl_offset`.
-        jsonl_tail::spawn(
-            state.db.clone(),
-            state.bus.clone(),
-            state.sessions.clone(),
-            row.sid.clone(),
-            row.cwd.clone(),
-        );
-        state.bus.notify(&row.sid).await;
+        jsonl_tail::spawn(state.clone(), row.sid.clone(), row.cwd.clone());
         recovered += 1;
         tracing::info!(sid = %row.sid, project = %row.project, "session recovered");
     }

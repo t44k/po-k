@@ -23,23 +23,25 @@ use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom};
 
-use crate::event_bus::EventBus;
-use crate::events_store::{self, Db};
+use crate::events_store;
 use crate::session::Registry;
+use crate::state::AppState;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub fn spawn(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String) {
+pub fn spawn(state: AppState, sid: String, cwd: String) {
     tokio::spawn(async move {
-        if let Err(e) = run(db, bus, sessions, sid.clone(), cwd).await {
+        if let Err(e) = run(state, sid.clone(), cwd).await {
             tracing::warn!(sid, error = %e, "jsonl tailer exited");
         }
     });
 }
 
-async fn run(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String) -> Result<()> {
+async fn run(state: AppState, sid: String, cwd: String) -> Result<()> {
+    let db = &state.db;
+    let sessions = &state.sessions;
     let path = transcript_path(&cwd, &sid)?;
-    let path = match wait_for_file(&path, &sessions, &sid).await {
+    let path = match wait_for_file(&path, sessions, &sid).await {
         Some(p) => p,
         None => {
             // Session was killed before it ever submitted a prompt, so no
@@ -64,7 +66,7 @@ async fn run(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String
         .ok()
         .map(|m| m.len())
         .unwrap_or(0);
-    let stored = events_store::get_jsonl_offset(&db, &sid).await.unwrap_or(0) as u64;
+    let stored = events_store::get_jsonl_offset(db, &sid).await.unwrap_or(0) as u64;
     let mut offset: u64 = if stored > file_size { file_size } else { stored };
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(offset)).await.ok();
@@ -90,7 +92,7 @@ async fn run(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String
                     if let Some((kind, payload)) = project_event(trimmed) {
                         let ts = events_store::now_iso();
                         if events_store::append_jsonl_event(
-                            &db,
+                            db,
                             &sid,
                             &ts,
                             &kind,
@@ -100,16 +102,19 @@ async fn run(db: Db, bus: EventBus, sessions: Registry, sid: String, cwd: String
                         .await
                         .is_ok()
                         {
-                            bus.notify(&sid).await;
+                            state.bus.notify(&sid).await;
+                            // Forward to Xpo-k (the atomic offset bump can't go
+                            // through `record`, so forward explicitly).
+                            crate::core::events::forward(&state, &sid, &kind, &payload).await;
                         }
                     } else {
                         // Unprojectable line: still advance the offset so we
                         // don't re-read it next restart.
-                        let _ = events_store::set_jsonl_offset(&db, &sid, next_offset as i64).await;
+                        let _ = events_store::set_jsonl_offset(db, &sid, next_offset as i64).await;
                     }
                 } else {
                     // Blank line: advance past it too.
-                    let _ = events_store::set_jsonl_offset(&db, &sid, next_offset as i64).await;
+                    let _ = events_store::set_jsonl_offset(db, &sid, next_offset as i64).await;
                 }
                 offset = next_offset;
             }

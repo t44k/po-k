@@ -43,14 +43,10 @@ pub async fn approve(
         "input": input,
         "timeout_ms": timeout_ms,
     });
-    let ts = events_store::now_iso();
-    if let Err(e) =
-        events_store::append_event(&state.db, sid, &ts, "permission_request", &payload).await
-    {
+    if let Err(e) = super::events::record(state, sid, "permission_request", &payload).await {
         state.perms.forget(&request_id).await;
         return Err(internal(e));
     }
-    state.bus.notify(sid).await;
 
     let decision = match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
         Ok(Ok(d)) => d,
@@ -66,15 +62,7 @@ pub async fn approve(
         "behavior": decision.behavior,
         "message": decision.message,
     });
-    let _ = events_store::append_event(
-        &state.db,
-        sid,
-        &events_store::now_iso(),
-        "permission_decision",
-        &outcome,
-    )
-    .await;
-    state.bus.notify(sid).await;
+    let _ = super::events::record(state, sid, "permission_decision", &outcome).await;
 
     Ok(CoreResponse::ok(
         serde_json::to_value(decision).unwrap_or(json!({})),

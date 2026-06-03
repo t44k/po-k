@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 // The profile schema types are shared with Xpo-k via the `pok-proto` crate.
 // po-k owns only the on-disk *generation* of a merged profile (below).
-pub use pok_proto::profile::{Agent, HookGroup, McpServer, Profile, ProfileSettings, Skill};
+pub use pok_proto::profile::*;
 
 /// The po-k-side values that must be baked into every generated plugin so CC
 /// can call back into po-k (hook curls + the permission MCP server). These are

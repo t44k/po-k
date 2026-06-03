@@ -19,6 +19,7 @@ mod core;
 mod config_watch;
 mod event_bus;
 mod events_store;
+mod hook_listener;
 mod http;
 mod jsonl_tail;
 mod permissions;

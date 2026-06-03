@@ -102,6 +102,68 @@ pub async fn cost(state: &AppState, sid: &str) -> CoreResult<CoreResponse> {
     })))
 }
 
+/// The single choke point for emitting an event: append to the DB, wake local
+/// long-poll/SSE waiters, and forward to Xpo-k (`session_event` + a
+/// `status_update` when the derived status changed). Every former
+/// `append_event` + `bus.notify` pair routes through here so forwarding can
+/// never be forgotten.
+pub async fn record(
+    state: &AppState,
+    sid: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<i64> {
+    let seq = events_store::append_event(&state.db, sid, &events_store::now_iso(), kind, payload)
+        .await?;
+    state.bus.notify(sid).await;
+    forward(state, sid, kind, payload).await;
+    Ok(seq)
+}
+
+/// Forward an already-persisted event to Xpo-k and emit a status_update when
+/// the derived status changed. Call this after `append_jsonl_event` (whose
+/// atomic offset bump can't go through `record`).
+pub async fn forward(state: &AppState, sid: &str, kind: &str, payload: &serde_json::Value) {
+    state
+        .uplink_send(pok_proto::WsMsg::SessionEvent {
+            sid: sid.to_string(),
+            event: pok_proto::EventEnvelope {
+                kind: kind.to_string(),
+                payload: payload.clone(),
+            },
+        })
+        .await;
+    push_status_if_changed(state, sid).await;
+}
+
+async fn push_status_if_changed(state: &AppState, sid: &str) {
+    let ended_at = events_store::get_session(&state.db, sid)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.ended_at);
+    let latest = match events_store::latest_status_seqs(&state.db, sid).await {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let (st, _) = crate::status::derive_status(&latest, ended_at.as_deref());
+    let st = st.as_str().to_string();
+    let changed = state
+        .last_status
+        .get(sid)
+        .map(|v| *v != st)
+        .unwrap_or(true);
+    if changed {
+        state.last_status.insert(sid.to_string(), st.clone());
+        state
+            .uplink_send(pok_proto::WsMsg::StatusUpdate {
+                sid: sid.to_string(),
+                status: st,
+            })
+            .await;
+    }
+}
+
 /// Infinite row stream from `since`, alternating DB drains and bus parks.
 /// Dropping the consumer ends it. Each transport adds its own framing /
 /// keepalive on top. Errors end the stream (logged by the caller).

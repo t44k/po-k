@@ -19,9 +19,51 @@ pub const DEFAULT_CONFIG_PATH: &str = "~/.config/po-k/po-k.yaml";
 pub struct Config {
     pub server: Server,
     pub auth: Auth,
+    /// Xpo-k connection (M14 Phase 2). Optional until the cutover; once set,
+    /// po-k connects to Xpo-k as a WebSocket client.
+    pub xpok: Option<Xpok>,
+    /// Localhost-only listener that receives CC's hook/permission callbacks.
+    pub hooks: Hooks,
     pub cc: CcDefaults,
     pub zellij: Zellij,
     pub projects: Vec<Project>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Xpok {
+    /// WebSocket URL of the Xpo-k server, e.g. `ws://xpo-k.host:8080/ws`.
+    pub url: String,
+    /// Shared secret / bearer presented on connect.
+    #[serde(default)]
+    pub token: String,
+    #[serde(default = "default_reconnect")]
+    pub reconnect_interval: HumanDuration,
+}
+
+fn default_reconnect() -> HumanDuration {
+    HumanDuration(Duration::from_secs(5))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hooks {
+    /// Local-only bind for the hook/permission callback listener.
+    pub bind: String,
+}
+
+impl Default for Hooks {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:7070".to_string(),
+        }
+    }
+}
+
+impl Hooks {
+    /// Base URL CC's hook curls + the mcp subprocess post back to.
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.bind)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
