@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/po-k"]
+members = ["crates/po-k", "crates/xpo-k", "crates/pok-proto"]
 
 [workspace.package]
 edition = "2021"
@@ -13,7 +13,14 @@ rust-version = "1.80"
 [workspace.dependencies]
 anyhow = "1"
 async-stream = "0.3"
-axum = { version = "0.8", features = ["macros", "json", "tokio"] }
+axum = { version = "0.8", features = ["macros", "json", "tokio", "ws"] }
+dashmap = "6"
+futures-util = "0.3"
+hostname = "0.4"
+matchit = "0.8"
+serde_urlencoded = "0.7"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+pok-proto = { path = "crates/pok-proto" }
 base64 = "0.22"
 http-body-util = "0.1"
 clap = { version = "4", features = ["derive", "env"] }

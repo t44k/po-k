@@ -1,35 +1,26 @@
 [package]
-name = "po-k"
+name = "xpo-k"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "HTTP service for driving Claude Code instances inside dedicated zellij sessions."
+description = "Central profile authority + cross-container router for po-k instances."
 
 [[bin]]
-name = "po-k"
+name = "xpo-k"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-async-stream = { workspace = true }
 axum = { workspace = true }
-base64 = { workspace = true }
 clap = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
-hostname = { workspace = true }
-indexmap = { workspace = true }
-matchit = { workspace = true }
-notify = { workspace = true }
 pok-proto = { workspace = true }
-serde_urlencoded = { workspace = true }
-tokio-tungstenite = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -46,3 +37,5 @@ uuid = { workspace = true }
 [dev-dependencies]
 http-body-util = { workspace = true }
 tempfile = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
