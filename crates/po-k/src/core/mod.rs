@@ -41,12 +41,14 @@ impl CoreResponse {
 pub enum CoreError {
     #[error("{0}")]
     NotFound(String),
-    /// 409. Carries an extra body (e.g. the existing `session_id`) merged into
-    /// the error object so the response stays byte-compatible with the old API.
+    /// 409 conflict. The extra `body` (e.g. the existing `session_id`) is
+    /// merged into the error object so the response stays byte-compatible with
+    /// the old HTTP API.
     #[error("{message}")]
     Conflict { message: String, body: Value },
     #[error("{0}")]
     BadRequest(String),
+    #[allow(dead_code)] // part of the error taxonomy; reserved for long-poll timeouts
     #[error("operation timed out")]
     Timeout,
     #[error("{0:#}")]

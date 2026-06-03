@@ -114,7 +114,7 @@ async fn resolve(st: &XState, names: &[String]) -> Result<Vec<pok_proto::Profile
 /// dedup preserving order.
 pub fn resolve_names(st: &XState, requested: &[String], project: Option<&str>) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    let mut push = |n: &str, names: &mut Vec<String>| {
+    let push = |n: &str, names: &mut Vec<String>| {
         if !names.iter().any(|x| x == n) {
             names.push(n.to_string());
         }

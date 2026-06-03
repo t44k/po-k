@@ -67,7 +67,7 @@ async fn connect_fake_pok(
             status: "idle".into(),
         }],
     };
-    sink.send(Message::Text(serde_json::to_string(&reg).unwrap().into()))
+    sink.send(Message::Text(serde_json::to_string(&reg).unwrap()))
         .await
         .unwrap();
     // Expect a `registered` ack.
@@ -124,7 +124,7 @@ async fn routed_unary_round_trip() {
                 headers: Default::default(),
                 body: r#"{"status":"idle","cursor":0}"#.into(),
             };
-            sink.send(Message::Text(serde_json::to_string(&resp).unwrap().into()))
+            sink.send(Message::Text(serde_json::to_string(&resp).unwrap()))
                 .await
                 .unwrap();
         }
@@ -158,12 +158,12 @@ async fn sse_stream_bridge() {
                     request_id,
                     data: format!("event: message\ndata: {{\"seq\":{i}}}\n\n"),
                 };
-                sink.send(Message::Text(serde_json::to_string(&chunk).unwrap().into()))
+                sink.send(Message::Text(serde_json::to_string(&chunk).unwrap()))
                     .await
                     .unwrap();
             }
             let end = WsMsg::WsStreamEnd { request_id };
-            sink.send(Message::Text(serde_json::to_string(&end).unwrap().into()))
+            sink.send(Message::Text(serde_json::to_string(&end).unwrap()))
                 .await
                 .unwrap();
         }
@@ -183,6 +183,80 @@ async fn sse_stream_bridge() {
     assert!(body.contains("\"seq\":0"));
     assert!(body.contains("\"seq\":1"));
     responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_pushes_to_live_session() {
+    let (addr, _state) = start_server().await;
+    let (mut sink, mut stream) = connect_fake_pok(addr).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // A profile the session will use.
+    client
+        .post(format!("{base}/profiles"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({ "name": "base", "claude_md": "# v1", "agents": { "a": {} } }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // Fake po-k: answer the create ws_request, then capture the ProfileUpdate.
+    let handle = tokio::spawn(async move {
+        loop {
+            match next_msg(&mut stream).await {
+                WsMsg::WsRequest { request_id, path, .. } if path == "/sessions" => {
+                    let resp = WsMsg::WsResponse {
+                        request_id,
+                        status: 201,
+                        headers: Default::default(),
+                        body: r#"{"session_id":"s1"}"#.into(),
+                    };
+                    sink.send(Message::Text(serde_json::to_string(&resp).unwrap()))
+                        .await
+                        .unwrap();
+                }
+                WsMsg::ProfileUpdate { session_id, changed_fields, .. } => {
+                    break Some((session_id, changed_fields));
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Create a session bound to profile "base".
+    client
+        .post(format!("{base}/sessions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({ "project": "demo", "profiles": ["base"] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // Update the profile → should push a profile_update to the live session.
+    client
+        .put(format!("{base}/profiles/base"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({ "name": "base", "claude_md": "# v2", "agents": { "a": {} } }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let update = tokio::time::timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("timed out waiting for profile_update")
+        .unwrap()
+        .expect("no profile_update received");
+    assert_eq!(update.0, "s1");
+    // agents present → structural change flagged.
+    assert!(update.1.contains(&"agents".to_string()));
+    assert!(update.1.contains(&"claude_md".to_string()));
 }
 
 #[tokio::test]

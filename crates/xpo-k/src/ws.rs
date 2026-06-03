@@ -175,11 +175,11 @@ async fn inbound(
                 .await;
         }
         WsMsg::Error {
-            request_id,
+            request_id: Some(rid),
             message,
             ..
         } => {
-            if let Some(rid) = request_id {
+            {
                 if let Some((_, sender)) = reg.pending.remove(&rid) {
                     let _ = sender.send(WsResult {
                         status: 502,

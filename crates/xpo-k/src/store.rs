@@ -96,6 +96,30 @@ pub struct ProfileRow {
     pub updated_at: String,
 }
 
+/// (name, version, description, tags, data, created_at, updated_at)
+type ProfileTuple = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+);
+
+fn profile_row_from(t: ProfileTuple) -> ProfileRow {
+    let (name, version, description, tags, data, created_at, updated_at) = t;
+    ProfileRow {
+        name,
+        version,
+        description,
+        tags,
+        data,
+        created_at,
+        updated_at,
+    }
+}
+
 impl ProfileRow {
     /// Summary JSON for `GET /profiles` listing.
     pub fn summary(&self) -> Value {
@@ -109,47 +133,24 @@ impl ProfileRow {
 }
 
 pub async fn list_profiles(db: &Db) -> Result<Vec<ProfileRow>> {
-    let rows: Vec<(String, String, Option<String>, Option<String>, String, String, String)> =
-        sqlx::query_as(
-            "SELECT name, version, description, tags, data, created_at, updated_at FROM profiles ORDER BY name",
-        )
-        .fetch_all(db)
-        .await
-        .context("SELECT profiles")?;
-    Ok(rows
-        .into_iter()
-        .map(|(name, version, description, tags, data, created_at, updated_at)| ProfileRow {
-            name,
-            version,
-            description,
-            tags,
-            data,
-            created_at,
-            updated_at,
-        })
-        .collect())
+    let rows: Vec<ProfileTuple> = sqlx::query_as(
+        "SELECT name, version, description, tags, data, created_at, updated_at FROM profiles ORDER BY name",
+    )
+    .fetch_all(db)
+    .await
+    .context("SELECT profiles")?;
+    Ok(rows.into_iter().map(profile_row_from).collect())
 }
 
 pub async fn get_profile(db: &Db, name: &str) -> Result<Option<ProfileRow>> {
-    let row: Option<(String, String, Option<String>, Option<String>, String, String, String)> =
-        sqlx::query_as(
-            "SELECT name, version, description, tags, data, created_at, updated_at FROM profiles WHERE name = ?1",
-        )
-        .bind(name)
-        .fetch_optional(db)
-        .await
-        .context("SELECT profile")?;
-    Ok(row.map(
-        |(name, version, description, tags, data, created_at, updated_at)| ProfileRow {
-            name,
-            version,
-            description,
-            tags,
-            data,
-            created_at,
-            updated_at,
-        },
-    ))
+    let row: Option<ProfileTuple> = sqlx::query_as(
+        "SELECT name, version, description, tags, data, created_at, updated_at FROM profiles WHERE name = ?1",
+    )
+    .bind(name)
+    .fetch_optional(db)
+    .await
+    .context("SELECT profile")?;
+    Ok(row.map(profile_row_from))
 }
 
 /// Upsert a profile, recording the prior+new data in `profile_history`.
@@ -237,6 +238,27 @@ pub async fn profile_history(db: &Db, name: &str) -> Result<Vec<Value>> {
     Ok(rows
         .into_iter()
         .map(|(version, _data, changed_at)| serde_json::json!({ "version": version, "changed_at": changed_at }))
+        .collect())
+}
+
+/// Live (not-ended) sessions: `(sid, pok_id, profile_names)`. Used by Phase 4
+/// to find sessions affected by a profile change.
+pub async fn live_sessions(db: &Db) -> Result<Vec<(String, String, Vec<String>)>> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT sid, pok_id, profiles FROM xpok_sessions WHERE ended_at IS NULL",
+    )
+    .fetch_all(db)
+    .await
+    .context("SELECT live xpok_sessions")?;
+    Ok(rows
+        .into_iter()
+        .map(|(sid, pok_id, profiles)| {
+            let names = profiles
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default();
+            (sid, pok_id, names)
+        })
         .collect())
 }
 

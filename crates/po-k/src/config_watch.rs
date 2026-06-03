@@ -7,7 +7,7 @@
 use anyhow::Result;
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
@@ -86,7 +86,7 @@ fn mtime(path: &PathBuf) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
-async fn reload(path: &PathBuf, current: &Arc<RwLock<Config>>) {
+async fn reload(path: &Path, current: &Arc<RwLock<Config>>) {
     match load_from(path) {
         Ok(new) => {
             let mut guard = current.write().await;
