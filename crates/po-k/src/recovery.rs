@@ -56,7 +56,24 @@ pub async fn recover_sessions(state: &AppState) -> Result<()> {
 
         // hooks.json / mcp.json paths are derivable from sid — they're not
         // persisted in the DB but always live under ~/.cache/po-k/sessions/<sid>/.
-        let dir = config::expand_path(&format!("~/.cache/po-k/sessions/{}", row.sid));
+        // Profile sessions (M14) keep them under plugin/; legacy sessions keep
+        // them flat in the session dir.
+        let dir = config::expand_path(format!("~/.cache/po-k/sessions/{}", row.sid));
+        let (hooks_path, mcp_path) = match row.plugin_dir.as_deref() {
+            Some(pd) => {
+                let pd = std::path::Path::new(pd);
+                (
+                    pd.join("hooks").join("hooks.json"),
+                    pd.join(".mcp.json"),
+                )
+            }
+            None => (dir.join("hooks.json"), dir.join("mcp.json")),
+        };
+        let profiles: Vec<String> = row
+            .profiles
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
         let running = RunningSession {
             sid: row.sid.clone(),
             project: row.project.clone(),
@@ -65,9 +82,11 @@ pub async fn recover_sessions(state: &AppState) -> Result<()> {
             model: row.model.clone().unwrap_or_else(|| cfg.cc.model.clone()),
             effort: row.effort.clone().unwrap_or_else(|| cfg.cc.effort.clone()),
             started_at: row.started_at.clone(),
-            hooks_path: dir.join("hooks.json").to_string_lossy().into_owned(),
-            mcp_path: dir.join("mcp.json").to_string_lossy().into_owned(),
+            hooks_path: hooks_path.to_string_lossy().into_owned(),
+            mcp_path: mcp_path.to_string_lossy().into_owned(),
             pid: row.pid,
+            profiles,
+            plugin_dir: row.plugin_dir.clone(),
         };
         state.sessions.insert(running).await;
         let _ = session::append_lifecycle_event(

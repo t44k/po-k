@@ -7,12 +7,34 @@
 //! Phases hang their endpoints off the protected sub-router. Currently:
 //! `/health` (public) + `/projects` (protected, config-driven).
 
+use axum::http::{Method, StatusCode, Uri};
 use axum::middleware;
-use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde_json::{json, Value};
 
 use crate::auth::require_bearer;
+use crate::core::{CoreError, CoreResponse, CoreResult};
 use crate::state::AppState;
+
+/// Adapt a core result into an Axum `(StatusCode, Json)` response, preserving
+/// the core-assigned status code (200/201/4xx/5xx) and JSON body verbatim.
+pub(crate) fn adapt(r: CoreResult<CoreResponse>) -> (StatusCode, Json<Value>) {
+    match r {
+        Ok(ok) => (
+            StatusCode::from_u16(ok.status).unwrap_or(StatusCode::OK),
+            Json(ok.body),
+        ),
+        Err(e) => adapt_err(e),
+    }
+}
+
+pub(crate) fn adapt_err(e: CoreError) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(e.body()),
+    )
+}
 
 pub mod control;
 pub mod events;
@@ -48,6 +70,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/status", get(control::status))
         .route("/sessions/{id}/wait", get(control::wait))
         .route("/sessions/{id}/pane", get(control::pane))
+        .route("/sessions/{id}/capabilities", get(sessions::capabilities))
         .route("/sessions/{id}/mcp/approve", post(perms::approve))
         .route(
             "/sessions/{id}/permission_requests/{req_id}",
@@ -59,7 +82,21 @@ pub fn router(state: AppState) -> Router {
         ))
         .with_state(state);
 
-    public.merge(protected)
+    public.merge(protected).fallback(not_found)
+}
+
+/// Fallback for unmatched routes — axum's default returns an empty 404, which
+/// is indistinguishable on the client from "endpoint returned empty data".
+/// This handler returns a JSON body pointing at /help so callers immediately
+/// see *why* they got nothing.
+async fn not_found(method: Method, uri: Uri) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": format!("no route for {method} {}", uri.path()),
+            "hint": "GET /help lists every endpoint",
+        })),
+    )
 }
 
 #[cfg(test)]
@@ -127,6 +164,8 @@ mod tests {
                 ended_at: None,
                 pid: None,
                 last_event_seq: 0,
+                profiles: None,
+                plugin_dir: None,
             },
         )
         .await
@@ -231,6 +270,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Body should be JSON with a useful error message — empty bodies make
+        // 401 look identical to "endpoint returned nothing" on the client.
+        let v = body_json(resp).await;
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("Authorization"),
+            "401 body lacks helpful error: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_returns_json_401() {
+        let app = router(test_state().await);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .header(header::AUTHORIZATION, "Bearer not-the-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid bearer token");
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_json_404() {
+        let app = router(test_state().await);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/no-such-endpoint")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let v = body_json(resp).await;
+        assert!(v["error"].as_str().unwrap().contains("no route"));
+        assert!(v["hint"].as_str().unwrap().contains("/help"));
     }
 
     #[tokio::test]

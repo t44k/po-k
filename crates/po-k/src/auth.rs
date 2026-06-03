@@ -10,6 +10,8 @@ use axum::extract::State;
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use axum::Json;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -77,7 +79,7 @@ pub async fn require_bearer(
     State(token): State<Token>,
     req: Request<Body>,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, (StatusCode, Json<Value>)> {
     let header_value = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -88,10 +90,20 @@ pub async fn require_bearer(
         .or_else(|| header_value.strip_prefix("bearer "));
     let presented = match presented {
         Some(p) => p,
-        None => return Err(StatusCode::UNAUTHORIZED),
+        None => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "missing or malformed Authorization header — expected `Authorization: Bearer <token>` (token at ~/.config/po-k/auth.token)"
+                })),
+            ));
+        }
     };
     if !token.matches(presented) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid bearer token" })),
+        ));
     }
     Ok(next.run(req).await)
 }

@@ -149,9 +149,7 @@ async fn wait_for_file(path: &std::path::Path, sessions: &Registry, sid: &str) -
         if path.exists() {
             return Some(path.to_path_buf());
         }
-        if sessions.get(sid).await.is_none() {
-            return None;
-        }
+        sessions.get(sid).await.as_ref()?;
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }

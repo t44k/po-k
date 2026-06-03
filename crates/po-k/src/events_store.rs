@@ -69,6 +69,14 @@ pub async fn open(path: &Path) -> Result<Db> {
     )
     .execute(&pool)
     .await;
+    // Profile system (M14): names of the profiles merged into this session
+    // (JSON array) and the path to the generated CC plugin directory.
+    let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN profiles TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN plugin_dir TEXT")
+        .execute(&pool)
+        .await;
     Ok(pool)
 }
 
@@ -84,12 +92,69 @@ pub struct SessionRow {
     pub ended_at: Option<String>,
     pub pid: Option<i64>,
     pub last_event_seq: i64,
+    /// JSON array of profile names merged into this session (M14). None for
+    /// legacy/profile-less sessions.
+    #[serde(default)]
+    pub profiles: Option<String>,
+    /// Path to the generated CC plugin directory (M14). None for legacy
+    /// sessions launched without a profile.
+    #[serde(default)]
+    pub plugin_dir: Option<String>,
+}
+
+/// Column list shared by every `SELECT … FROM sessions`, in struct order.
+const SESSION_COLS: &str = "sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq, profiles, plugin_dir";
+
+type SessionTuple = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<i64>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
+fn row_from_tuple(t: SessionTuple) -> SessionRow {
+    let (
+        sid,
+        project,
+        cwd,
+        zellij_session,
+        model,
+        effort,
+        started_at,
+        ended_at,
+        pid,
+        last_event_seq,
+        profiles,
+        plugin_dir,
+    ) = t;
+    SessionRow {
+        sid,
+        project,
+        cwd,
+        zellij_session,
+        model,
+        effort,
+        started_at,
+        ended_at,
+        pid,
+        last_event_seq,
+        profiles,
+        plugin_dir,
+    }
 }
 
 pub async fn insert_session(db: &Db, row: &SessionRow) -> Result<()> {
     sqlx::query(
-        r#"INSERT INTO sessions (sid, project, cwd, zellij_session, model, effort, started_at, pid, last_event_seq)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+        r#"INSERT INTO sessions (sid, project, cwd, zellij_session, model, effort, started_at, pid, last_event_seq, profiles, plugin_dir)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
     )
     .bind(&row.sid)
     .bind(&row.project)
@@ -100,6 +165,8 @@ pub async fn insert_session(db: &Db, row: &SessionRow) -> Result<()> {
     .bind(&row.started_at)
     .bind(row.pid)
     .bind(row.last_event_seq)
+    .bind(&row.profiles)
+    .bind(&row.plugin_dir)
     .execute(db)
     .await
     .context("INSERT INTO sessions")?;
@@ -107,35 +174,24 @@ pub async fn insert_session(db: &Db, row: &SessionRow) -> Result<()> {
 }
 
 pub async fn list_sessions(db: &Db) -> Result<Vec<SessionRow>> {
-    let rows: Vec<(String, String, String, String, Option<String>, Option<String>, String, Option<String>, Option<i64>, i64)> =
-        sqlx::query_as(
-            r#"SELECT sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq
-               FROM sessions ORDER BY started_at DESC"#,
-        )
-        .fetch_all(db)
-        .await
-        .context("SELECT FROM sessions")?;
-    Ok(rows
-        .into_iter()
-        .map(|(sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq)| SessionRow {
-            sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq,
-        })
-        .collect())
+    let rows: Vec<SessionTuple> = sqlx::query_as(&format!(
+        "SELECT {SESSION_COLS} FROM sessions ORDER BY started_at DESC"
+    ))
+    .fetch_all(db)
+    .await
+    .context("SELECT FROM sessions")?;
+    Ok(rows.into_iter().map(row_from_tuple).collect())
 }
 
 pub async fn get_session(db: &Db, sid: &str) -> Result<Option<SessionRow>> {
-    let row: Option<(String, String, String, String, Option<String>, Option<String>, String, Option<String>, Option<i64>, i64)> =
-        sqlx::query_as(
-            r#"SELECT sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq
-               FROM sessions WHERE sid = ?1"#,
-        )
-        .bind(sid)
-        .fetch_optional(db)
-        .await
-        .context("SELECT FROM sessions")?;
-    Ok(row.map(|(sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq)| SessionRow {
-        sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq,
-    }))
+    let row: Option<SessionTuple> = sqlx::query_as(&format!(
+        "SELECT {SESSION_COLS} FROM sessions WHERE sid = ?1"
+    ))
+    .bind(sid)
+    .fetch_optional(db)
+    .await
+    .context("SELECT FROM sessions")?;
+    Ok(row.map(row_from_tuple))
 }
 
 pub async fn mark_session_ended(db: &Db, sid: &str, ended_at: &str) -> Result<()> {
@@ -291,20 +347,13 @@ pub async fn current_cursor(db: &Db, sid: &str) -> Result<Option<i64>> {
 /// Sessions po-k still thinks are running (`ended_at IS NULL`). The recovery
 /// pass on startup walks these and reconciles them against zellij.
 pub async fn unended_sessions(db: &Db) -> Result<Vec<SessionRow>> {
-    let rows: Vec<(String, String, String, String, Option<String>, Option<String>, String, Option<String>, Option<i64>, i64)> =
-        sqlx::query_as(
-            r#"SELECT sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq
-               FROM sessions WHERE ended_at IS NULL ORDER BY started_at"#,
-        )
-        .fetch_all(db)
-        .await
-        .context("SELECT FROM sessions WHERE ended_at IS NULL")?;
-    Ok(rows
-        .into_iter()
-        .map(|(sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq)| SessionRow {
-            sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq,
-        })
-        .collect())
+    let rows: Vec<SessionTuple> = sqlx::query_as(&format!(
+        "SELECT {SESSION_COLS} FROM sessions WHERE ended_at IS NULL ORDER BY started_at"
+    ))
+    .fetch_all(db)
+    .await
+    .context("SELECT FROM sessions WHERE ended_at IS NULL")?;
+    Ok(rows.into_iter().map(row_from_tuple).collect())
 }
 
 /// The byte position the JSONL tailer left off at for this session, or 0 if
@@ -447,6 +496,8 @@ mod tests {
             ended_at: None,
             pid: Some(42),
             last_event_seq: 0,
+            profiles: None,
+            plugin_dir: None,
         }
     }
 
@@ -474,6 +525,26 @@ mod tests {
         let since1 = select_events_since(&db, "s2", 1, 100).await.unwrap();
         assert_eq!(since1.len(), 1);
         assert_eq!(since1[0].seq, 2);
+    }
+
+    #[tokio::test]
+    async fn profiles_and_plugin_dir_round_trip() {
+        let db = fresh_db().await;
+        let mut r = row("pf1");
+        r.profiles = Some(r#"["base","reviewer"]"#.into());
+        r.plugin_dir = Some("/home/me/.cache/po-k/sessions/pf1/plugin".into());
+        insert_session(&db, &r).await.unwrap();
+        let got = get_session(&db, "pf1").await.unwrap().unwrap();
+        assert_eq!(got.profiles.as_deref(), Some(r#"["base","reviewer"]"#));
+        assert_eq!(
+            got.plugin_dir.as_deref(),
+            Some("/home/me/.cache/po-k/sessions/pf1/plugin")
+        );
+        // Legacy rows (NULL columns) still deserialize.
+        insert_session(&db, &row("pf2")).await.unwrap();
+        let legacy = get_session(&db, "pf2").await.unwrap().unwrap();
+        assert_eq!(legacy.profiles, None);
+        assert_eq!(legacy.plugin_dir, None);
     }
 
     #[tokio::test]

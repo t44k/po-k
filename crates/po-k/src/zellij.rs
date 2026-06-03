@@ -57,8 +57,8 @@ fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if matches!(chars.peek(), Some('[')) {
+        if c == '\x1b'
+            && matches!(chars.peek(), Some('[')) {
                 chars.next();
                 while let Some(&c) = chars.peek() {
                     chars.next();
@@ -68,7 +68,6 @@ fn strip_ansi(s: &str) -> String {
                 }
                 continue;
             }
-        }
         out.push(c);
     }
     out
@@ -180,7 +179,7 @@ pub async fn kill_session(name: &str) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn mcp_socket_path(session: &str) -> PathBuf {
-    crate::config::expand_path(&format!("~/.cache/zellij/{session}.mcp.sock"))
+    crate::config::expand_path(format!("~/.cache/zellij/{session}.mcp.sock"))
 }
 
 async fn mcp_call(session: &str, operation: &str, args: Value) -> Result<Value> {

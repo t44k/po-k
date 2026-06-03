@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::config::{CcDefaults, Config, Project, Zellij};
+use crate::config::{Config, Project};
 use crate::events_store::{self, Db, SessionRow};
 use crate::state::AppState;
 use crate::zellij;
@@ -29,6 +29,12 @@ pub struct RunningSession {
     pub mcp_path: String,
     /// Resolved asynchronously after CC starts. v1 is None.
     pub pid: Option<i64>,
+    /// Profile names merged into this session (M14). Empty for legacy sessions.
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    /// Generated CC plugin directory (M14). None for legacy sessions.
+    #[serde(default)]
+    pub plugin_dir: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -76,7 +82,30 @@ pub enum SpawnError {
     Other(#[from] anyhow::Error),
 }
 
-pub async fn spawn(state: &AppState, project_name: &str) -> Result<RunningSession, SpawnError> {
+/// Optional profile/flag inputs for a session spawn. The legacy
+/// `POST /sessions {"project"}` path uses `SpawnOptions::default()` (no
+/// profile, no overrides), preserving the pre-M14 behaviour exactly.
+#[derive(Default)]
+pub struct SpawnOptions {
+    /// Already-merged profile (merging happens on Xpo-k). None = legacy mode.
+    pub profile: Option<crate::profile::Profile>,
+    /// Profile names recorded against the session (for capabilities + DB).
+    pub profile_names: Vec<String>,
+    /// `--agent <name>` main agent.
+    pub agent: Option<String>,
+    /// `--bare` clean-room mode.
+    pub bare: bool,
+    /// Explicit model override (highest precedence).
+    pub model: Option<String>,
+    /// Explicit effort override (highest precedence).
+    pub effort: Option<String>,
+}
+
+pub async fn spawn(
+    state: &AppState,
+    project_name: &str,
+    opts: SpawnOptions,
+) -> Result<RunningSession, SpawnError> {
     let snapshot = state.config.read().await.clone();
     let project = snapshot
         .projects
@@ -100,7 +129,7 @@ pub async fn spawn(state: &AppState, project_name: &str) -> Result<RunningSessio
             sid,
         });
     }
-    spawn_for_project(state, &snapshot, &project)
+    spawn_for_project(state, &snapshot, &project, opts)
         .await
         .map_err(SpawnError::Other)
 }
@@ -109,44 +138,90 @@ async fn spawn_for_project(
     state: &AppState,
     cfg: &Config,
     project: &Project,
+    opts: SpawnOptions,
 ) -> Result<RunningSession> {
     let sid = Uuid::new_v4().to_string();
     let zellij_session_name = project.zellij_session_name(&cfg.zellij);
-    let session_dir = crate::config::expand_path(&format!("~/.cache/po-k/sessions/{sid}"));
+    let session_dir = crate::config::expand_path(format!("~/.cache/po-k/sessions/{sid}"));
     std::fs::create_dir_all(&session_dir)
         .with_context(|| format!("creating {}", session_dir.display()))?;
 
-    let hooks_path = session_dir.join("hooks.json");
-    let mcp_path = session_dir.join("mcp.json");
     let token_file = crate::config::expand_path(&cfg.auth.bearer_token_file);
 
-    std::fs::write(
-        &hooks_path,
-        render_hooks_json(&cfg.server.base_url, &sid, state.token.raw()),
-    )
-    .with_context(|| format!("writing {}", hooks_path.display()))?;
-    std::fs::write(
-        &mcp_path,
-        render_mcp_json(&sid, &cfg.server.base_url, &token_file),
-    )
-    .with_context(|| format!("writing {}", mcp_path.display()))?;
+    // model / effort / permission_mode precedence:
+    //   explicit override (opts) > profile.settings > project/cc default.
+    let profile_settings = opts.profile.as_ref().map(|p| &p.settings);
+    let model = opts
+        .model
+        .clone()
+        .or_else(|| profile_settings.and_then(|s| s.model.clone()))
+        .unwrap_or_else(|| project.model(&cfg.cc).to_string());
+    let effort = opts
+        .effort
+        .clone()
+        .or_else(|| profile_settings.and_then(|s| s.effort.clone()))
+        .unwrap_or_else(|| project.effort(&cfg.cc).to_string());
+    let permission_mode = profile_settings
+        .and_then(|s| s.permission_mode.clone())
+        .unwrap_or_else(|| cfg.cc.permission_mode.clone());
+
+    // Lay out the config CC reads. Profile mode → a full plugin directory;
+    // legacy mode → the flat hooks.json / mcp.json pair (unchanged behaviour).
+    let (hooks_path, mcp_path, plugin_dir): (PathBuf, PathBuf, Option<PathBuf>) =
+        if let Some(profile) = &opts.profile {
+            let pok = crate::profile::PokHookContext {
+                base_url: &cfg.server.base_url,
+                token: state.token.raw(),
+                token_file: &token_file,
+                sid: &sid,
+            };
+            let paths = crate::profile::generate_plugin_dir(&session_dir, profile, &pok)?;
+            let settings_path = session_dir.join("settings.json");
+            std::fs::write(
+                &settings_path,
+                crate::profile::render_settings_json(profile, &pok, opts.agent.as_deref())?,
+            )
+            .with_context(|| format!("writing {}", settings_path.display()))?;
+            (paths.hooks_json, paths.mcp_json, Some(paths.dir))
+        } else {
+            let hooks_path = session_dir.join("hooks.json");
+            let mcp_path = session_dir.join("mcp.json");
+            std::fs::write(
+                &hooks_path,
+                render_hooks_json(&cfg.server.base_url, &sid, state.token.raw()),
+            )
+            .with_context(|| format!("writing {}", hooks_path.display()))?;
+            std::fs::write(&mcp_path, render_mcp_json(&sid, &cfg.server.base_url, &token_file))
+                .with_context(|| format!("writing {}", mcp_path.display()))?;
+            (hooks_path, mcp_path, None)
+        };
+    // In profile mode --settings points at the merged settings.json; legacy
+    // mode keeps passing hooks.json (which carries only the hooks block).
+    let settings_path = if plugin_dir.is_some() {
+        session_dir.join("settings.json")
+    } else {
+        hooks_path.clone()
+    };
 
     zellij::ensure_session(&zellij_session_name)
         .await
         .with_context(|| format!("ensuring zellij session {zellij_session_name:?}"))?;
 
-    let model = project.model(&cfg.cc).to_string();
-    let effort = project.effort(&cfg.cc).to_string();
-    let cmd = render_bootstrap(
-        &project.cwd,
-        &sid,
-        &model,
-        &effort,
-        &cfg.cc,
-        project,
-        &hooks_path,
-        &mcp_path,
-    );
+    let spec = BootstrapSpec {
+        cwd: &project.cwd,
+        sid: &sid,
+        model: &model,
+        effort: &effort,
+        permission_mode: &permission_mode,
+        disable_slash_commands: cfg.cc.disable_slash_commands,
+        add_dirs: &project.add_dirs,
+        mcp_config: &mcp_path,
+        settings: &settings_path,
+        plugin_dir: plugin_dir.as_deref(),
+        agent: opts.agent.as_deref(),
+        bare: opts.bare,
+    };
+    let cmd = render_bootstrap(&spec);
     // Submit the bootstrap line into the pane via the per-session MCP
     // socket. write_to_focused_pane resolves the right terminal pane on the
     // first tab and forwards the bytes verbatim.
@@ -154,6 +229,14 @@ async fn spawn_for_project(
     zellij::write_to_focused_pane(&zellij_session_name, &payload).await?;
 
     let started_at = events_store::now_iso();
+    let profiles_json = if opts.profile_names.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&opts.profile_names).ok()
+    };
+    let plugin_dir_str = plugin_dir
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
     let row = SessionRow {
         sid: sid.clone(),
         project: project.name.clone(),
@@ -165,6 +248,8 @@ async fn spawn_for_project(
         ended_at: None,
         pid: None,
         last_event_seq: 0,
+        profiles: profiles_json,
+        plugin_dir: plugin_dir_str.clone(),
     };
     events_store::insert_session(&state.db, &row).await?;
 
@@ -177,6 +262,7 @@ async fn spawn_for_project(
             "effort": effort,
             "cwd": project.cwd,
             "zellij_session": zellij_session_name,
+            "profiles": opts.profile_names,
         }),
     )
     .await?;
@@ -192,6 +278,8 @@ async fn spawn_for_project(
         hooks_path: hooks_path.to_string_lossy().into_owned(),
         mcp_path: mcp_path.to_string_lossy().into_owned(),
         pid: None,
+        profiles: opts.profile_names.clone(),
+        plugin_dir: plugin_dir_str,
     };
     state.sessions.insert(running.clone()).await;
     state.bus.notify(&sid).await;
@@ -224,7 +312,7 @@ pub async fn kill(state: &AppState, sid: &str) -> Result<()> {
     // Always reap the zellij session so a future start re-creates it cleanly.
     let _ = zellij::kill_session(&running.zellij_session).await;
 
-    let _ = std::fs::remove_dir_all(crate::config::expand_path(&format!(
+    let _ = std::fs::remove_dir_all(crate::config::expand_path(format!(
         "~/.cache/po-k/sessions/{sid}"
     )));
 
@@ -289,21 +377,36 @@ pub fn render_mcp_json(sid: &str, base_url: &str, token_file: &std::path::Path) 
     serde_json::to_string_pretty(&body).expect("mcp.json serialize")
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn render_bootstrap(
-    cwd: &str,
-    sid: &str,
-    model: &str,
-    effort: &str,
-    cc: &CcDefaults,
-    project: &Project,
-    hooks_path: &std::path::Path,
-    mcp_path: &std::path::Path,
-) -> String {
-    let mut add_dirs: Vec<String> = if project.add_dirs.is_empty() {
-        vec![cwd.to_string()]
+/// Everything needed to render the `claude` bootstrap command line. Replaces
+/// the old positional-arg form so profile-mode flags (`--plugin-dir`,
+/// `--agent`, `--bare`) can be threaded through cleanly.
+pub struct BootstrapSpec<'a> {
+    pub cwd: &'a str,
+    pub sid: &'a str,
+    pub model: &'a str,
+    pub effort: &'a str,
+    pub permission_mode: &'a str,
+    pub disable_slash_commands: bool,
+    pub add_dirs: &'a [String],
+    /// `--mcp-config` target (merged `.mcp.json` in profile mode, legacy
+    /// `mcp.json` otherwise).
+    pub mcp_config: &'a std::path::Path,
+    /// `--settings` target (merged `settings.json` in profile mode, legacy
+    /// `hooks.json` otherwise).
+    pub settings: &'a std::path::Path,
+    /// `--plugin-dir` (profile mode only).
+    pub plugin_dir: Option<&'a std::path::Path>,
+    /// `--agent <name>` to launch as the main agent (profile mode).
+    pub agent: Option<&'a str>,
+    /// `--bare` clean-room mode (spec §8.7), default off.
+    pub bare: bool,
+}
+
+pub fn render_bootstrap(spec: &BootstrapSpec) -> String {
+    let mut add_dirs: Vec<String> = if spec.add_dirs.is_empty() {
+        vec![spec.cwd.to_string()]
     } else {
-        project.add_dirs.clone()
+        spec.add_dirs.to_vec()
     };
     add_dirs.dedup();
     let add_args = add_dirs
@@ -312,21 +415,39 @@ pub fn render_bootstrap(
         .collect::<Vec<_>>()
         .join(" ");
     let mut parts = vec![
-        format!("cd {} &&", shell_quote(cwd)),
+        format!("cd {} &&", shell_quote(spec.cwd)),
         "exec claude".to_string(),
-        format!("--session-id {sid}"),
-        format!("--model {}", shell_quote(model)),
-        format!("--effort {}", shell_quote(effort)),
-        format!("--permission-mode {}", shell_quote(&cc.permission_mode)),
-        "--permission-prompt-tool mcp__po-k__approve".to_string(),
-        format!("--mcp-config {}", shell_quote(&mcp_path.to_string_lossy())),
-        format!("--settings {}", shell_quote(&hooks_path.to_string_lossy())),
     ];
-    if cc.disable_slash_commands {
+    if spec.bare {
+        parts.push("--bare".to_string());
+    }
+    parts.push(format!("--session-id {}", spec.sid));
+    if let Some(pd) = spec.plugin_dir {
+        parts.push(format!("--plugin-dir {}", shell_quote(&pd.to_string_lossy())));
+    }
+    parts.push(format!(
+        "--mcp-config {}",
+        shell_quote(&spec.mcp_config.to_string_lossy())
+    ));
+    parts.push(format!(
+        "--settings {}",
+        shell_quote(&spec.settings.to_string_lossy())
+    ));
+    parts.push(format!(
+        "--permission-mode {}",
+        shell_quote(spec.permission_mode)
+    ));
+    parts.push("--permission-prompt-tool mcp__po-k__approve".to_string());
+    parts.push(format!("--model {}", shell_quote(spec.model)));
+    parts.push(format!("--effort {}", shell_quote(spec.effort)));
+    if spec.disable_slash_commands {
         parts.push("--disable-slash-commands".to_string());
     }
     if !add_args.is_empty() {
         parts.push(add_args);
+    }
+    if let Some(a) = spec.agent {
+        parts.push(format!("--agent {}", shell_quote(a)));
     }
     parts.join(" ")
 }
@@ -342,15 +463,6 @@ fn shell_quote(s: &str) -> String {
     let escaped = s.replace('\'', "'\\''");
     format!("'{}'", escaped)
 }
-
-// `Project` already has `model()` / `effort()` helpers — re-export under the
-// shape spawn_for_project expects.
-trait _ProjectExt {}
-impl _ProjectExt for Project {}
-
-// Touch unused-but-imported symbols in test mode only.
-#[cfg(test)]
-fn _unused(_: Zellij) {}
 
 #[cfg(test)]
 mod tests {
@@ -390,27 +502,36 @@ mod tests {
         assert!(s.contains("\"mcp\""));
     }
 
+    fn spec_for<'a>(
+        cwd: &'a str,
+        add_dirs: &'a [String],
+        mcp: &'a std::path::Path,
+        settings: &'a std::path::Path,
+    ) -> BootstrapSpec<'a> {
+        BootstrapSpec {
+            cwd,
+            sid: "abc-123",
+            model: "sonnet",
+            effort: "medium",
+            permission_mode: "acceptEdits",
+            disable_slash_commands: true,
+            add_dirs,
+            mcp_config: mcp,
+            settings,
+            plugin_dir: None,
+            agent: None,
+            bare: false,
+        }
+    }
+
     #[test]
     fn bootstrap_contains_all_required_flags() {
-        let cc = CcDefaults::default();
-        let project = Project {
-            name: "po-k".into(),
-            cwd: "/workspace".into(),
-            model: None,
-            effort: None,
-            add_dirs: vec![],
-            zellij_session: None,
-        };
-        let bash = render_bootstrap(
+        let bash = render_bootstrap(&spec_for(
             "/workspace",
-            "abc-123",
-            "sonnet",
-            "medium",
-            &cc,
-            &project,
-            std::path::Path::new("/tmp/h.json"),
+            &[],
             std::path::Path::new("/tmp/m.json"),
-        );
+            std::path::Path::new("/tmp/h.json"),
+        ));
         assert!(bash.starts_with("cd /workspace && exec claude"));
         assert!(bash.contains("--session-id abc-123"));
         assert!(bash.contains("--model sonnet"));
@@ -421,29 +542,38 @@ mod tests {
         assert!(bash.contains("--settings /tmp/h.json"));
         assert!(bash.contains("--disable-slash-commands"));
         assert!(bash.contains("--add-dir /workspace"));
+        assert!(!bash.contains("--bare"));
+        assert!(!bash.contains("--plugin-dir"));
+        assert!(!bash.contains("--agent"));
+    }
+
+    #[test]
+    fn bootstrap_profile_mode_flags() {
+        let mut spec = spec_for(
+            "/workspace",
+            &[],
+            std::path::Path::new("/tmp/.mcp.json"),
+            std::path::Path::new("/tmp/settings.json"),
+        );
+        let pd = std::path::PathBuf::from("/tmp/plugin");
+        spec.plugin_dir = Some(&pd);
+        spec.agent = Some("security-reviewer");
+        spec.bare = true;
+        let bash = render_bootstrap(&spec);
+        assert!(bash.starts_with("cd /workspace && exec claude --bare"));
+        assert!(bash.contains("--plugin-dir /tmp/plugin"));
+        assert!(bash.contains("--agent security-reviewer"));
     }
 
     #[test]
     fn bootstrap_quotes_paths_with_spaces() {
-        let cc = CcDefaults::default();
-        let project = Project {
-            name: "p".into(),
-            cwd: "/home/me/with space".into(),
-            model: None,
-            effort: None,
-            add_dirs: vec!["/home/me/with space".into()],
-            zellij_session: None,
-        };
-        let bash = render_bootstrap(
+        let add = vec!["/home/me/with space".to_string()];
+        let bash = render_bootstrap(&spec_for(
             "/home/me/with space",
-            "sid",
-            "sonnet",
-            "medium",
-            &cc,
-            &project,
-            std::path::Path::new("/tmp/h.json"),
+            &add,
             std::path::Path::new("/tmp/m.json"),
-        );
+            std::path::Path::new("/tmp/h.json"),
+        ));
         assert!(bash.contains("'/home/me/with space'"));
     }
 
@@ -459,6 +589,8 @@ mod tests {
             hooks_path: "/h".into(),
             mcp_path: "/m".into(),
             pid: None,
+            profiles: Vec::new(),
+            plugin_dir: None,
         }
     }
 
