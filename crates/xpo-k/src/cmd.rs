@@ -52,17 +52,7 @@ pub async fn serve() -> Result<()> {
     tracing::info!(path = %db_path.display(), "profiles.db ready");
 
     let state = XState::new(cfg, token, db);
-    let app = crate::http::router(state.clone()).merge(crate::ws::router(state));
-
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
     tracing::info!(%addr, version = env!("CARGO_PKG_VERSION"), "xpo-k serve listening");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .context("axum serve")?;
+    crate::serve_on(state, addr).await.context("serve")?;
     Ok(())
 }

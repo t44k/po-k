@@ -20,8 +20,8 @@ mod config_watch;
 mod event_bus;
 mod events_store;
 mod hook_listener;
-mod http;
 mod jsonl_tail;
+mod live_reload;
 mod permissions;
 mod profile;
 mod recovery;
@@ -29,6 +29,8 @@ mod session;
 mod state;
 mod status;
 mod systemd_install;
+mod ws_dispatcher;
+mod xpok_client;
 mod zellij;
 
 /// po-k — drive Claude Code over zellij via a small HTTP service.

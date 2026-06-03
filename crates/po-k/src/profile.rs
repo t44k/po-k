@@ -121,6 +121,7 @@ pub fn render_settings_json(
     Ok(serde_json::to_string_pretty(&Value::Object(settings)).expect("settings serialize"))
 }
 
+#[allow(dead_code)]
 pub fn cleanup_plugin_dir(session_dir: &Path) {
     let _ = std::fs::remove_dir_all(session_dir.join("plugin"));
 }

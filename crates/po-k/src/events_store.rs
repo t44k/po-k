@@ -173,6 +173,7 @@ pub async fn insert_session(db: &Db, row: &SessionRow) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn list_sessions(db: &Db) -> Result<Vec<SessionRow>> {
     let rows: Vec<SessionTuple> = sqlx::query_as(&format!(
         "SELECT {SESSION_COLS} FROM sessions ORDER BY started_at DESC"

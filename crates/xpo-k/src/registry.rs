@@ -71,6 +71,14 @@ impl Registry {
         self.conns.insert(pok_id, conn);
     }
 
+    /// Replace the project rows owned by `pok_id` (on `config_update`).
+    pub fn update_projects(&self, pok_id: &str, projects: &[ProjectDecl]) {
+        self.project_to_pok.retain(|_, v| v != pok_id);
+        for p in projects {
+            self.project_to_pok.insert(p.name.clone(), pok_id.to_string());
+        }
+    }
+
     pub fn disconnect(&self, pok_id: &str) {
         self.conns.remove(pok_id);
         self.project_to_pok.retain(|_, v| v != pok_id);

@@ -5,18 +5,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-mod auth;
-mod cmd;
-mod config;
-mod http;
-mod live;
-mod merge;
-mod registry;
-mod routed;
-mod state;
-mod store;
-mod ws;
-
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -43,7 +31,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Init => cmd::init().await,
-        Cmd::Serve => cmd::serve().await,
+        Cmd::Init => xpo_k::cmd::init().await,
+        Cmd::Serve => xpo_k::cmd::serve().await,
     }
 }

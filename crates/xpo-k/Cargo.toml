@@ -8,12 +8,17 @@ authors.workspace = true
 rust-version.workspace = true
 description = "Central profile authority + cross-container router for po-k instances."
 
+[lib]
+name = "xpo_k"
+path = "src/lib.rs"
+
 [[bin]]
 name = "xpo-k"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+async-stream = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 dashmap = { workspace = true }

@@ -3144,6 +3144,7 @@ name = "xpo-k"
 version = "0.11.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "clap",
  "dashmap",

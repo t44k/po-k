@@ -1,8 +1,9 @@
 //! YAML config loader for `po-k.yaml`.
 //!
-//! Layout (see plan):
-//!   server: { bind, base_url, reload_on_change }
+//! Layout (M14 Phase 2):
 //!   auth:   { bearer_token_file }
+//!   xpok:   { url, token, reconnect_interval }   # optional Xpo-k connection
+//!   hooks:  { bind }                             # localhost CC-callback listener
 //!   cc:     { model, effort, permission_mode, permission_timeout, disable_slash_commands }
 //!   zellij: { session_prefix }
 //!   projects: [ { name, cwd, model?, effort?, add_dirs?, zellij_session? } ]
@@ -17,10 +18,9 @@ pub const DEFAULT_CONFIG_PATH: &str = "~/.config/po-k/po-k.yaml";
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
-    pub server: Server,
     pub auth: Auth,
-    /// Xpo-k connection (M14 Phase 2). Optional until the cutover; once set,
-    /// po-k connects to Xpo-k as a WebSocket client.
+    /// Xpo-k connection (M14 Phase 2). Optional; once set, po-k connects to
+    /// Xpo-k as a WebSocket client (its only orchestrator interface).
     pub xpok: Option<Xpok>,
     /// Localhost-only listener that receives CC's hook/permission callbacks.
     pub hooks: Hooks,
@@ -63,24 +63,6 @@ impl Hooks {
     /// Base URL CC's hook curls + the mcp subprocess post back to.
     pub fn base_url(&self) -> String {
         format!("http://{}", self.bind)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Server {
-    pub bind: String,
-    pub base_url: String,
-    pub reload_on_change: bool,
-}
-
-impl Default for Server {
-    fn default() -> Self {
-        Self {
-            bind: "127.0.0.1:7070".to_string(),
-            base_url: "http://127.0.0.1:7070".to_string(),
-            reload_on_change: true,
-        }
     }
 }
 
@@ -258,7 +240,7 @@ mod tests {
     #[test]
     fn parses_skeleton() {
         let cfg: Config = serde_yaml::from_str(skeleton_yaml()).unwrap();
-        assert_eq!(cfg.server.bind, "127.0.0.1:7070");
+        assert_eq!(cfg.hooks.bind, "127.0.0.1:7070");
         assert_eq!(cfg.cc.permission_mode, "acceptEdits");
         assert_eq!(cfg.cc.permission_timeout.0, Duration::from_secs(60));
         assert!(cfg.projects.iter().any(|p| p.name == "po-k"));

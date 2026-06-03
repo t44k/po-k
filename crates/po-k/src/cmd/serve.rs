@@ -1,25 +1,25 @@
-//! `po-k serve` — the HTTP service.
+//! `po-k serve` — headless WebSocket client + CC manager (M14 §5.9).
 //!
-//! Loads `po-k.yaml` + the bearer token, builds the shared `AppState`, optionally
-//! spawns the hot-reload watcher, and runs the axum router until SIGINT/SIGTERM.
+//! po-k no longer runs an orchestrator-facing HTTP server. It:
+//!   1. loads config + bearer token,
+//!   2. opens the events DB,
+//!   3. recovers surviving sessions,
+//!   4. starts the localhost-only hook listener (CC callbacks),
+//!   5. connects to Xpo-k over WebSocket and registers,
+//!   6. runs until SIGINT/SIGTERM.
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
-use std::net::SocketAddr;
-use std::str::FromStr;
 
 use crate::auth::Token;
 use crate::config;
 use crate::config_watch;
 use crate::events_store;
-use crate::http;
+use crate::hook_listener;
 use crate::state::AppState;
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
-    /// Bind override (e.g. `0.0.0.0:7070`). Logs a one-time WARN if non-loopback.
-    #[arg(long)]
-    pub bind: Option<String>,
     /// Kept for symmetry — `po-k serve` always runs in the foreground today.
     #[arg(long)]
     pub foreground: bool,
@@ -27,7 +27,6 @@ pub struct Args {
     #[arg(long)]
     pub install_systemd: bool,
     /// Write a system unit at /etc/systemd/system/po-k.service (requires root).
-    /// Implies --install-systemd. Default: user unit.
     #[arg(long)]
     pub system: bool,
 }
@@ -44,13 +43,8 @@ pub async fn run(args: Args) -> Result<()> {
     let token = Token::from_file(&token_path)
         .with_context(|| format!("loading bearer token from {}", token_path.display()))?;
 
-    let bind = args.bind.clone().unwrap_or_else(|| cfg.server.bind.clone());
-    let reload_on_change = cfg.server.reload_on_change;
-    let addr: SocketAddr = SocketAddr::from_str(&bind)
-        .with_context(|| format!("parsing bind address {bind:?}"))?;
-    if !is_loopback(&addr) {
-        tracing::warn!(%addr, "binding non-loopback address — make sure you tunnel this (SSH/Tailscale/WireGuard); po-k does not terminate TLS");
-    }
+    let hook_bind = cfg.hooks.bind.clone();
+    let xpok = cfg.xpok.clone();
 
     let db_path = config::expand_path("~/.config/po-k/events.db");
     let db = events_store::open(&db_path)
@@ -60,36 +54,46 @@ pub async fn run(args: Args) -> Result<()> {
 
     let state = AppState::new(token, cfg, cfg_path.clone(), db);
 
-    // Rebuild the Registry from the DB before serving requests, so /sessions
-    // and /status reflect surviving CC subprocesses immediately on first GET.
-    // Best-effort: a failure here logs and we keep serving (empty registry).
+    // Rebuild the Registry from the DB before accepting commands.
     if let Err(e) = crate::recovery::recover_sessions(&state).await {
         tracing::warn!(error = %e, "session recovery failed; starting clean");
     }
 
-    if reload_on_change {
-        config_watch::spawn(cfg_path.clone(), state.config.clone());
+    // Config hot-reload (also forwards ConfigUpdate to Xpo-k via the uplink).
+    config_watch::spawn(cfg_path.clone(), state.config.clone());
+
+    // The only HTTP server po-k keeps: the localhost hook/permission listener.
+    {
+        let state = state.clone();
+        let bind = hook_bind.clone();
+        tokio::spawn(async move {
+            if let Err(e) = hook_listener::serve(state, &bind).await {
+                tracing::error!(error = %e, "hook listener exited");
+            }
+        });
     }
 
-    let app = http::router(state);
+    // Connect to Xpo-k (the only orchestrator interface). Without it, po-k can
+    // still receive CC hooks but can't be driven.
+    match xpok {
+        Some(x) => {
+            tracing::info!(url = %x.url, "connecting to xpo-k");
+            crate::xpok_client::spawn(state.clone(), x);
+        }
+        None => {
+            tracing::warn!("no `xpok` configured — po-k will not be reachable by an orchestrator");
+        }
+    }
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
-    tracing::info!(%addr, version = env!("CARGO_PKG_VERSION"), config = %cfg_path.display(), "po-k serve listening");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("axum serve")?;
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        hook_bind = %hook_bind,
+        config = %cfg_path.display(),
+        "po-k serve started"
+    );
+    shutdown_signal().await;
+    tracing::info!("shutting down");
     Ok(())
-}
-
-fn is_loopback(addr: &SocketAddr) -> bool {
-    match addr {
-        SocketAddr::V4(v4) => v4.ip().is_loopback(),
-        SocketAddr::V6(v6) => v6.ip().is_loopback(),
-    }
 }
 
 async fn shutdown_signal() {

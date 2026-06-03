@@ -147,6 +147,7 @@ async fn spawn_for_project(
         .with_context(|| format!("creating {}", session_dir.display()))?;
 
     let token_file = crate::config::expand_path(&cfg.auth.bearer_token_file);
+    let base_url = cfg.hooks.base_url();
 
     // model / effort / permission_mode precedence:
     //   explicit override (opts) > profile.settings > project/cc default.
@@ -170,7 +171,7 @@ async fn spawn_for_project(
     let (hooks_path, mcp_path, plugin_dir): (PathBuf, PathBuf, Option<PathBuf>) =
         if let Some(profile) = &opts.profile {
             let pok = crate::profile::PokHookContext {
-                base_url: &cfg.server.base_url,
+                base_url: &base_url,
                 token: state.token.raw(),
                 token_file: &token_file,
                 sid: &sid,
@@ -188,10 +189,10 @@ async fn spawn_for_project(
             let mcp_path = session_dir.join("mcp.json");
             std::fs::write(
                 &hooks_path,
-                render_hooks_json(&cfg.server.base_url, &sid, state.token.raw()),
+                render_hooks_json(&base_url, &sid, state.token.raw()),
             )
             .with_context(|| format!("writing {}", hooks_path.display()))?;
-            std::fs::write(&mcp_path, render_mcp_json(&sid, &cfg.server.base_url, &token_file))
+            std::fs::write(&mcp_path, render_mcp_json(&sid, &base_url, &token_file))
                 .with_context(|| format!("writing {}", mcp_path.display()))?;
             (hooks_path, mcp_path, None)
         };

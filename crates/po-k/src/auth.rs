@@ -1,17 +1,9 @@
-//! Bearer-token auth middleware.
-//!
-//! - The token is loaded from `auth.bearer_token_file` (default `~/.config/po-k/auth.token`).
-//! - `/health` is the only unauthenticated route — wire it on a separate router.
-//! - Everything else requires `Authorization: Bearer <token>`.
+//! Bearer token loaded from `auth.bearer_token_file`. po-k no longer runs an
+//! authenticated HTTP server (the localhost hook listener is unauthenticated),
+//! but the token is still baked into CC's hook curls + the `po-k mcp`
+//! subprocess invocation, and presented to Xpo-k on the WebSocket connect.
 
 use anyhow::{Context, Result};
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::{header, Request, StatusCode};
-use axum::middleware::Next;
-use axum::response::Response;
-use axum::Json;
-use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -49,6 +41,7 @@ impl Token {
 
     /// Constant-time-ish equality. Token comparison doesn't need full timing
     /// resistance for a localhost service, but we still avoid early exits.
+    #[allow(dead_code)] // used in tests; po-k no longer auth-checks requests
     pub fn matches(&self, candidate: &str) -> bool {
         let a = self.value.as_bytes();
         let b = candidate.as_bytes();
@@ -73,39 +66,6 @@ pub fn generate_hex_token() -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
-}
-
-pub async fn require_bearer(
-    State(token): State<Token>,
-    req: Request<Body>,
-    next: Next,
-) -> Result<Response, (StatusCode, Json<Value>)> {
-    let header_value = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let presented = header_value
-        .strip_prefix("Bearer ")
-        .or_else(|| header_value.strip_prefix("bearer "));
-    let presented = match presented {
-        Some(p) => p,
-        None => {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({
-                    "error": "missing or malformed Authorization header — expected `Authorization: Bearer <token>` (token at ~/.config/po-k/auth.token)"
-                })),
-            ));
-        }
-    };
-    if !token.matches(presented) {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "invalid bearer token" })),
-        ));
-    }
-    Ok(next.run(req).await)
 }
 
 #[cfg(test)]

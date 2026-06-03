@@ -36,6 +36,7 @@ impl Status {
 
     /// CC is no longer actively producing output for the current turn — i.e.
     /// the orchestrator can resume. Everything except `Working`.
+    #[allow(dead_code)]
     pub fn is_stopped(self) -> bool {
         !matches!(self, Status::Working)
     }

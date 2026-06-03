@@ -19,13 +19,19 @@ pub async fn run() -> Result<()> {
     let token_path = config::expand_path(&cfg.auth.bearer_token_file);
     let token_state = if token_path.exists() { "ok" } else { "MISSING" };
 
+    let xpok = cfg
+        .xpok
+        .as_ref()
+        .map(|x| x.url.clone())
+        .unwrap_or_else(|| "<none>".into());
     println!(
-        "po-k {} · config {} · token {} · {} projects · bind {}",
+        "po-k {} · config {} · token {} · {} projects · hook-bind {} · xpok {}",
         env!("CARGO_PKG_VERSION"),
         cfg_path.display(),
         token_state,
         cfg.projects.len(),
-        cfg.server.bind,
+        cfg.hooks.bind,
+        xpok,
     );
     Ok(())
 }
