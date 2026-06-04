@@ -70,9 +70,12 @@ pub fn derive_status(latest: &HashMap<String, i64>, ended_at: Option<&str>) -> (
         return (Status::Ended, None);
     }
 
-    // Latest "stopped" boundary (turn finished). `subagent_stop` is NOT part of
-    // it — a subagent finishing doesn't idle the main agent.
-    let stop_seq = [get("stop"), get("turn_end")].into_iter().flatten().max();
+    // Latest "stopped" boundary (turn finished). Neither `subagent_stop` nor
+    // `turn_end` is included: a subagent finishing doesn't idle the main agent,
+    // and `turn_end` is a JSONL tailer artefact that fires between tool-use
+    // rounds within a single CC turn — only the `stop` hook reliably signals
+    // that CC is done and back at the `❯` prompt.
+    let stop_seq = get("stop");
     // A turn is *started* by a `user_prompt`. Intra-turn outputs
     // (assistant_message / tool_use / tool_result) are deliberately NOT counted
     // as activity here: the JSONL tailer can flush the turn's final
@@ -106,7 +109,7 @@ pub fn derive_status(latest: &HashMap<String, i64>, ended_at: Option<&str>) -> (
         _ => {}
     }
 
-    // 4. IDLE — last boundary is a stop/turn_end, or no events at all.
+    // 4. IDLE — last boundary is a stop, or no events at all.
     (Status::Idle, stop_seq)
 }
 
@@ -150,9 +153,19 @@ mod tests {
     }
 
     #[test]
-    fn turn_end_is_idle() {
+    fn turn_end_alone_does_not_idle() {
+        // turn_end is a JSONL artefact between tool-use rounds — it must NOT
+        // act as a stop boundary or /wait would return prematurely.
         let l = m(&[("user_prompt", 5), ("turn_end", 10)]);
-        assert_eq!(derive_status(&l, None), (Status::Idle, Some(10)));
+        assert_eq!(derive_status(&l, None), (Status::Working, Some(5)));
+    }
+
+    #[test]
+    fn turn_end_between_stop_and_prompt_is_still_working() {
+        // Prompt after a stop reopens "working", and a turn_end after the
+        // prompt must not flip it back to idle.
+        let l = m(&[("stop", 3), ("user_prompt", 5), ("turn_end", 8)]);
+        assert_eq!(derive_status(&l, None), (Status::Working, Some(5)));
     }
 
     #[test]
