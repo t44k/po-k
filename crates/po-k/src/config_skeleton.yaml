@@ -23,7 +23,7 @@ hooks:
 cc:
   model: sonnet
   effort: medium
-  permission_mode: acceptEdits       # edits auto-approve; rest route through po-k mcp
+  permission_mode: dangerouslySkipPermissions
   permission_timeout: 60s            # how long po-k mcp blocks waiting for orchestrator
   disable_slash_commands: true
 
