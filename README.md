@@ -1,5 +1,8 @@
 # po-k & Xpo-k
 
+*po-k* — from the Hungarian **pók** (spider): one process at the centre of a
+web of Claude Code sessions, legs reaching every machine.
+
 Drive fleets of Claude Code (CC) instances over zellij, from a single HTTP API,
 across any number of machines.
 
