@@ -23,7 +23,7 @@ hooks:
 cc:
   model: sonnet
   effort: medium
-  permission_mode: dangerouslySkipPermissions
+  permission_mode: bypassPermissions        # skip all permission prompts
   permission_timeout: 60s            # how long po-k mcp blocks waiting for orchestrator
   disable_slash_commands: true
 

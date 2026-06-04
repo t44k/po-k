@@ -247,7 +247,7 @@ hooks:
 cc:                                    # defaults; per-project overrides allowed
   model: sonnet
   effort: medium
-  permission_mode: dangerouslySkipPermissions
+  permission_mode: bypassPermissions
   permission_timeout: 60s
   disable_slash_commands: true
 

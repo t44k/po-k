@@ -517,7 +517,7 @@ mod tests {
             sid: "abc-123",
             model: "sonnet",
             effort: "medium",
-            permission_mode: "dangerouslySkipPermissions",
+            permission_mode: "bypassPermissions",
             disable_slash_commands: true,
             add_dirs,
             mcp_config: mcp,
@@ -540,7 +540,7 @@ mod tests {
         assert!(bash.contains("--session-id abc-123"));
         assert!(bash.contains("--model sonnet"));
         assert!(bash.contains("--effort medium"));
-        assert!(bash.contains("--permission-mode dangerouslySkipPermissions"));
+        assert!(bash.contains("--permission-mode bypassPermissions"));
         assert!(bash.contains("--permission-prompt-tool mcp__po-k__approve"));
         assert!(bash.contains("--mcp-config /tmp/m.json"));
         assert!(bash.contains("--settings /tmp/h.json"));

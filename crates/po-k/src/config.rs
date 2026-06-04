@@ -97,7 +97,7 @@ impl Default for CcDefaults {
         Self {
             model: "sonnet".to_string(),
             effort: "medium".to_string(),
-            permission_mode: "dangerouslySkipPermissions".to_string(),
+            permission_mode: "bypassPermissions".to_string(),
             permission_timeout: HumanDuration(Duration::from_secs(60)),
             disable_slash_commands: true,
         }
@@ -241,7 +241,7 @@ mod tests {
     fn parses_skeleton() {
         let cfg: Config = serde_yaml::from_str(skeleton_yaml()).unwrap();
         assert_eq!(cfg.hooks.bind, "127.0.0.1:7070");
-        assert_eq!(cfg.cc.permission_mode, "dangerouslySkipPermissions");
+        assert_eq!(cfg.cc.permission_mode, "bypassPermissions");
         assert_eq!(cfg.cc.permission_timeout.0, Duration::from_secs(60));
         assert!(cfg.projects.iter().any(|p| p.name == "po-k"));
     }
