@@ -67,10 +67,22 @@ async fn run(state: AppState, sid: String, cwd: String) -> Result<()> {
         .map(|m| m.len())
         .unwrap_or(0);
     let stored = events_store::get_jsonl_offset(db, &sid).await.unwrap_or(0) as u64;
-    let mut offset: u64 = if stored > file_size { file_size } else { stored };
+    let offset: u64 = if stored > file_size { file_size } else { stored };
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(offset)).await.ok();
+    pump(&state, &sid, &mut reader, offset).await
+}
 
+/// The read/append loop, split out from `run` so it can be tested against a
+/// hand-written transcript file. Consumes only newline-terminated lines.
+async fn pump(
+    state: &AppState,
+    sid: &str,
+    reader: &mut BufReader<File>,
+    mut offset: u64,
+) -> Result<()> {
+    let db = &state.db;
+    let sessions = &state.sessions;
     let mut line = String::new();
     loop {
         line.clear();
@@ -78,7 +90,7 @@ async fn run(state: AppState, sid: String, cwd: String) -> Result<()> {
             Ok(0) => {
                 // EOF — if the session is gone, stop; otherwise sleep and
                 // check for newly appended bytes.
-                if sessions.get(&sid).await.is_none() {
+                if sessions.get(sid).await.is_none() {
                     tracing::info!(sid, "session ended; jsonl tailer stopping");
                     return Ok(());
                 }
@@ -86,6 +98,25 @@ async fn run(state: AppState, sid: String, cwd: String) -> Result<()> {
                 continue;
             }
             Ok(n) => {
+                // `read_line` returns whatever it has when it hits EOF — which,
+                // for a file CC is still appending to, can be a *partial* line
+                // with no trailing newline (a large assistant message is often
+                // flushed in several writes). Committing a partial line would
+                // parse-fail, advance the offset past it, and then read the
+                // completion as a second garbage line — silently dropping the
+                // event. So only consume newline-terminated lines; otherwise
+                // rewind to the line start and re-read once more bytes land.
+                if !line.ends_with('\n') {
+                    reader.seek(SeekFrom::Start(offset)).await.ok();
+                    if sessions.get(sid).await.is_none() {
+                        // Session gone and the line never completed — nothing
+                        // more is coming. Drop the incomplete remnant and stop.
+                        tracing::info!(sid, "session ended mid-line; jsonl tailer stopping");
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
                 let next_offset = offset + n as u64;
                 let trimmed = line.trim_end();
                 if !trimmed.is_empty() {
@@ -93,7 +124,7 @@ async fn run(state: AppState, sid: String, cwd: String) -> Result<()> {
                         let ts = events_store::now_iso();
                         if events_store::append_jsonl_event(
                             db,
-                            &sid,
+                            sid,
                             &ts,
                             &kind,
                             &payload,
@@ -102,19 +133,19 @@ async fn run(state: AppState, sid: String, cwd: String) -> Result<()> {
                         .await
                         .is_ok()
                         {
-                            state.bus.notify(&sid).await;
+                            state.bus.notify(sid).await;
                             // Forward to Xpo-k (the atomic offset bump can't go
                             // through `record`, so forward explicitly).
-                            crate::core::events::forward(&state, &sid, &kind, &payload).await;
+                            crate::core::events::forward(state, sid, &kind, &payload).await;
                         }
                     } else {
                         // Unprojectable line: still advance the offset so we
                         // don't re-read it next restart.
-                        let _ = events_store::set_jsonl_offset(db, &sid, next_offset as i64).await;
+                        let _ = events_store::set_jsonl_offset(db, sid, next_offset as i64).await;
                     }
                 } else {
                     // Blank line: advance past it too.
-                    let _ = events_store::set_jsonl_offset(db, &sid, next_offset as i64).await;
+                    let _ = events_store::set_jsonl_offset(db, sid, next_offset as i64).await;
                 }
                 offset = next_offset;
             }
@@ -273,6 +304,107 @@ fn project_event(line: &str) -> Option<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Token;
+    use crate::config::Config;
+    use crate::state::AppState;
+    use tokio::io::AsyncWriteExt;
+
+    async fn test_state_with_session(sid: &str) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::events_store::open(&dir.path().join("e.db")).await.unwrap();
+        let state = AppState::new(
+            Token::__test_new("t".into()),
+            Config::default(),
+            std::path::PathBuf::from("/dev/null"),
+            db,
+        );
+        // Seed the session row (append_jsonl_event UPDATEs it) and register it
+        // (so the EOF loop doesn't exit before we feed the rest of the line).
+        crate::events_store::insert_session(
+            &state.db,
+            &crate::events_store::SessionRow {
+                sid: sid.into(),
+                project: "p".into(),
+                cwd: "/x".into(),
+                zellij_session: "z".into(),
+                model: None,
+                effort: None,
+                started_at: "2026-06-04T00:00:00Z".into(),
+                ended_at: None,
+                pid: None,
+                last_event_seq: 0,
+                profiles: None,
+                plugin_dir: None,
+            },
+        )
+        .await
+        .unwrap();
+        state
+            .sessions
+            .insert(crate::session::RunningSession {
+                sid: sid.into(),
+                project: "p".into(),
+                cwd: "/x".into(),
+                zellij_session: "z".into(),
+                model: "m".into(),
+                effort: "e".into(),
+                started_at: "now".into(),
+                hooks_path: "/h".into(),
+                mcp_path: "/m".into(),
+                pid: None,
+                profiles: vec![],
+                plugin_dir: None,
+            })
+            .await;
+        (state, dir)
+    }
+
+    /// Regression: a transcript line flushed in two writes (partial, then the
+    /// rest) must be ingested exactly once — never split into garbage and
+    /// dropped. This is the assistant_message-missing-from-/messages bug.
+    #[tokio::test]
+    async fn partial_line_is_not_dropped() {
+        let (state, dir) = test_state_with_session("s1").await;
+        let path = dir.path().join("t.jsonl");
+
+        // Write the first half of an assistant message — no trailing newline.
+        let head = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hel"#;
+        tokio::fs::write(&path, head).await.unwrap();
+
+        let f = File::open(&path).await.unwrap();
+        let mut reader = BufReader::new(f);
+        let st = state.clone();
+        let sid = "s1".to_string();
+        let pump_task = tokio::spawn(async move { pump(&st, &sid, &mut reader, 0).await });
+
+        // Give the pump time to read the partial line and (correctly) wait.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mid = crate::events_store::select_events_since(&state.db, "s1", 0, 100)
+            .await
+            .unwrap();
+        assert!(mid.is_empty(), "partial line must not be committed yet");
+
+        // Append the rest, completing the line.
+        let mut f = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        f.write_all(b"lo there\"}]}}\n").await.unwrap();
+        f.flush().await.unwrap();
+
+        // Let the pump pick it up, then end the session so it exits.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        state.sessions.remove_for_test("s1").await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), pump_task).await;
+
+        let events = crate::events_store::select_events_since(&state.db, "s1", 0, 100)
+            .await
+            .unwrap();
+        let msgs: Vec<_> = events.iter().filter(|e| e.kind == "assistant_message").collect();
+        assert_eq!(msgs.len(), 1, "exactly one assistant_message, got {events:?}");
+        assert_eq!(msgs[0].payload["text"], "hello there");
+    }
 
     #[test]
     fn sanitize_known_paths() {

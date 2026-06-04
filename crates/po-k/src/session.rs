@@ -68,6 +68,11 @@ impl Registry {
     async fn remove(&self, sid: &str) -> Option<RunningSession> {
         self.inner.lock().await.remove(sid)
     }
+
+    #[cfg(test)]
+    pub async fn remove_for_test(&self, sid: &str) {
+        self.remove(sid).await;
+    }
 }
 
 /// Errors that can surface to the HTTP layer; the `serve` layer maps these to
