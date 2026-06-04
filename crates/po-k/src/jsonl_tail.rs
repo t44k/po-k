@@ -170,8 +170,17 @@ pub fn transcript_path(cwd: &str, sid: &str) -> Result<PathBuf> {
 
 /// CC's per-project dir name. `/workspace` → `-workspace`,
 /// `/home/me/with.dot` → `-home-me-with-dot`.
+///
+/// CC derives this from its *normalized* working directory (the kernel's
+/// getcwd, which has no trailing slash), so we must normalize too. A config
+/// `cwd` with a trailing slash (`/home/me/todo/`) would otherwise sanitize to
+/// `-home-me-todo-` and never match CC's `-home-me-todo` — leaving the tailer
+/// waiting on a path that never appears (no JSONL events ever ingested).
 pub fn sanitize_cwd(cwd: &str) -> String {
-    cwd.chars()
+    let normalized = cwd.trim_end_matches('/');
+    let normalized = if normalized.is_empty() { "/" } else { normalized };
+    normalized
+        .chars()
         .map(|c| if c == '/' || c == '.' { '-' } else { c })
         .collect()
 }
@@ -411,6 +420,15 @@ mod tests {
         assert_eq!(sanitize_cwd("/workspace"), "-workspace");
         assert_eq!(sanitize_cwd("/home/me/dotfiles"), "-home-me-dotfiles");
         assert_eq!(sanitize_cwd("/home/me/with.dot"), "-home-me-with-dot");
+    }
+
+    #[test]
+    fn sanitize_normalizes_trailing_slash() {
+        // A config cwd with a trailing slash must match CC's normalized getcwd.
+        assert_eq!(sanitize_cwd("/home/devuser/todo/"), "-home-devuser-todo");
+        assert_eq!(sanitize_cwd("/home/devuser/todo"), "-home-devuser-todo");
+        assert_eq!(sanitize_cwd("/workspace///"), "-workspace");
+        assert_eq!(sanitize_cwd("/"), "-");
     }
 
     #[test]
