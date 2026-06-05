@@ -55,6 +55,12 @@ impl Status {
 ///   (the kill path appends `cc_exited` before writing `ended_at`).
 /// - `subagent_stop` is deliberately excluded from the turn-boundary sets: a
 ///   subagent finishing does not return the main agent to idle.
+/// - CC's post-turn `idle_prompt` notification ("Claude is waiting for your
+///   input") is remapped to `idle_notification` at hook ingestion
+///   (`core::hooks::ingest`). That kind is not in `latest_status_seqs`'
+///   IN-clause, so it never reaches this map and never drives
+///   `awaiting_input` — only genuine notifications (e.g. permission prompts)
+///   are stored as `notification`.
 pub fn derive_status(latest: &HashMap<String, i64>, ended_at: Option<&str>) -> (Status, Option<i64>) {
     let get = |k: &str| latest.get(k).copied();
 
@@ -196,6 +202,17 @@ mod tests {
     fn notification_newest_is_awaiting() {
         let l = m(&[("stop", 10), ("notification", 11)]);
         assert_eq!(derive_status(&l, None), (Status::AwaitingInput, Some(11)));
+    }
+
+    #[test]
+    fn idle_notification_after_stop_stays_idle() {
+        // CC's idle_prompt notification is stored as `idle_notification` at
+        // hook ingestion and excluded from latest_status_seqs' IN-clause, so
+        // it never appears in the map derive_status receives. Even if it did,
+        // derive_status never consults the kind — the post-turn sequence
+        // stop → idle_notification must read as idle, not awaiting_input.
+        let l = m(&[("user_prompt", 5), ("stop", 10), ("idle_notification", 11)]);
+        assert_eq!(derive_status(&l, None), (Status::Idle, Some(10)));
     }
 
     #[test]

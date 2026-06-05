@@ -576,11 +576,15 @@ mod tests {
         append_event(&db, "s5", "t", "raw", &json!({})).await.unwrap();          // 2 (excluded)
         append_event(&db, "s5", "t", "tool_use", &json!({})).await.unwrap();     // 3
         append_event(&db, "s5", "t", "stop", &json!({})).await.unwrap();         // 4
+        // idle_prompt notifications are remapped to this kind at hook
+        // ingestion; it must stay outside the status-relevant IN-clause.
+        append_event(&db, "s5", "t", "idle_notification", &json!({})).await.unwrap(); // 5 (excluded)
         let latest = latest_status_seqs(&db, "s5").await.unwrap();
         assert_eq!(latest.get("user_prompt"), Some(&1));
         assert_eq!(latest.get("tool_use"), Some(&3));
         assert_eq!(latest.get("stop"), Some(&4));
         assert_eq!(latest.get("raw"), None); // not a status-relevant kind
+        assert_eq!(latest.get("idle_notification"), None); // never drives awaiting_input
     }
 
     #[tokio::test]
