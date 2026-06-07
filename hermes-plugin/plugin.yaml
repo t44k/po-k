@@ -1,0 +1,10 @@
+name: pok
+description: "Drive Claude Code sessions on remote po-k instances via Xpo-k HTTP API"
+version: 0.1.0
+author: Tamas
+type: tools
+requires_env:
+  - XPOK_URL
+optional_env:
+  - XPOK_TOKEN_FILE
+  - XPOK_TOKEN
