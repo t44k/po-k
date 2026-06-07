@@ -38,6 +38,11 @@ pub struct Xpok {
     pub token: String,
     #[serde(default = "default_reconnect")]
     pub reconnect_interval: HumanDuration,
+    /// Override the hostname advertised to Xpo-k. If unset, uses the OS
+    /// hostname. Must be unique across all connected po-k instances — Xpo-k
+    /// rejects duplicate hostnames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 fn default_reconnect() -> HumanDuration {
@@ -90,6 +95,9 @@ pub struct CcDefaults {
     /// decision. Times out → deny.
     pub permission_timeout: HumanDuration,
     pub disable_slash_commands: bool,
+    /// When true, allow sessions in arbitrary directories (no pre-configured
+    /// project required). Advertised to Xpo-k as a capability flag.
+    pub ad_hoc: bool,
 }
 
 impl Default for CcDefaults {
@@ -100,6 +108,7 @@ impl Default for CcDefaults {
             permission_mode: "bypassPermissions".to_string(),
             permission_timeout: HumanDuration(Duration::from_secs(60)),
             disable_slash_commands: true,
+            ad_hoc: false,
         }
     }
 }

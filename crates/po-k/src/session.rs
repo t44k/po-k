@@ -83,6 +83,8 @@ pub enum SpawnError {
     UnknownProject(String),
     #[error("a session for project {project:?} is already running (sid {sid})")]
     AlreadyRunning { project: String, sid: String },
+    #[error("ad-hoc sessions disabled")]
+    AdHocDisabled,
     #[error("spawning session: {0}")]
     Other(#[from] anyhow::Error),
 }
@@ -104,6 +106,9 @@ pub struct SpawnOptions {
     pub model: Option<String>,
     /// Explicit effort override (highest precedence).
     pub effort: Option<String>,
+    /// Explicit working directory. When set, overrides the project's configured
+    /// cwd (or creates an ad-hoc project if the project name is unknown/empty).
+    pub cwd_override: Option<String>,
 }
 
 pub async fn spawn(
@@ -112,12 +117,60 @@ pub async fn spawn(
     opts: SpawnOptions,
 ) -> Result<RunningSession, SpawnError> {
     let snapshot = state.config.read().await.clone();
-    let project = snapshot
-        .projects
-        .iter()
-        .find(|p| p.name == project_name)
-        .ok_or_else(|| SpawnError::UnknownProject(project_name.to_string()))?
-        .clone();
+
+    // --- Resolve the project (configured or ad-hoc) ---
+    let project = if let Some(configured) = snapshot.projects.iter().find(|p| p.name == project_name) {
+        // Known project — optionally override cwd.
+        let mut p = configured.clone();
+        if let Some(ref cwd) = opts.cwd_override {
+            p.cwd = cwd.clone();
+        }
+        p
+    } else if opts.cwd_override.is_some() {
+        // Unknown project name (or empty) + explicit cwd → ad-hoc session.
+        if !snapshot.cc.ad_hoc {
+            return Err(SpawnError::AdHocDisabled);
+        }
+        let cwd = opts.cwd_override.as_ref().unwrap().clone();
+        let name = if project_name.is_empty() {
+            // Derive a slug from the directory name.
+            let raw = std::path::Path::new(&cwd)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "adhoc".to_string());
+            // Sanitise to a valid project name.
+            raw.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                .collect::<String>()
+        } else {
+            project_name.to_string()
+        };
+        Project {
+            name,
+            cwd,
+            model: None,
+            effort: None,
+            add_dirs: vec![],
+            zellij_session: None,
+        }
+    } else if project_name.is_empty() {
+        return Err(SpawnError::UnknownProject("(empty)".to_string()));
+    } else {
+        return Err(SpawnError::UnknownProject(project_name.to_string()));
+    };
+
+    // For ad-hoc sessions, ensure the target directory exists.
+    if opts.cwd_override.is_some() {
+        let cwd_path = std::path::Path::new(&project.cwd);
+        if !cwd_path.exists() {
+            std::fs::create_dir_all(cwd_path)
+                .map_err(|e| SpawnError::Other(
+                    anyhow::anyhow!("creating ad-hoc directory {:?}: {e}", project.cwd)
+                ))?;
+            tracing::info!(cwd = %project.cwd, "created ad-hoc directory");
+        }
+    }
+
     // One CC per project: every session for a project shares one zellij session
     // (and pane), so a second spawn would type its bootstrap into the pane
     // already running the first session's CC. Refuse instead of clobbering —

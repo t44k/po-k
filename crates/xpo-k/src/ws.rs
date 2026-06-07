@@ -93,34 +93,54 @@ async fn inbound(
             version,
             projects,
             sessions,
+            caps,
         } => {
             let conn = PokConn {
                 pok_id: id.clone(),
-                hostname,
+                hostname: hostname.clone(),
                 version,
                 tx: tx.clone(),
+                caps,
             };
             let session_pairs: Vec<(String, String)> = sessions
                 .iter()
                 .map(|s| (s.sid.clone(), s.project.clone()))
                 .collect();
-            reg.register(conn, &projects, &session_pairs);
-            *pok_id = Some(id.clone());
-            // Seed aggregated session rows.
-            for s in &sessions {
-                let _ = sqlx::query(
-                    "INSERT OR REPLACE INTO xpok_sessions (sid, pok_id, project, status, started_at) VALUES (?1,?2,?3,?4,?5)",
-                )
-                .bind(&s.sid)
-                .bind(&id)
-                .bind(&s.project)
-                .bind(&s.status)
-                .bind(store::now_iso())
-                .execute(&state.db)
-                .await;
+            match reg.register(conn, &projects, &session_pairs) {
+                Ok(()) => {
+                    *pok_id = Some(id.clone());
+                    // Seed aggregated session rows.
+                    for s in &sessions {
+                        let _ = sqlx::query(
+                            "INSERT OR REPLACE INTO xpok_sessions (sid, pok_id, project, status, started_at) VALUES (?1,?2,?3,?4,?5)",
+                        )
+                        .bind(&s.sid)
+                        .bind(&id)
+                        .bind(&s.project)
+                        .bind(&s.status)
+                        .bind(store::now_iso())
+                        .execute(&state.db)
+                        .await;
+                    }
+                    tracing::info!(pok_id = %id, hostname = %hostname, projects = projects.len(), "po-k registered");
+                    let _ = tx.send(WsMsg::Registered { pok_id: id });
+                }
+                Err(existing_pok_id) => {
+                    tracing::warn!(
+                        pok_id = %id,
+                        hostname = %hostname,
+                        existing = %existing_pok_id,
+                        "rejecting registration: hostname already taken"
+                    );
+                    let _ = tx.send(WsMsg::Error {
+                        request_id: None,
+                        code: pok_proto::ErrorCode::Conflict,
+                        message: format!(
+                            "hostname {hostname:?} already registered by po-k {existing_pok_id}"
+                        ),
+                    });
+                }
             }
-            tracing::info!(pok_id = %id, projects = projects.len(), "po-k registered");
-            let _ = tx.send(WsMsg::Registered { pok_id: id });
         }
         WsMsg::ConfigUpdate { projects } => {
             if let Some(id) = pok_id.as_deref() {

@@ -110,22 +110,51 @@ async fn by_session(
 }
 
 /// `GET /projects` — fan out to every connected po-k, merge the arrays.
+/// Each project entry is enriched with the owning po-k's `pok_id` and `hostname`.
 async fn list_projects(State(st): State<XState>) -> Response {
-    fan_out(&st, "/projects").await
-}
-
-/// `GET /sessions` — fan out, merge.
-async fn list_sessions(State(st): State<XState>) -> Response {
-    fan_out(&st, "/sessions").await
-}
-
-async fn fan_out(st: &XState, path: &str) -> Response {
-    let pok_ids: Vec<String> = st.registry.conns.iter().map(|e| e.pok_id.clone()).collect();
+    let pok_ids: Vec<(String, String)> = st
+        .registry
+        .conns
+        .iter()
+        .map(|e| (e.pok_id.clone(), e.hostname.clone()))
+        .collect();
     let mut merged: Vec<Value> = Vec::new();
-    for id in pok_ids {
-        if let Ok(r) = call_pok(st, &id, "GET", path, None).await {
+    for (id, hostname) in pok_ids {
+        if let Ok(r) = call_pok(&st, &id, "GET", "/projects", None).await {
             if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&r.body) {
-                merged.extend(arr);
+                for mut p in arr {
+                    if let Some(obj) = p.as_object_mut() {
+                        obj.insert("pok_id".into(), json!(id));
+                        obj.insert("hostname".into(), json!(hostname));
+                    }
+                    merged.push(p);
+                }
+            }
+        }
+    }
+    (StatusCode::OK, Json(json!(merged))).into_response()
+}
+
+/// `GET /sessions` — fan out to every connected po-k, merge the arrays.
+/// Each session entry is enriched with the owning po-k's `pok_id` and `hostname`.
+async fn list_sessions(State(st): State<XState>) -> Response {
+    let pok_ids: Vec<(String, String)> = st
+        .registry
+        .conns
+        .iter()
+        .map(|e| (e.pok_id.clone(), e.hostname.clone()))
+        .collect();
+    let mut merged: Vec<Value> = Vec::new();
+    for (id, hostname) in pok_ids {
+        if let Ok(r) = call_pok(&st, &id, "GET", "/sessions", None).await {
+            if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&r.body) {
+                for mut s in arr {
+                    if let Some(obj) = s.as_object_mut() {
+                        obj.insert("pok_id".into(), json!(id));
+                        obj.insert("hostname".into(), json!(hostname));
+                    }
+                    merged.push(s);
+                }
             }
         }
     }
@@ -134,16 +163,81 @@ async fn fan_out(st: &XState, path: &str) -> Response {
 
 /// Extended `POST /sessions` (spec §4.3): resolve + merge profiles, then create
 /// the session on the owning po-k with the merged profile inline.
+///
+/// Routing:
+///  1. If `project` is given and a connected po-k owns it → route there.
+///  2. If `pok_id` or `host` is given → route to that specific po-k instance.
+///  3. Otherwise → 404.
 async fn create_session(State(st): State<XState>, Json(body): Json<Value>) -> Response {
-    let project = match body.get("project").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        None => return err(StatusCode::BAD_REQUEST, "missing `project`"),
-    };
-    let Some(pok_id) = st.registry.pok_for_project(&project) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            format!("no connected po-k owns project {project:?}"),
-        );
+    let project = body.get("project").and_then(|v| v.as_str()).unwrap_or("");
+    let cwd = body.get("cwd").and_then(|v| v.as_str());
+    let target_pok = body
+        .get("pok_id")
+        .or_else(|| body.get("host"))
+        .and_then(|v| v.as_str());
+
+    // Resolve the owning po-k.
+    let pok_id = if !project.is_empty() {
+        // Known project → route by project name.
+        match st.registry.pok_for_project(project) {
+            Some(id) => id,
+            None => {
+                // Project unknown — fall back to explicit target if given.
+                if let Some(t) = target_pok {
+                    match st.registry.pok_by_id_or_host(t) {
+                        Some(id) => id,
+                        None => {
+                            return err(
+                                StatusCode::NOT_FOUND,
+                                format!("no connected po-k matching {t:?}"),
+                            )
+                        }
+                    }
+                } else {
+                    return err(
+                        StatusCode::NOT_FOUND,
+                        format!("no connected po-k owns project {project:?}"),
+                    );
+                }
+            }
+        }
+    } else if let Some(t) = target_pok {
+        match st.registry.pok_by_id_or_host(t) {
+            Some(id) => id,
+            None => {
+                return err(
+                    StatusCode::NOT_FOUND,
+                    format!("no connected po-k matching {t:?}"),
+                )
+            }
+        }
+    } else if cwd.is_some() {
+        // cwd-only, no project, no explicit target — if exactly one po-k
+        // with ad_hoc, route there automatically.
+        let ad_hoc_poks: Vec<String> = st
+            .registry
+            .conns
+            .iter()
+            .filter(|e| e.caps.ad_hoc)
+            .map(|e| e.pok_id.clone())
+            .collect();
+        match ad_hoc_poks.len() {
+            1 => ad_hoc_poks.into_iter().next().unwrap(),
+            0 => {
+                return err(
+                    StatusCode::NOT_FOUND,
+                    "no project specified and no ad-hoc-capable po-k connected",
+                )
+            }
+            _ => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "multiple ad-hoc po-k instances connected; specify `pok_id` or `host`",
+                )
+            }
+        }
+    } else {
+        return err(StatusCode::BAD_REQUEST, "missing `project`, `cwd`, or `pok_id`/`host`");
     };
 
     let requested: Vec<String> = body
@@ -151,10 +245,13 @@ async fn create_session(State(st): State<XState>, Json(body): Json<Value>) -> Re
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let names = crate::http::profiles::resolve_names(&st, &requested, Some(&project));
+    let names = crate::http::profiles::resolve_names(&st, &requested, if project.is_empty() { None } else { Some(project) });
 
     // Build the create body forwarded to po-k.
     let mut create = json!({ "project": project, "profiles": names });
+    if let Some(c) = cwd {
+        create["cwd"] = json!(c);
+    }
     if !names.is_empty() {
         match merge_named(&st, &names).await {
             Ok(merged) => {
@@ -190,7 +287,7 @@ async fn create_session(State(st): State<XState>, Json(body): Json<Value>) -> Re
                     )
                     .bind(sid)
                     .bind(&pok_id)
-                    .bind(&project)
+                    .bind(if project.is_empty() { v.get("project").and_then(|p| p.as_str()).unwrap_or("") } else { project })
                     .bind(serde_json::to_string(&names).ok())
                     .bind(crate::store::now_iso())
                     .execute(&st.db)

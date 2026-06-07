@@ -14,6 +14,7 @@ auth:
 #   url: ws://xpo-k.host:8080/ws
 #   token: "<shared secret / xpo-k bearer token>"
 #   reconnect_interval: 5s
+#   hostname: my-dev-box               # override OS hostname for Xpo-k (must be unique)
 
 # Localhost-only listener for CC hook + permission callbacks (no auth).
 hooks:
@@ -26,6 +27,7 @@ cc:
   permission_mode: bypassPermissions        # skip all permission prompts
   permission_timeout: 60s            # how long po-k mcp blocks waiting for orchestrator
   disable_slash_commands: true
+  ad_hoc: true                       # allow sessions in arbitrary dirs (no project needed)
 
 zellij:
   session_prefix: po-k-              # session name = <prefix><project>; override per project below

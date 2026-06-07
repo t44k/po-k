@@ -17,6 +17,7 @@ pub mod profiles;
 pub fn router(state: XState) -> Router {
     let protected = Router::new()
         .route("/registry", get(health::registry))
+        .route("/clients", get(health::clients))
         .route("/profiles", get(profiles::list).post(profiles::create))
         .route(
             "/profiles/{name}",
