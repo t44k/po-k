@@ -482,6 +482,210 @@ def _handle_pok_cost(args: dict, **_kw) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool: pok_clear
+# ---------------------------------------------------------------------------
+
+POK_CLEAR_SCHEMA = {
+    "name": "pok_clear",
+    "description": (
+        "Send /clear to a CC session to reset its context. "
+        "Best followed immediately by a pok_prompt with a new task — "
+        "/clear alone is unreliable, but /clear + prompt works."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_clear(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    try:
+        data = _client().clear(sid)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_capabilities
+# ---------------------------------------------------------------------------
+
+POK_CAPABILITIES_SCHEMA = {
+    "name": "pok_capabilities",
+    "description": "Get the agents, skills, and MCP servers available in a CC session.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_capabilities(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    try:
+        data = _client().get_capabilities(sid)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_permission
+# ---------------------------------------------------------------------------
+
+POK_PERMISSION_SCHEMA = {
+    "name": "pok_permission",
+    "description": (
+        "Answer a pending permission request from CC's MCP approval flow. "
+        "Only works for po-k's MCP-based permission requests (not native CC TUI prompts). "
+        "Use pok_events to find permission_request events with a request_id."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+            "request_id": {"type": "string", "description": "Permission request ID from the permission_request event."},
+            "behavior": {
+                "type": "string",
+                "enum": ["allow", "deny"],
+                "description": "Whether to allow or deny the requested action.",
+            },
+            "message": {
+                "type": "string",
+                "description": "Optional message to send back with the decision.",
+            },
+        },
+        "required": ["session_id", "request_id", "behavior"],
+    },
+}
+
+
+def _handle_pok_permission(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    req_id = args.get("request_id", "")
+    behavior = args.get("behavior", "")
+    if not sid or not req_id or not behavior:
+        return _err("session_id, request_id, and behavior are required")
+    try:
+        data = _client().answer_permission(
+            sid, req_id, behavior, args.get("message", "")
+        )
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_health
+# ---------------------------------------------------------------------------
+
+POK_HEALTH_SCHEMA = {
+    "name": "pok_health",
+    "description": "Check Xpo-k connectivity — returns version and connected po-k count. No auth required.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+
+def _handle_pok_health(args: dict, **_kw) -> str:
+    try:
+        data = _client().health()
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_profiles
+# ---------------------------------------------------------------------------
+
+POK_PROFILES_SCHEMA = {
+    "name": "pok_profiles",
+    "description": (
+        "List, get, create, update, delete, or merge Xpo-k profiles. "
+        "Profiles compose CC configuration (CLAUDE.md, agents, skills, MCP servers, settings). "
+        "Use action='list' to see available profiles, 'get' to read one, "
+        "'create'/'update'/'delete' to manage, 'merge' to preview a composition."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "get", "create", "update", "delete", "merge"],
+                "description": "Operation to perform.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Profile name (required for get/update/delete).",
+            },
+            "profile": {
+                "type": "object",
+                "description": "Profile data (required for create/update). Fields: claude_md, agents, skills, mcp_servers, hooks, settings, tags.",
+            },
+            "profiles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Profile names to merge (for action='merge').",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+
+def _handle_pok_profiles(args: dict, **_kw) -> str:
+    action = args.get("action", "")
+    name = args.get("name", "")
+    try:
+        c = _client()
+        if action == "list":
+            return _ok({"profiles": c.list_profiles()})
+        elif action == "get":
+            if not name:
+                return _err("name is required for get")
+            return _ok({"profile": c.get_profile(name)})
+        elif action == "create":
+            profile = args.get("profile", {})
+            if not profile:
+                return _err("profile data is required for create")
+            if name:
+                profile["name"] = name
+            return _ok(c.create_profile(profile))
+        elif action == "update":
+            if not name:
+                return _err("name is required for update")
+            profile = args.get("profile", {})
+            if not profile:
+                return _err("profile data is required for update")
+            return _ok(c.update_profile(name, profile))
+        elif action == "delete":
+            if not name:
+                return _err("name is required for delete")
+            return _ok(c.delete_profile(name))
+        elif action == "merge":
+            profile_names = args.get("profiles", [])
+            if not profile_names:
+                return _err("profiles list is required for merge")
+            return _ok({"merged": c.merge_profiles(profile_names)})
+        else:
+            return _err(f"unknown action: {action!r}")
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -499,6 +703,11 @@ _TOOLS = [
     (POK_DELETE_SCHEMA, _handle_pok_delete),
     (POK_UPLOAD_SCHEMA, _handle_pok_upload),
     (POK_COST_SCHEMA, _handle_pok_cost),
+    (POK_CLEAR_SCHEMA, _handle_pok_clear),
+    (POK_CAPABILITIES_SCHEMA, _handle_pok_capabilities),
+    (POK_PERMISSION_SCHEMA, _handle_pok_permission),
+    (POK_HEALTH_SCHEMA, _handle_pok_health),
+    (POK_PROFILES_SCHEMA, _handle_pok_profiles),
 ]
 
 

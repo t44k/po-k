@@ -158,6 +158,45 @@ class XpokClient:
             "content_base64": content_base64,
         })
 
+    def clear(self, sid: str) -> Dict[str, Any]:
+        return self._post(f"/sessions/{sid}/clear")
+
+    def get_capabilities(self, sid: str) -> Dict[str, Any]:
+        return self._get(f"/sessions/{sid}/capabilities")
+
+    def answer_permission(self, sid: str, req_id: str,
+                          behavior: str, message: str = "") -> Dict[str, Any]:
+        body: Dict[str, Any] = {"behavior": behavior}
+        if message:
+            body["message"] = message
+        return self._post(f"/sessions/{sid}/permission_requests/{req_id}", body)
+
+    def registry(self) -> Any:
+        return self._get("/registry")
+
+    # -- Profile endpoints --
+
+    def list_profiles(self) -> Any:
+        return self._get("/profiles")
+
+    def get_profile(self, name: str) -> Dict[str, Any]:
+        return self._get(f"/profiles/{name}")
+
+    def create_profile(self, profile: Dict[str, Any]) -> Dict[str, Any]:
+        return self._post("/profiles", profile)
+
+    def update_profile(self, name: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"{self.base_url}/profiles/{name}"
+        r = requests.put(url, headers=self._headers(), json=profile, timeout=_DEFAULT_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+
+    def delete_profile(self, name: str) -> Dict[str, Any]:
+        return self._delete(f"/profiles/{name}")
+
+    def merge_profiles(self, profile_names: list) -> Dict[str, Any]:
+        return self._post("/profiles/merge", {"profiles": profile_names})
+
 
 # Singleton-ish — lazily created on first tool call.
 _client: Optional[XpokClient] = None
