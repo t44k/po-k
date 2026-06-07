@@ -1,0 +1,517 @@
+"""Agent-facing tool schemas and handlers for po-k / Xpo-k.
+
+Each tool follows the Hermes plugin handler convention:
+    handler(args: dict, **kwargs) -> dict | str
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict
+
+logger = logging.getLogger(__name__)
+
+TOOLSET = "pok"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _ok(data: Dict[str, Any]) -> str:
+    return json.dumps({"success": True, **data})
+
+
+def _err(msg: str) -> str:
+    return json.dumps({"success": False, "error": msg})
+
+
+def _client():
+    """Lazy import to avoid import-time env checks."""
+    from .client import get_client
+    return get_client()
+
+
+def _check() -> bool:
+    """Check function — is XPOK_URL set?"""
+    return bool(os.getenv("XPOK_URL"))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_clients
+# ---------------------------------------------------------------------------
+
+POK_CLIENTS_SCHEMA = {
+    "name": "pok_clients",
+    "description": (
+        "List connected po-k instances (Claude Code host machines). "
+        "Returns pok_id, hostname, version, ad_hoc capability, and project count for each."
+    ),
+    "parameters": {"type": "object", "properties": {}},
+}
+
+
+def _handle_pok_clients(args: dict, **_kw) -> str:
+    try:
+        data = _client().clients()
+        return _ok({"clients": data})
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_projects
+# ---------------------------------------------------------------------------
+
+POK_PROJECTS_SCHEMA = {
+    "name": "pok_projects",
+    "description": (
+        "List projects across all connected po-k instances. "
+        "Each entry includes the project name, cwd, owning pok_id and hostname."
+    ),
+    "parameters": {"type": "object", "properties": {}},
+}
+
+
+def _handle_pok_projects(args: dict, **_kw) -> str:
+    try:
+        data = _client().projects()
+        return _ok({"projects": data})
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_sessions
+# ---------------------------------------------------------------------------
+
+POK_SESSIONS_SCHEMA = {
+    "name": "pok_sessions",
+    "description": (
+        "List all active CC sessions across all connected po-k instances. "
+        "Each entry includes session_id, project, cwd, model, effort, started_at, pok_id, hostname."
+    ),
+    "parameters": {"type": "object", "properties": {}},
+}
+
+
+def _handle_pok_sessions(args: dict, **_kw) -> str:
+    try:
+        data = _client().sessions()
+        return _ok({"sessions": data})
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_create
+# ---------------------------------------------------------------------------
+
+POK_CREATE_SCHEMA = {
+    "name": "pok_create",
+    "description": (
+        "Create a new Claude Code session on a po-k instance. "
+        "Specify a configured project name, or use cwd for ad-hoc sessions "
+        "(requires cc.ad_hoc: true on the target po-k). "
+        "Route to a specific instance via host or pok_id."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "description": "Project name (from po-k.yaml). Can be empty for ad-hoc sessions.",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Working directory for the session. Required for ad-hoc; optional override for configured projects.",
+            },
+            "host": {
+                "type": "string",
+                "description": "Target po-k instance by hostname.",
+            },
+            "pok_id": {
+                "type": "string",
+                "description": "Target po-k instance by pok_id.",
+            },
+            "profiles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Xpo-k profile names to compose for this session.",
+            },
+            "model": {
+                "type": "string",
+                "description": "CC model override (e.g. 'opus', 'sonnet').",
+            },
+            "effort": {
+                "type": "string",
+                "description": "CC effort override (e.g. 'high', 'medium').",
+            },
+        },
+    },
+}
+
+
+def _handle_pok_create(args: dict, **_kw) -> str:
+    try:
+        data = _client().create_session(
+            project=args.get("project", ""),
+            cwd=args.get("cwd", ""),
+            host=args.get("host", ""),
+            pok_id=args.get("pok_id", ""),
+            profiles=args.get("profiles"),
+            model=args.get("model", ""),
+            effort=args.get("effort", ""),
+        )
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_prompt
+# ---------------------------------------------------------------------------
+
+POK_PROMPT_SCHEMA = {
+    "name": "pok_prompt",
+    "description": (
+        "Send a prompt to a running CC session. Blocks until CC's input prompt is ready "
+        "(up to 120s). Returns a cursor for subsequent /wait or /events calls."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+            "text": {"type": "string", "description": "The prompt text to send to CC."},
+        },
+        "required": ["session_id", "text"],
+    },
+}
+
+
+def _handle_pok_prompt(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    text = args.get("text", "")
+    if not sid or not text:
+        return _err("session_id and text are required")
+    try:
+        data = _client().send_message(sid, text)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_status
+# ---------------------------------------------------------------------------
+
+POK_STATUS_SCHEMA = {
+    "name": "pok_status",
+    "description": (
+        "Get the current status of a CC session: working, idle, awaiting_input, or ended."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_status(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    try:
+        data = _client().get_status(sid)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_wait
+# ---------------------------------------------------------------------------
+
+POK_WAIT_SCHEMA = {
+    "name": "pok_wait",
+    "description": (
+        "Block until a CC session becomes idle, awaiting_input, or ended. "
+        "Returns the deciding event. Use 'since' cursor from pok_prompt to avoid "
+        "seeing stale events. Max server-side timeout is 600s; returns timed_out: true on timeout."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+            "since": {
+                "type": "integer",
+                "description": "Cursor from pok_prompt. Only events after this seq are considered.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Max seconds to wait (default 600, max 600).",
+            },
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_wait(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    since = args.get("since", 0)
+    timeout = min(args.get("timeout", 600), 600)
+    try:
+        data = _client().wait(sid, since=since, timeout=timeout)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_events
+# ---------------------------------------------------------------------------
+
+POK_EVENTS_SCHEMA = {
+    "name": "pok_events",
+    "description": (
+        "Fetch events from a CC session. Use to read CC's reply after /wait returns idle. "
+        "Look for events with kind='stop' — the 'last_assistant_message' field contains "
+        "CC's reply text."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+            "since": {
+                "type": "integer",
+                "description": "Cursor — only events with seq > since are returned.",
+            },
+            "wait": {
+                "type": "integer",
+                "description": "Long-poll seconds (default 2). Always pass >= 2.",
+            },
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_events(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    since = args.get("since", 0)
+    wait = args.get("wait", 2)
+    try:
+        data = _client().get_events(sid, since=since, wait=wait)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_pane
+# ---------------------------------------------------------------------------
+
+POK_PANE_SCHEMA = {
+    "name": "pok_pane",
+    "description": (
+        "Read the raw terminal pane content of a CC session (what's visible on screen). "
+        "Useful for checking CC's live progress, permission prompts, or error messages."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_pane(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    try:
+        data = _client().get_pane(sid)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_interrupt
+# ---------------------------------------------------------------------------
+
+POK_INTERRUPT_SCHEMA = {
+    "name": "pok_interrupt",
+    "description": "Send ESC to interrupt a running CC session (e.g. dismiss a permission prompt).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_interrupt(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    try:
+        data = _client().interrupt(sid)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_delete
+# ---------------------------------------------------------------------------
+
+POK_DELETE_SCHEMA = {
+    "name": "pok_delete",
+    "description": "Tear down a CC session — sends /exit, force-deletes the zellij session, marks ended.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_delete(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    try:
+        data = _client().delete_session(sid)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_upload
+# ---------------------------------------------------------------------------
+
+POK_UPLOAD_SCHEMA = {
+    "name": "pok_upload",
+    "description": (
+        "Upload a local file to a CC session's .po-k-inbox/ directory so CC can read it. "
+        "Provide either file_path (local path to read and encode) or content_base64 directly."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+            "filename": {"type": "string", "description": "Bare filename (no slashes). Written to <cwd>/.po-k-inbox/<filename>."},
+            "file_path": {"type": "string", "description": "Local file path to read and upload."},
+            "content_base64": {"type": "string", "description": "Already-encoded base64 content (alternative to file_path)."},
+        },
+        "required": ["session_id", "filename"],
+    },
+}
+
+
+def _handle_pok_upload(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    filename = args.get("filename", "")
+    if not sid or not filename:
+        return _err("session_id and filename are required")
+
+    content_b64 = args.get("content_base64", "")
+    file_path = args.get("file_path", "")
+
+    if not content_b64 and not file_path:
+        return _err("provide file_path or content_base64")
+
+    if file_path and not content_b64:
+        p = Path(file_path).expanduser()
+        if not p.is_file():
+            return _err(f"file not found: {file_path}")
+        content_b64 = base64.b64encode(p.read_bytes()).decode()
+
+    try:
+        data = _client().upload_file(sid, filename, content_b64)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tool: pok_cost
+# ---------------------------------------------------------------------------
+
+POK_COST_SCHEMA = {
+    "name": "pok_cost",
+    "description": "Get token usage and cost totals for a CC session.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID."},
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_cost(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    try:
+        data = _client().get_cost(sid)
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+_TOOLS = [
+    (POK_CLIENTS_SCHEMA, _handle_pok_clients),
+    (POK_PROJECTS_SCHEMA, _handle_pok_projects),
+    (POK_SESSIONS_SCHEMA, _handle_pok_sessions),
+    (POK_CREATE_SCHEMA, _handle_pok_create),
+    (POK_PROMPT_SCHEMA, _handle_pok_prompt),
+    (POK_STATUS_SCHEMA, _handle_pok_status),
+    (POK_WAIT_SCHEMA, _handle_pok_wait),
+    (POK_EVENTS_SCHEMA, _handle_pok_events),
+    (POK_PANE_SCHEMA, _handle_pok_pane),
+    (POK_INTERRUPT_SCHEMA, _handle_pok_interrupt),
+    (POK_DELETE_SCHEMA, _handle_pok_delete),
+    (POK_UPLOAD_SCHEMA, _handle_pok_upload),
+    (POK_COST_SCHEMA, _handle_pok_cost),
+]
+
+
+def register(ctx) -> None:
+    """Register all po-k tools with the Hermes plugin context."""
+    for schema, handler in _TOOLS:
+        ctx.register_tool(
+            name=schema["name"],
+            toolset=TOOLSET,
+            schema=schema,
+            handler=handler,
+            check_fn=_check,
+            is_async=False,
+            description=schema.get("description", ""),
+        )
+    logger.info("po-k plugin: registered %d tools", len(_TOOLS))
