@@ -17,3 +17,8 @@ pub async fn health(State(st): State<XState>) -> Json<Value> {
 pub async fn registry(State(st): State<XState>) -> Json<Value> {
     Json(st.registry.list())
 }
+
+/// `GET /clients` — lightweight view of connected po-k instances.
+pub async fn clients(State(st): State<XState>) -> Json<Value> {
+    Json(st.registry.list_clients())
+}

@@ -18,6 +18,15 @@ pub struct ProjectDecl {
     pub cwd: String,
 }
 
+/// Capability flags a po-k instance advertises at registration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PokCaps {
+    /// When true, this po-k accepts sessions in arbitrary directories (no
+    /// pre-configured project required).
+    #[serde(default)]
+    pub ad_hoc: bool,
+}
+
 /// An active session a po-k instance is tracking, declared at registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDecl {
@@ -59,6 +68,9 @@ pub enum WsMsg {
         projects: Vec<ProjectDecl>,
         #[serde(default)]
         sessions: Vec<SessionDecl>,
+        /// Capability flags (ad_hoc support, etc.). Defaults for old po-k builds.
+        #[serde(default)]
+        caps: PokCaps,
     },
     ConfigUpdate {
         projects: Vec<ProjectDecl>,
@@ -150,6 +162,7 @@ mod tests {
             version: "0".into(),
             projects: vec![],
             sessions: vec![],
+            caps: PokCaps::default(),
         });
         assert_eq!(v["type"], "register");
 

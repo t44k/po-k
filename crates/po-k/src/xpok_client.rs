@@ -34,10 +34,7 @@ pub fn spawn(state: AppState, cfg: Xpok) {
 }
 
 fn stable_pok_id(state: &AppState) -> String {
-    let host = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "unknown".into());
+    let host = resolve_hostname(state);
     let path = state.config_path.to_string_lossy();
     // Simple stable hash of hostname + config path.
     let mut h: u64 = 1469598103934665603;
@@ -46,6 +43,27 @@ fn stable_pok_id(state: &AppState) -> String {
         h = h.wrapping_mul(1099511628211);
     }
     format!("{host}-{h:x}")
+}
+
+/// Return the hostname to advertise to Xpo-k. Prefers the explicit
+/// `xpok.hostname` config value; falls back to the OS hostname.
+fn resolve_hostname(state: &AppState) -> String {
+    // config is behind an async RwLock but we need this in a sync context
+    // (stable_pok_id). Try_read is fine during startup — the lock is never
+    // held long.
+    if let Ok(cfg) = state.config.try_read() {
+        if let Some(ref xpok) = cfg.xpok {
+            if let Some(ref h) = xpok.hostname {
+                if !h.is_empty() {
+                    return h.clone();
+                }
+            }
+        }
+    }
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 async fn connect_once(state: &AppState, cfg: &Xpok) -> Result<()> {
@@ -284,6 +302,14 @@ async fn register_msg(state: &AppState) -> WsMsg {
             cwd: p.cwd.clone(),
         })
         .collect();
+    let caps = pok_proto::PokCaps {
+        ad_hoc: cfg.cc.ad_hoc,
+    };
+    let hostname_override = cfg
+        .xpok
+        .as_ref()
+        .and_then(|x| x.hostname.clone())
+        .filter(|h| !h.is_empty());
     drop(cfg);
     let sessions = state
         .sessions
@@ -296,14 +322,18 @@ async fn register_msg(state: &AppState) -> WsMsg {
             status: String::new(),
         })
         .collect();
-    WsMsg::Register {
-        pok_id: stable_pok_id(state),
-        hostname: hostname::get()
+    let hostname = hostname_override.unwrap_or_else(|| {
+        hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
-            .unwrap_or_default(),
+            .unwrap_or_default()
+    });
+    WsMsg::Register {
+        pok_id: stable_pok_id(state),
+        hostname,
         version: env!("CARGO_PKG_VERSION").to_string(),
         projects,
         sessions,
+        caps,
     }
 }

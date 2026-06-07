@@ -66,6 +66,7 @@ async fn connect_fake_pok(
             project: "demo".into(),
             status: "idle".into(),
         }],
+        caps: Default::default(),
     };
     sink.send(Message::Text(serde_json::to_string(&reg).unwrap()))
         .await

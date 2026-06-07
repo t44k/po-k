@@ -8,9 +8,18 @@ use crate::state::AppState;
 
 /// Inputs for creating a session. Mirrors the extended `POST /sessions` body
 /// (spec §4.3) — `project` plus optional merged profile and flags.
+///
+/// **Ad-hoc mode** (when `cc.ad_hoc: true` in config): if `cwd` is set and
+/// `project` is empty, a synthetic project is created from the directory name.
+/// If `project` is also provided it is used as the session's project name.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct CreateRequest {
+    #[serde(default)]
     pub project: String,
+    /// Explicit working directory. When set, overrides the project's configured
+    /// cwd (or creates an ad-hoc project if the name is unknown/empty).
+    #[serde(default)]
+    pub cwd: Option<String>,
     #[serde(default)]
     pub profile: Option<crate::profile::Profile>,
     #[serde(default)]
@@ -33,12 +42,16 @@ pub async fn create(state: &AppState, req: CreateRequest) -> CoreResult<CoreResp
         bare: req.bare,
         model: req.model,
         effort: req.effort,
+        cwd_override: req.cwd,
     };
     match session::spawn(state, &req.project, opts).await {
         Ok(s) => Ok(CoreResponse::created(view_full(&s))),
         Err(SpawnError::UnknownProject(name)) => {
             Err(CoreError::NotFound(format!("unknown project {name:?}")))
         }
+        Err(SpawnError::AdHocDisabled) => Err(CoreError::BadRequest(
+            "ad-hoc sessions disabled; set cc.ad_hoc: true in po-k.yaml".into(),
+        )),
         Err(SpawnError::AlreadyRunning { project, sid }) => Err(CoreError::Conflict {
             message: format!("a session for project {project:?} is already running"),
             body: json!({ "session_id": sid }),
