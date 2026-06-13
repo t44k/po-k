@@ -736,5 +736,6 @@ def register(ctx) -> None:
             check_fn=_check,
             is_async=False,
             description=schema.get("description", ""),
+            emoji="🕷️",
         )
     logger.info("po-k plugin: registered %d tools", len(_TOOLS))
