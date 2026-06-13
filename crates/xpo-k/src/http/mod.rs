@@ -34,7 +34,9 @@ pub fn router(state: XState) -> Router {
             require_bearer,
         ));
 
-    let public = Router::new().route("/health", get(health::health));
+    let public = Router::new()
+        .route("/health", get(health::health))
+        .route("/help", get(health::help));
 
     public
         .merge(protected)
