@@ -12,7 +12,11 @@ use crate::state::AppState;
 
 pub const DEFAULT_WAIT: u64 = 30;
 pub const MAX_WAIT: u64 = 60;
+/// Per-drain batch size for the SSE row stream (`stream_rows`). Unrelated to the
+/// one-shot page API's `size` cap (`MAX_SIZE`).
 pub const PAGE_LIMIT: i64 = 500;
+/// Upper bound on the `size` query parameter for the one-shot page API.
+pub const MAX_SIZE: i64 = 1000;
 
 async fn ensure_exists(state: &AppState, sid: &str) -> CoreResult<()> {
     if events_store::get_session(&state.db, sid)
@@ -26,32 +30,48 @@ async fn ensure_exists(state: &AppState, sid: &str) -> CoreResult<()> {
 }
 
 /// One long-poll page. `transcript_only` selects the `/messages` view.
+///
+/// `offset >= 0` returns events with `seq > offset` (cursor pagination).
+/// `offset < 0` is the tail sentinel (`-1`): return the latest `size` events
+/// without knowing the current cursor. `size` is clamped to `1..=MAX_SIZE`;
+/// the dispatcher rejects out-of-range values with 400 before reaching here,
+/// so the clamp is purely defensive (and guards the SQLite `LIMIT -1` =
+/// "unlimited" footgun).
 pub async fn page(
     state: &AppState,
     sid: &str,
     transcript_only: bool,
-    since: i64,
+    offset: i64,
+    size: i64,
     wait: u64,
 ) -> CoreResult<CoreResponse> {
     ensure_exists(state, sid).await?;
     let wait = wait.min(MAX_WAIT);
-    let select = |since: i64| async move {
-        if transcript_only {
-            events_store::select_messages_since(&state.db, sid, since, PAGE_LIMIT).await
-        } else {
-            events_store::select_events_since(&state.db, sid, since, PAGE_LIMIT).await
+    let size = size.clamp(1, MAX_SIZE);
+    let tail = offset < 0;
+    let select = || async {
+        match (tail, transcript_only) {
+            (true, true) => events_store::select_messages_tail(&state.db, sid, size).await,
+            (true, false) => events_store::select_events_tail(&state.db, sid, size).await,
+            (false, true) => {
+                events_store::select_messages_since(&state.db, sid, offset, size).await
+            }
+            (false, false) => events_store::select_events_since(&state.db, sid, offset, size).await,
         }
     };
 
-    let mut rows = select(since).await.map_err(internal)?;
+    let mut rows = select().await.map_err(internal)?;
     if rows.is_empty() && wait > 0 {
         let notify = state.bus.subscribe(sid).await;
         let notified = notify.notified();
         tokio::pin!(notified);
         let _ = tokio::time::timeout(Duration::from_secs(wait), notified).await;
-        rows = select(since).await.map_err(internal)?;
+        rows = select().await.map_err(internal)?;
     }
-    let next_cursor = rows.last().map(|r| r.seq).unwrap_or(since);
+    let next_cursor = rows
+        .last()
+        .map(|r| r.seq)
+        .unwrap_or(if tail { 0 } else { offset });
     let key = if transcript_only { "messages" } else { "events" };
     Ok(CoreResponse::ok(json!({
         key: rows.iter().map(render_row).collect::<Vec<_>>(),

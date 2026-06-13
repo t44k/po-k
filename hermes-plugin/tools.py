@@ -285,15 +285,28 @@ POK_EVENTS_SCHEMA = {
     "description": (
         "Fetch events from a CC session. Use to read CC's reply after /wait returns idle. "
         "Look for events with kind='stop' — the 'last_assistant_message' field contains "
-        "CC's reply text."
+        "CC's reply text.\n\n"
+        "Pagination: 'offset' and 'size' control the window. offset=-1 (the default) "
+        "returns the LATEST 'size' events (tail) — the right choice for 'show me the most "
+        "recent reply', and it works even on huge sessions without paginating. offset>=0 "
+        "returns events with seq > offset (forward cursor pagination). The response includes "
+        "'next_cursor'; to follow a session forward, call once with offset=-1 to get the "
+        "latest, then pass next_cursor as the offset on subsequent calls."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "session_id": {"type": "string", "description": "Session UUID."},
-            "since": {
+            "offset": {
                 "type": "integer",
-                "description": "Cursor — only events with seq > since are returned.",
+                "description": (
+                    "Cursor. -1 (default) = latest 'size' events (tail). "
+                    ">=0 = only events with seq > offset."
+                ),
+            },
+            "size": {
+                "type": "integer",
+                "description": "Max events to return (default 100, server caps at 1000).",
             },
             "wait": {
                 "type": "integer",
@@ -309,10 +322,11 @@ def _handle_pok_events(args: dict, **_kw) -> str:
     sid = args.get("session_id", "")
     if not sid:
         return _err("session_id is required")
-    since = args.get("since", 0)
+    offset = args.get("offset", -1)
+    size = args.get("size", 100)
     wait = args.get("wait", 2)
     try:
-        data = _client().get_events(sid, since=since, wait=wait)
+        data = _client().get_events(sid, offset=offset, size=size, wait=wait)
         return _ok(data)
     except Exception as e:
         return _err(str(e))

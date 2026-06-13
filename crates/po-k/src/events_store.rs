@@ -214,6 +214,20 @@ pub struct EventRow {
     pub payload: Value,
 }
 
+/// Map a raw `(sid, seq, ts, kind, payload)` row into an [`EventRow`], parsing
+/// the stored JSON payload (defaulting to `null` on malformed JSON). Shared by
+/// every `select_*` query so they decode rows identically.
+fn event_row_from_tuple(t: (String, i64, String, String, String)) -> EventRow {
+    let (sid, seq, ts, kind, payload) = t;
+    EventRow {
+        sid,
+        seq,
+        ts,
+        kind,
+        payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+    }
+}
+
 /// Append an event in a single transaction: bump `sessions.last_event_seq`,
 /// insert the row with `seq = new_seq`. Returns the assigned seq.
 pub async fn append_event(
@@ -267,16 +281,7 @@ pub async fn select_events_since(
     .fetch_all(db)
     .await
     .context("SELECT events since")?;
-    Ok(rows
-        .into_iter()
-        .map(|(sid, seq, ts, kind, payload)| EventRow {
-            sid,
-            seq,
-            ts,
-            kind,
-            payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
-        })
-        .collect())
+    Ok(rows.into_iter().map(event_row_from_tuple).collect())
 }
 
 /// Transcript-only events (the conversational record an orchestrator consumes)
@@ -301,16 +306,44 @@ pub async fn select_messages_since(
     .fetch_all(db)
     .await
     .context("SELECT messages since")?;
-    Ok(rows
-        .into_iter()
-        .map(|(sid, seq, ts, kind, payload)| EventRow {
-            sid,
-            seq,
-            ts,
-            kind,
-            payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
-        })
-        .collect())
+    Ok(rows.into_iter().map(event_row_from_tuple).collect())
+}
+
+/// Latest `limit` events for a session, returned in ascending seq order.
+/// Used for the `offset=-1` tail page so a caller need not know the cursor.
+pub async fn select_events_tail(db: &Db, sid: &str, limit: i64) -> Result<Vec<EventRow>> {
+    let rows: Vec<(String, i64, String, String, String)> = sqlx::query_as(
+        r#"SELECT sid, seq, ts, kind, payload FROM (
+             SELECT sid, seq, ts, kind, payload FROM events
+             WHERE sid = ?1
+             ORDER BY seq DESC LIMIT ?2
+           ) ORDER BY seq ASC"#,
+    )
+    .bind(sid)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .context("SELECT events tail")?;
+    Ok(rows.into_iter().map(event_row_from_tuple).collect())
+}
+
+/// Transcript-only tail (`/messages` view). Same kind filter as
+/// [`select_messages_since`].
+pub async fn select_messages_tail(db: &Db, sid: &str, limit: i64) -> Result<Vec<EventRow>> {
+    let rows: Vec<(String, i64, String, String, String)> = sqlx::query_as(
+        r#"SELECT sid, seq, ts, kind, payload FROM (
+             SELECT sid, seq, ts, kind, payload FROM events
+             WHERE sid = ?1
+               AND kind IN ('user_prompt','assistant_message','tool_use','tool_result','turn_end')
+             ORDER BY seq DESC LIMIT ?2
+           ) ORDER BY seq ASC"#,
+    )
+    .bind(sid)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .context("SELECT messages tail")?;
+    Ok(rows.into_iter().map(event_row_from_tuple).collect())
 }
 
 /// The latest `seq` of each status-relevant event kind for a session, in one
@@ -631,5 +664,58 @@ mod tests {
         // `since` cursor and ordering hold.
         let after = select_messages_since(&db, "s6", 1, 100).await.unwrap();
         assert_eq!(after.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 5]);
+    }
+
+    #[tokio::test]
+    async fn select_events_tail_returns_latest_in_order() {
+        let db = fresh_db().await;
+        insert_session(&db, &row("t1")).await.unwrap();
+        for _ in 0..20 {
+            append_event(&db, "t1", "t", "user_prompt", &json!({})).await.unwrap();
+        }
+        let tail = select_events_tail(&db, "t1", 5).await.unwrap();
+        assert_eq!(
+            tail.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![16, 17, 18, 19, 20]
+        );
+    }
+
+    #[tokio::test]
+    async fn select_events_tail_when_fewer_than_limit() {
+        let db = fresh_db().await;
+        insert_session(&db, &row("t2")).await.unwrap();
+        for _ in 0..3 {
+            append_event(&db, "t2", "t", "user_prompt", &json!({})).await.unwrap();
+        }
+        let tail = select_events_tail(&db, "t2", 10).await.unwrap();
+        assert_eq!(tail.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn select_events_tail_empty_session() {
+        let db = fresh_db().await;
+        insert_session(&db, &row("t3")).await.unwrap();
+        let tail = select_events_tail(&db, "t3", 5).await.unwrap();
+        assert!(tail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn select_messages_tail_filters_to_transcript() {
+        let db = fresh_db().await;
+        insert_session(&db, &row("t4")).await.unwrap();
+        append_event(&db, "t4", "t", "user_prompt", &json!({})).await.unwrap();        // 1
+        append_event(&db, "t4", "t", "notification", &json!({})).await.unwrap();       // 2 (excluded)
+        append_event(&db, "t4", "t", "assistant_message", &json!({})).await.unwrap();  // 3
+        append_event(&db, "t4", "t", "permission_request", &json!({})).await.unwrap(); // 4 (excluded)
+        append_event(&db, "t4", "t", "turn_end", &json!({})).await.unwrap();           // 5
+        // Full tail: only the 3 transcript kinds, ascending.
+        let tail = select_messages_tail(&db, "t4", 10).await.unwrap();
+        assert_eq!(
+            tail.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        // Small tail: the last two *transcript* rows, not the last two overall.
+        let tail2 = select_messages_tail(&db, "t4", 2).await.unwrap();
+        assert_eq!(tail2.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 5]);
     }
 }

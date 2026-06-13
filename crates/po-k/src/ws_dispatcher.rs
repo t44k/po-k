@@ -137,10 +137,12 @@ pub async fn dispatch(
                 .to_string();
             unary(core::messages::send(state, &id, &text).await)
         }
-        ("GET", Route::Messages) => {
-            let (since, wait) = poll_params(query);
-            unary(core::events::page(state, &id, true, since, wait).await)
-        }
+        ("GET", Route::Messages) => match page_params(query) {
+            Ok((offset, size, wait)) => {
+                unary(core::events::page(state, &id, true, offset, size, wait).await)
+            }
+            Err(e) => unary(Err(e)),
+        },
         ("POST", Route::Interrupt) => unary(core::messages::interrupt(state, &id).await),
         ("POST", Route::Clear) => unary(core::messages::clear(state, &id).await),
         ("POST", Route::Files) => {
@@ -149,10 +151,12 @@ pub async fn dispatch(
             let content = b.get("content_base64").and_then(|v| v.as_str()).unwrap_or("");
             unary(core::messages::upload_file(state, &id, filename, content).await)
         }
-        ("GET", Route::Events) => {
-            let (since, wait) = poll_params(query);
-            unary(core::events::page(state, &id, false, since, wait).await)
-        }
+        ("GET", Route::Events) => match page_params(query) {
+            Ok((offset, size, wait)) => {
+                unary(core::events::page(state, &id, false, offset, size, wait).await)
+            }
+            Err(e) => unary(Err(e)),
+        },
         ("GET", Route::Cost) => unary(core::events::cost(state, &id).await),
         ("GET", Route::Status) => unary(core::control::status(state, &id).await),
         ("GET", Route::Wait) => {
@@ -192,12 +196,25 @@ pub async fn dispatch(
     }
 }
 
-fn poll_params(query: &str) -> (i64, u64) {
-    let since = qget(query, "since").and_then(|s| s.parse().ok()).unwrap_or(0);
+/// Parse the required `offset` + `size` (and optional `wait`) for the page API.
+/// `offset` must be `>= -1` (`-1` = tail) and `size` must be `> 0`; anything
+/// else is a 400. `wait` defaults to [`core::events::DEFAULT_WAIT`].
+fn page_params(query: &str) -> Result<(i64, i64, u64), CoreError> {
+    let offset = qget(query, "offset").and_then(|s| s.parse::<i64>().ok());
+    let size = qget(query, "size").and_then(|s| s.parse::<i64>().ok());
     let wait = qget(query, "wait")
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(core::events::DEFAULT_WAIT);
-    (since, wait)
+
+    match (offset, size) {
+        (Some(o), Some(s)) if o >= -1 && s > 0 => Ok((o, s, wait)),
+        (Some(_), Some(_)) => Err(CoreError::BadRequest(
+            "offset must be >= -1 and size must be > 0".into(),
+        )),
+        _ => Err(CoreError::BadRequest(
+            "offset and size query parameters are required".into(),
+        )),
+    }
 }
 
 fn qget(query: &str, key: &str) -> Option<String> {
@@ -232,9 +249,34 @@ mod tests {
 
     #[test]
     fn query_parsing() {
-        assert_eq!(qget("since=5&wait=0", "since"), Some("5".into()));
-        assert_eq!(poll_params("since=7&wait=10"), (7, 10));
-        assert_eq!(poll_params(""), (0, core::events::DEFAULT_WAIT));
+        assert_eq!(qget("offset=5&wait=0", "offset"), Some("5".into()));
+        assert_eq!(page_params("offset=7&size=100&wait=10").unwrap(), (7, 100, 10));
+        assert_eq!(
+            page_params("offset=-1&size=50").unwrap(),
+            (-1, 50, core::events::DEFAULT_WAIT)
+        );
+    }
+
+    #[test]
+    fn page_params_rejects_missing_and_out_of_range() {
+        // Missing either required param → "required" message.
+        for q in ["size=10", "offset=0", "", "wait=5"] {
+            let e = page_params(q).unwrap_err();
+            assert_eq!(e.status(), 400);
+            assert!(
+                e.to_string().contains("required"),
+                "expected 'required' for {q:?}, got {e}"
+            );
+        }
+        // Present but out of range → range message.
+        for q in ["offset=-2&size=10", "offset=0&size=0", "offset=0&size=-5"] {
+            let e = page_params(q).unwrap_err();
+            assert_eq!(e.status(), 400);
+            assert!(
+                e.to_string().contains(">="),
+                "expected range message for {q:?}, got {e}"
+            );
+        }
     }
 
     // --- parity tests (ported from the deleted http integration tests): these
@@ -337,8 +379,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let (status, b) =
-            body(&dispatch(&st, "GET", "/sessions/s3/messages?since=0&wait=0", None).await);
+        let (status, b) = body(
+            &dispatch(&st, "GET", "/sessions/s3/messages?offset=0&size=500&wait=0", None).await,
+        );
         assert_eq!(status, 200);
         let kinds: Vec<&str> = b["messages"]
             .as_array()
@@ -347,6 +390,109 @@ mod tests {
             .map(|e| e["kind"].as_str().unwrap())
             .collect();
         assert_eq!(kinds, vec!["user_prompt", "assistant_message"]);
+    }
+
+    async fn append_n(st: &AppState, sid: &str, n: usize) {
+        for _ in 0..n {
+            crate::events_store::append_event(&st.db, sid, "t", "user_prompt", &json!({}))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn event_seqs(b: &Value) -> Vec<i64> {
+        b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["seq"].as_i64().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn events_400_when_offset_missing() {
+        let st = test_state().await;
+        seed(&st, "e1").await;
+        let (status, _) = body(&dispatch(&st, "GET", "/sessions/e1/events?size=10", None).await);
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn events_400_when_size_missing() {
+        let st = test_state().await;
+        seed(&st, "e2").await;
+        let (status, _) = body(&dispatch(&st, "GET", "/sessions/e2/events?offset=0", None).await);
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn events_400_when_size_nonpositive() {
+        let st = test_state().await;
+        seed(&st, "e3").await;
+        let (status, _) =
+            body(&dispatch(&st, "GET", "/sessions/e3/events?offset=0&size=0", None).await);
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn events_400_when_offset_below_neg_one() {
+        let st = test_state().await;
+        seed(&st, "e4").await;
+        let (status, _) =
+            body(&dispatch(&st, "GET", "/sessions/e4/events?offset=-2&size=10", None).await);
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn events_size_capped_at_max() {
+        let st = test_state().await;
+        seed(&st, "e5").await;
+        append_n(&st, "e5", 3).await;
+        // Oversized `size` is accepted (clamped), not rejected.
+        let (status, b) = body(
+            &dispatch(&st, "GET", "/sessions/e5/events?offset=0&size=9999&wait=0", None).await,
+        );
+        assert_eq!(status, 200);
+        assert!(b["events"].as_array().unwrap().len() <= 1000);
+        assert_eq!(b["events"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn events_tail_returns_latest() {
+        let st = test_state().await;
+        seed(&st, "e6").await;
+        append_n(&st, "e6", 6).await;
+        let (status, b) = body(
+            &dispatch(&st, "GET", "/sessions/e6/events?offset=-1&size=3&wait=0", None).await,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(event_seqs(&b), vec![4, 5, 6]);
+        assert_eq!(b["next_cursor"], 6);
+    }
+
+    #[tokio::test]
+    async fn events_cursor_pagination_still_works() {
+        let st = test_state().await;
+        seed(&st, "e7").await;
+        append_n(&st, "e7", 5).await;
+        let (status, b) = body(
+            &dispatch(&st, "GET", "/sessions/e7/events?offset=2&size=2&wait=0", None).await,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(event_seqs(&b), vec![3, 4]);
+        assert_eq!(b["next_cursor"], 4);
+    }
+
+    #[tokio::test]
+    async fn events_tail_empty_session_returns_empty() {
+        let st = test_state().await;
+        seed(&st, "e8").await;
+        let (status, b) = body(
+            &dispatch(&st, "GET", "/sessions/e8/events?offset=-1&size=5&wait=0", None).await,
+        );
+        assert_eq!(status, 200);
+        assert!(b["events"].as_array().unwrap().is_empty());
+        assert_eq!(b["next_cursor"], 0);
     }
 
     #[tokio::test]
