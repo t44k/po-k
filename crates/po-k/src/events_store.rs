@@ -355,7 +355,8 @@ pub async fn latest_status_seqs(db: &Db, sid: &str) -> Result<HashMap<String, i6
              AND kind IN (
                'user_prompt','assistant_message','tool_use','tool_result',
                'stop','subagent_stop','notification',
-               'session_end','cc_exited','permission_request','permission_decision'
+               'session_end','cc_exited','permission_request','permission_decision',
+               'user_question'
              )
            GROUP BY kind"#,
     )

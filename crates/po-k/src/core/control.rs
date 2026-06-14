@@ -128,7 +128,13 @@ async fn deciding_event(db: &Db, sid: &str, seq: Option<i64>) -> Value {
             .into_iter()
             .next()
             .filter(|r| r.seq == seq)
-            .map(|r| json!({ "kind": r.kind, "seq": r.seq, "ts": r.ts }))
+            .map(|r| {
+                let mut ev = json!({ "kind": r.kind, "seq": r.seq, "ts": r.ts });
+                if r.kind == "user_question" || r.kind == "permission_request" {
+                    ev["payload"] = r.payload.clone();
+                }
+                ev
+            })
             .unwrap_or(Value::Null),
         Err(_) => Value::Null,
     }

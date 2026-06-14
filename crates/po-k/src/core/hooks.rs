@@ -80,6 +80,19 @@ mod tests {
     }
 
     #[test]
+    fn permission_prompt_notification_stays_notification() {
+        // CC fires Notification with notification_type="permission_prompt" for
+        // permission dialogs. This must stay "notification" (not remapped) so
+        // it drives awaiting_input via the status derivation. The JSONL tailer's
+        // user_question is separate and does not affect this path.
+        let kind = remap(
+            "Notification",
+            json!({ "notification_type": "permission_prompt", "message": "Allow Bash?" }),
+        );
+        assert_eq!(kind, "notification");
+    }
+
+    #[test]
     fn notification_without_type_keeps_notification_kind() {
         assert_eq!(remap("Notification", json!({ "message": "hi" })), "notification");
         assert_eq!(remap("Notification", json!({})), "notification");

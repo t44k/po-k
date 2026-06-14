@@ -261,6 +261,15 @@ fn project_event(line: &str) -> Option<(String, Value)> {
                             }
                         }
                         Some("tool_use") => {
+                            if item.get("name").and_then(|n| n.as_str()) == Some("AskUserQuestion") {
+                                return Some(("user_question".to_string(), json!({
+                                    "id": item.get("id"),
+                                    "name": "AskUserQuestion",
+                                    "questions": item.get("input").and_then(|i| i.get("questions")),
+                                    "input": item.get("input"),
+                                    "turn_id": turn_id,
+                                })));
+                            }
                             tool_uses.push(json!({
                                 "id": item.get("id"),
                                 "name": item.get("name"),
@@ -462,6 +471,29 @@ mod tests {
         let (k, v) = project_event(line).unwrap();
         assert_eq!(k, "tool_use");
         assert_eq!(v["name"], "Bash");
+    }
+
+    #[test]
+    fn project_ask_user_question_emits_user_question() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_abc","name":"AskUserQuestion","input":{"questions":[{"header":"Approach","question":"Which approach?","multiSelect":false,"options":[{"label":"A","description":"Option A"},{"label":"B","description":"Option B"}]}]}}]}}"#;
+        let (k, v) = project_event(line).unwrap();
+        assert_eq!(k, "user_question");
+        assert_eq!(v["name"], "AskUserQuestion");
+        assert_eq!(v["id"], "tu_abc");
+        let questions = v["questions"].as_array().unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0]["header"], "Approach");
+        // input is also carried through for full fidelity
+        assert_eq!(v["input"]["questions"][0]["options"][0]["label"], "A");
+    }
+
+    #[test]
+    fn project_ask_user_question_not_a_generic_tool_use() {
+        // Must emit user_question, never tool_use
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_x","name":"AskUserQuestion","input":{"questions":[]}}]}}"#;
+        let (k, _) = project_event(line).unwrap();
+        assert_ne!(k, "tool_use");
+        assert_eq!(k, "user_question");
     }
 
     #[test]

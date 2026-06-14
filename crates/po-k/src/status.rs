@@ -101,10 +101,14 @@ pub fn derive_status(latest: &HashMap<String, i64>, ended_at: Option<&str>) -> (
     if perm_pending {
         return (Status::AwaitingInput, get("permission_request"));
     }
-    if let Some(n) = get("notification") {
+    let awaiting_signals = [get("notification"), get("user_question")]
+        .into_iter()
+        .flatten()
+        .max();
+    if let Some(sig) = awaiting_signals {
         let newest_other = [stop_seq, active_seq].into_iter().flatten().max().unwrap_or(0);
-        if n > newest_other {
-            return (Status::AwaitingInput, Some(n));
+        if sig > newest_other {
+            return (Status::AwaitingInput, Some(sig));
         }
     }
 
@@ -202,6 +206,38 @@ mod tests {
     fn notification_newest_is_awaiting() {
         let l = m(&[("stop", 10), ("notification", 11)]);
         assert_eq!(derive_status(&l, None), (Status::AwaitingInput, Some(11)));
+    }
+
+    #[test]
+    fn user_question_newest_is_awaiting() {
+        let l = m(&[("stop", 10), ("user_question", 11)]);
+        assert_eq!(derive_status(&l, None), (Status::AwaitingInput, Some(11)));
+    }
+
+    #[test]
+    fn user_question_older_than_stop_is_idle() {
+        let l = m(&[("user_question", 8), ("stop", 12)]);
+        assert_eq!(derive_status(&l, None), (Status::Idle, Some(12)));
+    }
+
+    #[test]
+    fn user_question_older_than_active_is_working() {
+        let l = m(&[("user_question", 5), ("user_prompt", 9)]);
+        assert_eq!(derive_status(&l, None), (Status::Working, Some(9)));
+    }
+
+    #[test]
+    fn user_question_newest_beats_notification() {
+        // When both exist, the max drives awaiting_input — user_question wins here.
+        let l = m(&[("notification", 10), ("user_question", 14)]);
+        assert_eq!(derive_status(&l, None), (Status::AwaitingInput, Some(14)));
+    }
+
+    #[test]
+    fn notification_newest_beats_user_question() {
+        // When both exist, the max drives awaiting_input — notification wins here.
+        let l = m(&[("user_question", 10), ("notification", 14)]);
+        assert_eq!(derive_status(&l, None), (Status::AwaitingInput, Some(14)));
     }
 
     #[test]
