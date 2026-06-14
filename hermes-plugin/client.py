@@ -140,7 +140,7 @@ class XpokClient:
             params["since"] = since
         return self._get(f"/sessions/{sid}/wait", params=params, timeout=_WAIT_TIMEOUT)
 
-    def get_events(self, sid: str, offset: int = -1, size: int = 100,
+    def get_events(self, sid: str, offset: int = -1, size: int = 10,
                    wait: int = 2) -> Dict[str, Any]:
         # offset and size are REQUIRED by the server. offset=-1 returns the
         # latest `size` events (tail); offset>=0 returns events with seq > offset.

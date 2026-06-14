@@ -306,7 +306,7 @@ POK_EVENTS_SCHEMA = {
             },
             "size": {
                 "type": "integer",
-                "description": "Max events to return (default 100, server caps at 1000).",
+                "description": "Max events to return (default 10, server caps at 1000). ⚠️ Each event carries full payload (tool_use inputs, tool_result content, assistant_message text). After /wait returns idle, use size=3–5 — the stop event is always near the tail. size=100 (old default) can dump 50-100K tokens into context, causing provider timeouts.",
             },
             "wait": {
                 "type": "integer",
@@ -323,7 +323,7 @@ def _handle_pok_events(args: dict, **_kw) -> str:
     if not sid:
         return _err("session_id is required")
     offset = args.get("offset", -1)
-    size = args.get("size", 100)
+    size = args.get("size", 10)
     wait = args.get("wait", 2)
     try:
         data = _client().get_events(sid, offset=offset, size=size, wait=wait)
