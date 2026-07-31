@@ -11,7 +11,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -624,6 +624,50 @@ def _handle_pok_health(args: dict, **_kw) -> str:
 # Tool: pok_profiles
 # ---------------------------------------------------------------------------
 
+def _freeform_map(description: str) -> Dict[str, Any]:
+    """Schema fragment for a profile sub-map with arbitrary keys.
+
+    Returns a fresh dict per call so callers never share (and mutate) the
+    nested ``properties`` object.
+    """
+    return {
+        "type": "object",
+        "description": description,
+        "properties": {},
+        "additionalProperties": True,
+    }
+
+
+# Field-level schema for the profile object, mirroring pok_proto::Profile
+# (crates/pok-proto/src/profile.rs). Declaring the fields explicitly matters:
+# a bare {"type": "object"} with no "properties" gets an empty properties dict
+# injected downstream (Hermes' schema sanitizer does this for llama.cpp-style
+# grammar backends), and a property-less object with no additionalProperties
+# constrains the model to emitting a literal {} — i.e. it cannot express any
+# profile data at all. The free-form sub-maps keep additionalProperties: true
+# so arbitrary agent/skill/server names still pass through.
+_PROFILE_PROPERTIES: Dict[str, Any] = {
+    "name": {
+        "type": "string",
+        "description": "Profile name. The top-level `name` argument wins when both are given.",
+    },
+    "description": {"type": "string", "description": "Human-readable summary of the profile."},
+    "version": {"type": "string", "description": "Profile version (defaults to 1.0.0 server-side)."},
+    "tags": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Free-form tags for grouping profiles.",
+    },
+    "claude_md": {"type": "string", "description": "CLAUDE.md content this profile contributes."},
+    "agents": _freeform_map("Agent definitions keyed by agent name."),
+    "skills": _freeform_map("Skill definitions keyed by skill name."),
+    "mcp_servers": _freeform_map("MCP server definitions keyed by server name."),
+    "hooks": _freeform_map("CC hook groups keyed by hook event name."),
+    "settings": _freeform_map(
+        "CC settings.json fragment (model, effort, permission_mode, env, ...)."
+    ),
+}
+
 POK_PROFILES_SCHEMA = {
     "name": "pok_profiles",
     "description": (
@@ -646,7 +690,13 @@ POK_PROFILES_SCHEMA = {
             },
             "profile": {
                 "type": "object",
-                "description": "Profile data (required for create/update). Fields: claude_md, agents, skills, mcp_servers, hooks, settings, tags.",
+                "description": (
+                    "Profile data (required for create/update). Pass a real JSON object, "
+                    "not a JSON-encoded string. Fields: claude_md, agents, skills, "
+                    "mcp_servers, hooks, settings, tags, description, version, name."
+                ),
+                "properties": _PROFILE_PROPERTIES,
+                "additionalProperties": True,
             },
             "profiles": {
                 "type": "array",
@@ -657,6 +707,45 @@ POK_PROFILES_SCHEMA = {
         "required": ["action"],
     },
 }
+
+
+_PROFILE_FIELD_HINT = (
+    "pass a non-empty object with at least one of: "
+    "claude_md, agents, skills, mcp_servers, hooks, settings, tags, description"
+)
+
+
+def _coerce_profile(raw: Any) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Normalize the ``profile`` argument to a plain dict.
+
+    Returns ``(profile, error)`` — ``error`` is non-empty only when the value
+    is present but unusable. A missing/blank profile yields ``(None, "")`` so
+    the caller can emit its own action-specific message.
+
+    Models often emit nested object arguments as a JSON-encoded string, and
+    not every dispatch path runs Hermes' ``coerce_tool_args`` (plugin-invoked
+    tools go straight to ``registry.dispatch``), so a string profile has to be
+    decoded here. Without it, create died on ``profile["name"] = name`` with
+    "'str' object does not support item assignment" and update forwarded the
+    raw string as the HTTP body — Xpo-k then saw a JSON string instead of an
+    object and rejected it.
+
+    The returned dict is always a copy: the handler injects ``name`` into it
+    and must not mutate the caller's argument dict.
+    """
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None, ""
+        try:
+            raw = json.loads(text)
+        except ValueError as e:
+            return None, f"profile is not valid JSON: {e}"
+    if raw is None:
+        return None, ""
+    if not isinstance(raw, dict):
+        return None, f"profile must be an object, got {type(raw).__name__}"
+    return dict(raw), ""
 
 
 def _handle_pok_profiles(args: dict, **_kw) -> str:
@@ -671,18 +760,30 @@ def _handle_pok_profiles(args: dict, **_kw) -> str:
                 return _err("name is required for get")
             return _ok({"profile": c.get_profile(name)})
         elif action == "create":
-            profile = args.get("profile", {})
+            profile, perr = _coerce_profile(args.get("profile"))
+            if perr:
+                return _err(perr)
             if not profile:
-                return _err("profile data is required for create")
+                return _err(f"profile data is required for create — {_PROFILE_FIELD_HINT}")
             if name:
                 profile["name"] = name
+            pname = profile.get("name")
+            if not isinstance(pname, str) or not pname.strip():
+                # Xpo-k's POST /profiles requires a string `name`; fail here
+                # with a usable message instead of round-tripping a 400.
+                return _err(
+                    "profile name is required for create — pass name, "
+                    "or set a string 'name' inside profile"
+                )
             return _ok(c.create_profile(profile))
         elif action == "update":
             if not name:
                 return _err("name is required for update")
-            profile = args.get("profile", {})
+            profile, perr = _coerce_profile(args.get("profile"))
+            if perr:
+                return _err(perr)
             if not profile:
-                return _err("profile data is required for update")
+                return _err(f"profile data is required for update — {_PROFILE_FIELD_HINT}")
             return _ok(c.update_profile(name, profile))
         elif action == "delete":
             if not name:
