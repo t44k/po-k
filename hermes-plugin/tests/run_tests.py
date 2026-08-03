@@ -564,11 +564,262 @@ def run_notifications() -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Tests: pre_llm_call surfacing hook (deterministic — injected clock, no HTTP)
+# --------------------------------------------------------------------------- #
+
+class FakeNotifyClient:
+    """Client stub for the notifier: scripted poll results, recorded calls."""
+
+    def __init__(self, subs_count: int = 1) -> None:
+        self.calls: list = []
+        self.subs_count = subs_count
+        self.pending: list = []
+        self.fail_poll = False
+        self.fail_probe = False
+
+    def list_subscriptions(self, *, subscriber="", sid="", timeout=None):
+        self.calls.append(("list_subscriptions", subscriber, timeout))
+        if self.fail_probe:
+            raise RuntimeError("connection refused")
+        return {"count": self.subs_count,
+                "subscriptions": [{"id": "sub-1"}] * self.subs_count}
+
+    def poll_notifications(self, *, subscriber="", sid="", limit=20, wait=0, timeout=None):
+        self.calls.append(("poll", subscriber, limit, wait, timeout))
+        if self.fail_poll:
+            raise RuntimeError("timeout")
+        return {"notifications": list(self.pending), "count": len(self.pending)}
+
+    def ack_notifications(self, ids):
+        self.calls.append(("ack", list(ids)))
+        return {"ok": True, "acked": len(ids)}
+
+
+def run_hook() -> int:
+    global _passes, _failures
+    _passes = _failures = 0
+
+    import os as _os
+    from hermes_plugins.pok import notifier
+
+    # Deterministic clock: the module reads time.monotonic() only.
+    clock = {"t": 1000.0}
+    real_monotonic = notifier.time.monotonic
+    notifier.time.monotonic = lambda: clock["t"]  # type: ignore[assignment]
+
+    fake = FakeNotifyClient()
+    notifier._client = lambda: fake  # type: ignore[assignment]
+    notifier._subscriber = lambda: "hermes-test"  # type: ignore[assignment]
+
+    saved_env = {k: _os.environ.get(k) for k in (
+        "XPOK_URL", "POK_NOTIFY_SURFACE", "POK_NOTIFY_POLL_SECS",
+        "POK_NOTIFY_RESURFACE_SECS", "POK_NOTIFY_LIMIT", "POK_NOTIFY_TIMEOUT",
+        "POK_NOTIFY_PROBE_SECS")}
+    _os.environ["XPOK_URL"] = "http://xpok.test:8080"
+    _os.environ["POK_NOTIFY_POLL_SECS"] = "30"
+    _os.environ["POK_NOTIFY_RESURFACE_SECS"] = "600"
+    _os.environ.pop("POK_NOTIFY_SURFACE", None)
+
+    def ntf(nid, kind="stop", seq=7, status=None, sid="s1"):
+        return {"id": nid, "session_id": sid, "kind": kind, "seq": seq,
+                "status": status, "payload": {}}
+
+    try:
+        print("\nhook: gating")
+        notifier.reset_for_tests()
+        fake.calls.clear()
+        saved_url = _os.environ.pop("XPOK_URL")
+        _check("no XPOK_URL → hook is a no-op",
+               notifier.on_pre_llm_call() is None and fake.calls == [], str(fake.calls))
+        _os.environ["XPOK_URL"] = saved_url
+
+        notifier.reset_for_tests()
+        fake.calls.clear()
+        _os.environ["POK_NOTIFY_SURFACE"] = "0"
+        _check("POK_NOTIFY_SURFACE=0 disables it",
+               notifier.on_pre_llm_call() is None and fake.calls == [], str(fake.calls))
+        _os.environ.pop("POK_NOTIFY_SURFACE")
+
+        notifier.reset_for_tests()
+        fake.calls.clear()
+        fake.subs_count = 0
+        _check("no subscriptions → probes once, never polls",
+               notifier.on_pre_llm_call() is None
+               and [c[0] for c in fake.calls] == ["list_subscriptions"],
+               str(fake.calls))
+        clock["t"] += 31
+        fake.calls.clear()
+        _check("cached negative probe suppresses further work",
+               notifier.on_pre_llm_call() is None and fake.calls == [], str(fake.calls))
+        fake.subs_count = 1
+
+        print("\nhook: surfacing")
+        notifier.reset_for_tests()
+        fake.calls.clear()
+        fake.pending = [ntf("ntf-1")]
+        res = notifier.on_pre_llm_call(session_id="x", user_message="unrelated question",
+                                       is_first_turn=False, model="m", platform="cli")
+        _check("returns a dict with a context key",
+               isinstance(res, dict) and "context" in res, str(res))
+        ctx = res["context"] if isinstance(res, dict) else ""
+        _check("context is fenced for the model", ctx.startswith("<po-k-notifications>"), ctx[:60])
+        _check("names the notification id", "ntf-1" in ctx, ctx)
+        _check("names the session", "s1" in ctx, ctx)
+        _check("tells the agent to ack", "pok_notifications(action='ack'" in ctx, ctx)
+        _check("says they are not acknowledged", "NOT acknowledged" in ctx, ctx)
+        _check("never acks while surfacing",
+               not any(c[0] == "ack" for c in fake.calls), str(fake.calls))
+        poll = [c for c in fake.calls if c[0] == "poll"][0]
+        _check("polls with wait=0 (never blocks the turn)", poll[3] == 0, str(poll))
+        _check("polls with a short timeout", poll[4] == 3, str(poll))
+
+        print("\nhook: no duplicate nagging, but nothing is lost")
+        fake.calls.clear()
+        clock["t"] += 31  # past the poll rate limit
+        _check("same notification is not repeated within the resurface window",
+               notifier.on_pre_llm_call() is None, "repeated too early")
+        _check("…and it polled again (the id is filtered locally, not server-side)",
+               any(c[0] == "poll" for c in fake.calls), str(fake.calls))
+        fake.calls.clear()
+        clock["t"] += 601  # past POK_NOTIFY_RESURFACE_SECS
+        res2 = notifier.on_pre_llm_call()
+        _check("an unacked notification is re-surfaced later",
+               isinstance(res2, dict) and "ntf-1" in res2["context"], str(res2))
+
+        print("\nhook: rate limiting")
+        fake.calls.clear()
+        clock["t"] += 5  # inside the 30s window
+        _check("no HTTP inside the rate-limit window",
+               notifier.on_pre_llm_call() is None and fake.calls == [], str(fake.calls))
+
+        print("\nhook: failures never consume a notification")
+        notifier.reset_for_tests()
+        fake.calls.clear()
+        fake.pending = [ntf("ntf-2")]
+        fake.fail_poll = True
+        _check("a failed poll returns no context", notifier.on_pre_llm_call() is None)
+        fake.fail_poll = False
+        clock["t"] += 31
+        res3 = notifier.on_pre_llm_call()
+        _check("the notification is surfaced on the next attempt (not marked delivered)",
+               isinstance(res3, dict) and "ntf-2" in res3["context"], str(res3))
+
+        notifier.reset_for_tests()
+        fake.calls.clear()
+        fake.fail_probe = True
+        _check("a failed probe is not fatal", notifier.on_pre_llm_call() is None)
+        fake.fail_probe = False
+
+        print("\nhook: ack clears local state")
+        notifier.reset_for_tests()
+        notifier.note_subscription_created()
+        fake.pending = [ntf("ntf-3")]
+        res4 = notifier.on_pre_llm_call()
+        _check("surfaced once", isinstance(res4, dict) and "ntf-3" in res4["context"])
+        notifier.note_acked(["ntf-3"])
+        _check("acked ids are dropped from the mentioned-map",
+               "ntf-3" not in notifier._surfaced, str(notifier._surfaced))
+
+        print("\nhook: shapes and robustness")
+        notifier.reset_for_tests()
+        notifier.note_subscription_created()
+        fake.calls.clear()
+        _check("note_subscription_created skips the probe",
+               not any(c[0] == "list_subscriptions" for c in fake.calls), str(fake.calls))
+        fake.pending = [ntf("ntf-s", kind="status", seq=-1, status="idle")]
+        res5 = notifier.on_pre_llm_call()
+        _check("status notifications render as status=…",
+               isinstance(res5, dict) and "status=idle" in res5["context"], str(res5))
+        _check("no bogus seq for status rows",
+               isinstance(res5, dict) and "seq=-1" not in res5["context"], str(res5))
+        notifier.reset_for_tests()
+        notifier.note_subscription_created()
+        fake.pending = [{"garbage": True}, ntf("ntf-4")]
+        res6 = notifier.on_pre_llm_call()
+        _check("rows without an id are skipped, valid ones still surface",
+               isinstance(res6, dict) and "ntf-4" in res6["context"], str(res6))
+        notifier.reset_for_tests()
+        notifier.note_subscription_created()
+        fake.pending = []
+        _check("nothing pending → no context", notifier.on_pre_llm_call() is None)
+        _check("render([]) is empty", notifier.render([]) == "")
+
+        print("\nhook: bounded memory")
+        notifier.reset_for_tests()
+        notifier.note_subscription_created()
+        fake.pending = [ntf(f"ntf-b{i}") for i in range(notifier._MAX_SURFACED + 50)]
+        _os.environ["POK_NOTIFY_LIMIT"] = str(notifier._MAX_SURFACED + 50)
+        notifier.on_pre_llm_call()
+        _check("mentioned-map stays bounded",
+               len(notifier._surfaced) <= notifier._MAX_SURFACED,
+               str(len(notifier._surfaced)))
+        _os.environ.pop("POK_NOTIFY_LIMIT")
+
+        print("\nregistration")
+        registered: list = []
+
+        class _Ctx:
+            def register_tool(self, **kw):
+                pass
+
+            def register_hook(self, name, cb):
+                registered.append((name, cb))
+
+        from hermes_plugins import pok as pkg
+        pkg.register(_Ctx())
+        _check("plugin registers exactly one hook", len(registered) == 1, str(registered))
+        _check("…and it is pre_llm_call", registered and registered[0][0] == "pre_llm_call",
+               str(registered))
+        _check("…bound to the notifier callback",
+               registered and registered[0][1] is notifier.on_pre_llm_call)
+
+        # A Hermes build without register_hook must still load the tools.
+        class _OldCtx:
+            def register_tool(self, **kw):
+                pass
+
+        try:
+            pkg.register(_OldCtx())
+            _check("plugin still loads when register_hook is unavailable", True)
+        except Exception as e:
+            _check("plugin still loads when register_hook is unavailable", False, str(e))
+    finally:
+        notifier.time.monotonic = real_monotonic  # type: ignore[assignment]
+        notifier.reset_for_tests()
+        for k, v in saved_env.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+    print(f"\nhook results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
+# --------------------------------------------------------------------------- #
 # Tests: round trip through the Hermes framework (skipped without hermes-agent)
 # --------------------------------------------------------------------------- #
 
+def pt_notifier_stub():
+    """The plugin's real hook callback with a scripted client behind it, so the
+    framework round trip exercises our code, not a lambda."""
+    from hermes_plugins.pok import notifier
+
+    fake = FakeNotifyClient()
+    fake.pending = [{"id": "ntf-fw", "session_id": "s1", "kind": "stop", "seq": 3}]
+    notifier.reset_for_tests()
+    notifier._client = lambda: fake  # type: ignore[assignment]
+    notifier._subscriber = lambda: "hermes-fw"  # type: ignore[assignment]
+    notifier.note_subscription_created()
+    import os as _os
+
+    _os.environ["XPOK_URL"] = _os.environ.get("XPOK_URL") or "http://xpok.test:8080"
+    return notifier.on_pre_llm_call
+
+
 def run_framework() -> int:
-    """Verify the schema survives Hermes' sanitizer and arg coercion."""
+    """Verify the schema survives Hermes' sanitizer and arg coercion, and that
+    the surfacing hook plugs into the real plugin manager."""
     global _passes, _failures
     _passes = _failures = 0
     print("\nhermes-agent round trip")
@@ -592,6 +843,41 @@ def run_framework() -> int:
            prof.get("additionalProperties") is True)
     _check("sanitizer keeps required=[action]",
            sanitized[0]["function"]["parameters"].get("required") == ["action"])
+
+    # The surfacing hook must be a REAL Hermes hook, not an invented name, and
+    # invoke_hook must actually collect our context dict.
+    try:
+        from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
+
+        _check("pre_llm_call is a documented Hermes hook", "pre_llm_call" in VALID_HOOKS)
+        mgr = get_plugin_manager()
+        mgr._hooks.setdefault("pre_llm_call", [])
+        before = list(mgr._hooks["pre_llm_call"])
+        mgr._hooks["pre_llm_call"].append(pt_notifier_stub())
+        try:
+            results = mgr.invoke_hook(
+                "pre_llm_call",
+                session_id="s", user_message="unrelated", conversation_history=[],
+                is_first_turn=False, model="m", platform="cli", sender_id="",
+            )
+            ctxs = [r["context"] for r in results
+                    if isinstance(r, dict) and r.get("context")]
+            _check("invoke_hook collects our {'context': ...} return",
+                   any("po-k-notifications" in c for c in ctxs), str(results))
+        finally:
+            mgr._hooks["pre_llm_call"] = before
+        # And a raising callback is swallowed by the manager (our hook also
+        # guards internally, but confirm the contract we rely on).
+        mgr._hooks["pre_llm_call"].append(lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+        try:
+            mgr.invoke_hook("pre_llm_call", session_id="s")
+            _check("a raising hook callback cannot break the turn", True)
+        except Exception as e:
+            _check("a raising hook callback cannot break the turn", False, str(e))
+        finally:
+            mgr._hooks["pre_llm_call"] = before
+    except Exception as e:
+        _check("hook contract verified against hermes-agent", False, str(e))
 
     try:
         from model_tools import coerce_tool_args
@@ -633,6 +919,10 @@ def test_notifications() -> None:
     assert run_notifications() == 0
 
 
+def test_surfacing_hook() -> None:
+    assert run_hook() == 0
+
+
 def test_framework_round_trip() -> None:
     assert run_framework() == 0
 
@@ -640,5 +930,6 @@ def test_framework_round_trip() -> None:
 if __name__ == "__main__":
     rc1 = run()
     rc2 = run_notifications()
-    rc3 = run_framework()
-    sys.exit(rc1 | rc2 | rc3)
+    rc3 = run_hook()
+    rc4 = run_framework()
+    sys.exit(rc1 | rc2 | rc3 | rc4)

@@ -40,6 +40,17 @@ def _check() -> bool:
     return bool(os.getenv("XPOK_URL"))
 
 
+def _notifier_call(fn_name: str, *fn_args) -> None:
+    """Nudge the notifier's process-local state. Best effort — the tools must
+    work even if the hook module is unavailable."""
+    try:
+        from . import notifier
+
+        getattr(notifier, fn_name)(*fn_args)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.debug("po-k: notifier.%s skipped: %s", fn_name, e)
+
+
 def _subscriber(args: dict) -> str:
     """Resolve the subscriber identity for notification subscriptions.
 
@@ -925,6 +936,9 @@ def _handle_pok_subscribe(args: dict, **_kw) -> str:
             ttl_secs=args.get("ttl_secs"),
             cursor=args.get("cursor"),
         )
+        # Let the pre_llm_call hook start surfacing immediately instead of
+        # waiting for its next subscription probe.
+        _notifier_call("note_subscription_created")
         return _ok(data)
     except Exception as e:
         return _err(str(e))
@@ -975,7 +989,9 @@ def _handle_pok_subscriptions(args: dict, **_kw) -> str:
             sub_id = args.get("subscription_id", "")
             if not sub_id:
                 return _err("subscription_id is required for delete")
-            return _ok(c.delete_subscription(sub_id))
+            data = c.delete_subscription(sub_id)
+            _notifier_call("note_subscription_deleted")
+            return _ok(data)
         else:
             return _err(f"unknown action: {action!r}")
     except Exception as e:
@@ -1037,7 +1053,10 @@ def _handle_pok_notifications(args: dict, **_kw) -> str:
                 ids = [ids]
             if not ids or not isinstance(ids, list):
                 return _err("ids (array of notification ids) is required for ack")
-            return _ok(c.ack_notifications([str(i) for i in ids]))
+            ids = [str(i) for i in ids]
+            data = c.ack_notifications(ids)
+            _notifier_call("note_acked", ids)
+            return _ok(data)
         else:
             return _err(f"unknown action: {action!r}")
     except Exception as e:

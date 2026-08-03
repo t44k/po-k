@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     statuses    TEXT NOT NULL,          -- JSON array of derived statuses
     cursor      INTEGER NOT NULL DEFAULT 0,  -- advanced on ACK only
     created_at  TEXT NOT NULL,
+    ttl_secs    INTEGER NOT NULL,       -- the configured lifetime, reused on refresh
     expires_at  INTEGER NOT NULL        -- unix epoch seconds
 );
 CREATE INDEX IF NOT EXISTS subscriptions_by_sid ON subscriptions (sid);

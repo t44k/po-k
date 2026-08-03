@@ -59,6 +59,9 @@ pub struct SubscriptionRow {
     pub statuses: Vec<String>,
     pub cursor: i64,
     pub created_at: String,
+    /// Configured lifetime; reused when an ack refreshes `expires_at` so a
+    /// short-lived subscription doesn't silently become a 24h one.
+    pub ttl_secs: i64,
     pub expires_at: i64,
 }
 
@@ -75,10 +78,20 @@ pub struct NotificationRow {
     pub created_at: String,
 }
 
-type SubTuple = (String, String, String, String, String, i64, String, i64);
+type SubTuple = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    i64,
+);
 
 fn sub_from(t: SubTuple) -> SubscriptionRow {
-    let (id, subscriber, sid, kinds, statuses, cursor, created_at, expires_at) = t;
+    let (id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, expires_at) = t;
     SubscriptionRow {
         id,
         subscriber,
@@ -87,6 +100,7 @@ fn sub_from(t: SubTuple) -> SubscriptionRow {
         statuses: parse_list(&statuses),
         cursor,
         created_at,
+        ttl_secs,
         expires_at,
     }
 }
@@ -95,7 +109,8 @@ fn parse_list(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
-const SUB_COLS: &str = "id, subscriber, sid, kinds, statuses, cursor, created_at, expires_at";
+const SUB_COLS: &str =
+    "id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, expires_at";
 
 // ---------------------------------------------------------------------------
 // Long-poll hub
@@ -151,11 +166,12 @@ pub async fn create_subscription(
         statuses: statuses.to_vec(),
         cursor,
         created_at: now_iso(),
+        ttl_secs: ttl,
         expires_at: now_epoch() + ttl,
     };
     sqlx::query(
-        r#"INSERT INTO subscriptions (id, subscriber, sid, kinds, statuses, cursor, created_at, expires_at)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"#,
+        r#"INSERT INTO subscriptions (id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, expires_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"#,
     )
     .bind(&row.id)
     .bind(&row.subscriber)
@@ -164,6 +180,7 @@ pub async fn create_subscription(
     .bind(serde_json::to_string(&row.statuses)?)
     .bind(row.cursor)
     .bind(&row.created_at)
+    .bind(row.ttl_secs)
     .bind(row.expires_at)
     .execute(db)
     .await
@@ -273,11 +290,14 @@ pub async fn sweep(db: &Db, ack_retention_secs: i64) -> Result<(u64, u64)> {
         .await
         .context("DELETE expired subscriptions")?
         .rows_affected();
-    // Prune long-acked rows. `datetime()` keeps the comparison in SQLite so we
-    // don't have to format a cut-off timestamp here.
+    // Prune long-acked rows. The cut-off MUST be rendered in the same format
+    // `now_iso()` writes (`YYYY-MM-DDTHH:MM:SSZ`) — SQLite's bare `datetime()`
+    // yields `YYYY-MM-DD HH:MM:SS`, and a lexicographic compare against the
+    // 'T'/'Z' form then never matches within the same day, so nothing would
+    // ever be pruned.
     let r = sqlx::query(
         "DELETE FROM notifications WHERE acked_at IS NOT NULL
-           AND acked_at < datetime('now', ?1)",
+           AND acked_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)",
     )
     .bind(format!("-{ack_retention_secs} seconds"))
     .execute(db)
@@ -290,9 +310,17 @@ pub async fn sweep(db: &Db, ack_retention_secs: i64) -> Result<(u64, u64)> {
 // Matching + enqueue
 // ---------------------------------------------------------------------------
 
-/// Queue one notification. `seq >= 0` rows are deduplicated by the partial
-/// unique index; `seq < 0` (status-derived) rows are suppressed while an
-/// unacked row with the same status is already pending.
+/// Queue one notification.
+///
+/// Two deduplication lanes:
+/// * `seq > 0` — sequenced events. The partial unique index on
+///   `(sub_id, seq, kind)` makes a re-delivery (duplicate push, reconnect
+///   replay) a no-op forever, which is exactly right for an immutable event.
+/// * `seq <= 0` — status changes (`-1`) and events forwarded by a pre-M15 po-k
+///   that carry no seq. These have no stable identity, so the unique index
+///   would permanently swallow every later occurrence; instead they are
+///   suppressed only while an unacked row with the same kind+status is
+///   pending, and may fire again once that one is acked.
 ///
 /// Returns the row when it was actually inserted, `None` when suppressed.
 async fn enqueue(
@@ -303,7 +331,7 @@ async fn enqueue(
     status: Option<&str>,
     payload: &Value,
 ) -> Result<Option<NotificationRow>> {
-    if seq < 0 {
+    if seq <= 0 {
         let dup: Option<(String,)> = sqlx::query_as(
             r#"SELECT id FROM notifications
                WHERE sub_id = ?1 AND acked_at IS NULL AND kind = ?2
@@ -380,7 +408,14 @@ pub async fn match_event(
             continue;
         }
         let body = json!({ "event": { "kind": kind, "seq": seq, "ts": ts, "payload": payload } });
-        if enqueue(db, &sub, seq, kind, None, &body).await?.is_some() {
+        // An event with no usable seq (pre-M15 po-k) is stored on the
+        // unsequenced lane so it can recur after an ack; the real value stays
+        // visible in the payload.
+        let stored_seq = if seq > 0 { seq } else { -1 };
+        if enqueue(db, &sub, stored_seq, kind, None, &body)
+            .await?
+            .is_some()
+        {
             woken.push(sub.subscriber.clone());
         }
     }
@@ -491,6 +526,16 @@ pub async fn ack(db: &Db, ids: &[String]) -> Result<(u64, u64)> {
             already += 1;
             continue;
         };
+        // Refresh with the subscription's CONFIGURED ttl, not the default —
+        // acking a 60s subscription must not silently make it a 24h one.
+        let ttl: i64 =
+            sqlx::query_as::<_, (i64,)>("SELECT ttl_secs FROM subscriptions WHERE id = ?1")
+                .bind(&sub_id)
+                .fetch_optional(db)
+                .await
+                .context("SELECT subscription ttl")?
+                .map(|(t,)| t)
+                .unwrap_or(DEFAULT_TTL_SECS);
         let mut tx = db.begin().await?;
         sqlx::query("UPDATE notifications SET acked_at = ?1 WHERE id = ?2 AND acked_at IS NULL")
             .bind(now_iso())
@@ -502,7 +547,7 @@ pub async fn ack(db: &Db, ids: &[String]) -> Result<(u64, u64)> {
             "UPDATE subscriptions SET cursor = MAX(cursor, ?1), expires_at = ?2 WHERE id = ?3",
         )
         .bind(seq.max(0))
-        .bind(now_epoch() + DEFAULT_TTL_SECS)
+        .bind(now_epoch() + ttl)
         .bind(&sub_id)
         .execute(&mut *tx)
         .await
@@ -800,6 +845,149 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        let pend = pending(&db, None, None, 10).await.unwrap();
+        assert_eq!(pend[0].seq, -1, "stored on the unsequenced lane");
+        assert_eq!(
+            pend[0].payload["event"]["seq"], 0,
+            "the forwarded value stays visible in the payload"
+        );
+    }
+
+    /// Regression: an unsequenced event must not be locked out forever by the
+    /// `(sub_id, seq, kind)` unique index. A second turn from a pre-M15 po-k has
+    /// to notify again once the first notification is acked — otherwise the
+    /// orchestrator would see exactly one completion per session, ever.
+    #[tokio::test]
+    async fn unsequenced_events_recur_after_ack() {
+        let (db, _d) = fresh_db().await;
+        sub_for(&db, "s1", 0).await;
+        assert_eq!(
+            match_event(&db, "s1", "stop", 0, "", &ev())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // While the first is unacked, a repeat is suppressed (no nagging).
+        assert!(match_event(&db, "s1", "stop", 0, "", &ev())
+            .await
+            .unwrap()
+            .is_empty());
+        let ids: Vec<String> = pending(&db, None, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 1);
+        ack(&db, &ids).await.unwrap();
+        // The next turn's stop notifies again.
+        assert_eq!(
+            match_event(&db, "s1", "stop", 0, "", &ev())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(pending(&db, None, None, 10).await.unwrap().len(), 1);
+    }
+
+    /// Regression: acking must refresh the subscription with its OWN ttl, not
+    /// the 24h default — a deliberately short-lived subscription must stay
+    /// short-lived.
+    #[tokio::test]
+    async fn ack_refreshes_with_the_configured_ttl() {
+        let (db, _d) = fresh_db().await;
+        let short = create_subscription(&db, "hermes-1", "s1", &[], &[], 0, 120)
+            .await
+            .unwrap();
+        assert_eq!(short.ttl_secs, 120);
+        match_event(&db, "s1", "stop", 4, "t", &ev()).await.unwrap();
+        let ids: Vec<String> = pending(&db, None, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        ack(&db, &ids).await.unwrap();
+        let after = get_subscription(&db, &short.id).await.unwrap().unwrap();
+        let horizon = after.expires_at - now_epoch();
+        assert!(
+            (60..=180).contains(&horizon),
+            "expected a ~120s horizon, got {horizon}s (did the default TTL leak in?)"
+        );
+    }
+
+    /// Regression: acked rows must actually be pruned. The cut-off has to be
+    /// rendered in `now_iso()`'s format — with SQLite's bare `datetime()` the
+    /// comparison silently never matched and acked rows accumulated forever.
+    #[tokio::test]
+    async fn sweep_prunes_acked_notifications_past_the_retention_window() {
+        let (db, _d) = fresh_db().await;
+        sub_for(&db, "s1", 0).await;
+        match_event(&db, "s1", "stop", 1, "t", &ev()).await.unwrap();
+        let ids: Vec<String> = pending(&db, None, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        ack(&db, &ids).await.unwrap();
+
+        // Age the ack deterministically instead of sleeping.
+        sqlx::query(
+            "UPDATE notifications SET acked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now','-7200 seconds')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let (_, notifs) = sweep(&db, 3600).await.unwrap();
+        assert_eq!(notifs, 1, "the 2h-old acked row must be pruned");
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM notifications")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(total.0, 0);
+    }
+
+    /// …but a *recent* ack is retained, because that retention window is what
+    /// makes a duplicate ack idempotent instead of "unknown id".
+    #[tokio::test]
+    async fn sweep_keeps_recently_acked_rows_for_idempotence() {
+        let (db, _d) = fresh_db().await;
+        sub_for(&db, "s1", 0).await;
+        match_event(&db, "s1", "stop", 1, "t", &ev()).await.unwrap();
+        let ids: Vec<String> = pending(&db, None, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        ack(&db, &ids).await.unwrap();
+        let (_, notifs) = sweep(&db, 3600).await.unwrap();
+        assert_eq!(notifs, 0, "a fresh ack is inside the retention window");
+        let (acked, already) = ack(&db, &ids).await.unwrap();
+        assert_eq!(
+            (acked, already),
+            (0, 1),
+            "re-ack still reports already_acked"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_clamps_the_ttl_and_persists_it() {
+        let (db, _d) = fresh_db().await;
+        let huge = create_subscription(&db, "h", "s1", &[], &[], 0, MAX_TTL_SECS * 10)
+            .await
+            .unwrap();
+        assert_eq!(huge.ttl_secs, MAX_TTL_SECS);
+        let zero = create_subscription(&db, "h", "s2", &[], &[], 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            zero.ttl_secs, 1,
+            "a non-positive ttl clamps to 1s, never 0 or negative"
         );
     }
 }

@@ -203,26 +203,31 @@ class XpokClient:
             body["cursor"] = cursor
         return self._post("/subscriptions", body)
 
-    def list_subscriptions(self, *, subscriber: str = "",
-                           sid: str = "") -> Dict[str, Any]:
+    def list_subscriptions(self, *, subscriber: str = "", sid: str = "",
+                           timeout: int = _DEFAULT_TIMEOUT) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
         if subscriber:
             params["subscriber"] = subscriber
         if sid:
             params["session_id"] = sid
-        return self._get("/subscriptions", params=params or None)
+        return self._get("/subscriptions", params=params or None, timeout=timeout)
 
     def delete_subscription(self, subscription_id: str) -> Dict[str, Any]:
         return self._delete(f"/subscriptions/{subscription_id}")
 
     def poll_notifications(self, *, subscriber: str = "", sid: str = "",
-                           limit: int = 20, wait: int = 0) -> Dict[str, Any]:
+                           limit: int = 20, wait: int = 0,
+                           timeout: Optional[int] = None) -> Dict[str, Any]:
+        # `timeout` is an explicit override for the in-turn notifier poll, which
+        # must stay well under a second-scale budget rather than the long-poll
+        # default of wait + 15s.
         params: Dict[str, Any] = {"limit": limit, "wait": wait}
         if subscriber:
             params["subscriber"] = subscriber
         if sid:
             params["session_id"] = sid
-        return self._get("/notifications", params=params, timeout=wait + 15)
+        return self._get("/notifications", params=params,
+                         timeout=timeout if timeout is not None else wait + 15)
 
     def ack_notifications(self, ids: list) -> Dict[str, Any]:
         return self._post("/notifications/ack", {"ids": ids})

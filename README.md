@@ -249,15 +249,77 @@ Contract:
 - **Expiry.** Subscriptions default to a 24 h TTL (max 7 days), refreshed on
   every ack; expired ones and their queued rows are swept automatically.
 
-**Hermes plugin usage.** `pok_subscribe` → do other work → `pok_notifications
-(action="poll")` → `pok_notifications(action="ack", ids=[…])`. The plugin
-deliberately does **not** spawn a background thread to inject into the
-conversation: `ctx.inject_message` is unavailable in gateway mode, so a
-thread-based design would drop notifications exactly where they matter most.
-Instead the queue is authoritative on the server and polled explicitly — from
-the agent's own turn, or from a gateway-side heartbeat/cron that polls
-`/notifications` and starts a turn when something is pending. Either way an
-unacked notification is never lost.
+### Hermes plugin integration
+
+Two layers, and it matters which does what:
+
+**1. Automatic surfacing on the next turn (no config needed).** The plugin
+registers Hermes' `pre_llm_call` hook. That hook fires once per turn before the
+tool loop, and a callback returning `{"context": "..."}` has that text appended
+to the current turn's user message (ephemeral — never persisted). So a CC
+completion that lands while Hermes is busy elsewhere is named on the **next
+turn, whatever that turn is about** — no `pok_wait` in flight, no background
+thread. It works in the CLI and under the gateway, because the hook lives in the
+shared conversation loop (unlike `ctx.inject_message()`, which needs a CLI
+reference and returns False in gateway mode).
+
+What the agent sees prepended to its turn:
+
+```
+<po-k-notifications>
+1 queued po-k session notification(s) — a CC session you subscribed to reached
+a boundary while you were busy:
+- id=ntf-… session=<sid> event=stop seq=214
+These are NOT acknowledged yet. …call pok_notifications(action='ack', ids=[...])
+</po-k-notifications>
+```
+
+Surfacing never acks. The row stays pending in Xpo-k until the agent explicitly
+acks it, so a turn that dies mid-way loses nothing; the notification is
+mentioned again after `POK_NOTIFY_RESURFACE_SECS`.
+
+The hook is cheap and defensive: it does nothing unless `XPOK_URL` is set and
+this subscriber actually has a subscription (one cached probe answers that,
+including for subscriptions made before the process started), it polls at most
+once per `POK_NOTIFY_POLL_SECS` with `wait=0` and a 3 s timeout, and it can never
+raise into the turn.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `POK_SUBSCRIBER` | `hermes-<hostname>` | subscriber identity (stable across restarts) |
+| `POK_NOTIFY_SURFACE` | `1` | `0` disables the hook entirely |
+| `POK_NOTIFY_POLL_SECS` | `30` | minimum seconds between in-turn polls |
+| `POK_NOTIFY_RESURFACE_SECS` | `600` | re-mention an unacked notification after this long (`0` = every turn) |
+| `POK_NOTIFY_TIMEOUT` | `3` | HTTP timeout for the in-turn poll |
+| `POK_NOTIFY_PROBE_SECS` | `300` | how long the "any subscriptions?" answer is cached |
+| `POK_NOTIFY_LIMIT` | `5` | max notifications named per turn |
+
+**2. Waking a fully idle Hermes (requires one external config change).** No
+plugin API can *originate* a turn — `pre_llm_call` needs a turn to exist, and
+`ctx.inject_message()` only reaches a CLI process. If Hermes may sit idle for
+hours and you want the completion handled without a human sending anything,
+create a **Hermes cron job** that polls; the cron runner starts a real agent turn
+with your prompt, at which point layer 1 is not even needed:
+
+```sh
+# One-time, on the Hermes host. `hermes cron create <schedule> <prompt>`.
+hermes cron create 5m \
+  "Call pok_notifications(action='poll'). If nothing is pending, reply 'nothing
+   pending' and stop. Otherwise, for each notification read the session with
+   pok_events, act if needed, then ack it with
+   pok_notifications(action='ack', ids=[...])." \
+  --name pok-notifications
+```
+
+The cron runner starts a real agent turn from that prompt, so the completion is
+handled with no human input. (Equivalently, the agent's own `cronjob` tool, which
+additionally accepts `enabled_toolsets=["pok"]` to keep the tick cheap — that
+option is not exposed on the `hermes cron create` CLI.) Nothing in this repo
+creates the job: it spends tokens on a schedule, so it stays an explicit operator
+decision.
+
+**Agent flow either way:** `pok_subscribe` → do other work → notifications
+appear in a later turn (or the cron turn) → read with `pok_events` → `ack`.
 
 ## Permission round-trip
 
