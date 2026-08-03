@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::state::XState;
 use crate::subs;
+use crate::workflow;
 
 type Resp = (StatusCode, Json<Value>);
 
@@ -47,6 +48,15 @@ pub struct CreateBody {
     /// Optional webhook push target (M16). Omit for a poll-only subscription.
     #[serde(default)]
     pub deliver: Option<DeliverBody>,
+    /// Opaque routing metadata: which chat/topic/user asked for this work (M17).
+    /// Validated against an allow-list and size-capped; omit for CLI origins.
+    #[serde(default)]
+    pub origin: Option<Value>,
+    /// Bounds for autonomous continuation on this task.
+    #[serde(default)]
+    pub max_turns: Option<i64>,
+    #[serde(default)]
+    pub budget_secs: Option<i64>,
 }
 
 /// Webhook target as supplied by an operator.
@@ -147,6 +157,28 @@ pub async fn create(State(st): State<XState>, Json(body): Json<CreateBody>) -> R
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
 
+    // Origin is opaque routing metadata; validate hard, interpret never.
+    let origin = match subs::sanitize_origin(body.origin.as_ref().unwrap_or(&Value::Null)) {
+        Ok(o) => o,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+
+    // Every subscription belongs to a workflow: the durable join between this CC
+    // session, the thread that asked, and the bounded run of autonomous turns.
+    let wf = match workflow::ensure(
+        &st.db,
+        &subscriber,
+        &body.session_id,
+        origin.as_deref(),
+        body.max_turns,
+        body.budget_secs,
+    )
+    .await
+    {
+        Ok(w) => w,
+        Err(e) => return internal(e),
+    };
+
     match subs::create_subscription(
         &st.db,
         &subscriber,
@@ -156,6 +188,8 @@ pub async fn create(State(st): State<XState>, Json(body): Json<CreateBody>) -> R
         cursor,
         body.ttl_secs.unwrap_or(subs::DEFAULT_TTL_SECS),
         &deliver,
+        origin.as_deref(),
+        Some(&wf.id),
     )
     .await
     {
@@ -171,6 +205,8 @@ pub async fn create(State(st): State<XState>, Json(body): Json<CreateBody>) -> R
                 "cursor_source": cursor_source,
                 "expires_at": row.expires_at,
                 "deliver": deliver_view(&row),
+                "workflow": workflow::view(&wf),
+                "origin": subs::origin_value(row.origin.as_deref()),
             })),
         ),
         Err(e) => internal(e),
@@ -255,6 +291,7 @@ pub async fn list(State(st): State<XState>, Query(q): Query<ListQuery>) -> Resp 
                     m.remove("deliver_secret_env");
                     m.remove("deliver_secret_file");
                     m.insert("deliver".into(), deliver_view(row));
+                    m.insert("origin".into(), subs::origin_value(row.origin.as_deref()));
                     if let Ok(summary) = subs::delivery_summary(&st.db, &row.id).await {
                         m.insert("delivery".into(), summary);
                     }

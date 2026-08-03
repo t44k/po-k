@@ -44,6 +44,91 @@ pub const DEFAULT_KINDS: &[&str] = &[
 /// happened), the status push still wakes the subscriber.
 pub const DEFAULT_STATUSES: &[&str] = &["idle", "awaiting_input", "ended"];
 
+/// Maximum serialised size of the opaque `origin` blob. Big enough for chat
+/// routing metadata, small enough that it can never become a payload channel.
+pub const ORIGIN_MAX_BYTES: usize = 2048;
+/// Longest accepted value for a single origin field.
+pub const ORIGIN_MAX_FIELD: usize = 300;
+/// The only keys an orchestrator may store as origin. Everything else is
+/// dropped: this is routing metadata, never a place for prose or secrets.
+pub const ORIGIN_KEYS: &[&str] = &[
+    "platform",
+    "chat_id",
+    "chat_name",
+    "chat_type",
+    "thread_id",
+    "parent_chat_id",
+    "message_id",
+    "user_id",
+    "user_name",
+    "session_key",
+    "hint",
+];
+
+/// Validate and normalise an `origin` object.
+///
+/// Returns the canonical JSON string to persist, or `None` when nothing usable
+/// was supplied. Rejects (rather than truncates) anything structurally wrong so
+/// a caller learns immediately; drops unknown keys silently so the orchestrator
+/// can evolve without a lockstep Xpo-k upgrade.
+pub fn sanitize_origin(raw: &Value) -> Result<Option<String>, String> {
+    match raw {
+        Value::Null => return Ok(None),
+        Value::Object(_) => {}
+        other => {
+            return Err(format!(
+                "origin must be an object, got {}",
+                match other {
+                    Value::Array(_) => "array",
+                    Value::String(_) => "string",
+                    Value::Number(_) => "number",
+                    Value::Bool(_) => "boolean",
+                    _ => "value",
+                }
+            ))
+        }
+    }
+    let obj = raw.as_object().expect("checked above");
+    let mut out = serde_json::Map::new();
+    for key in ORIGIN_KEYS {
+        let Some(v) = obj.get(*key) else { continue };
+        let text = match v {
+            Value::Null => continue,
+            Value::String(s) => s.trim().to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => return Err(format!("origin.{key} must be a scalar")),
+        };
+        if text.is_empty() {
+            continue;
+        }
+        if text.chars().count() > ORIGIN_MAX_FIELD {
+            return Err(format!(
+                "origin.{key} is longer than {ORIGIN_MAX_FIELD} characters"
+            ));
+        }
+        // Control characters would corrupt log lines and prompt templates.
+        if text.chars().any(|c| c.is_control()) {
+            return Err(format!("origin.{key} must not contain control characters"));
+        }
+        out.insert((*key).to_string(), Value::String(text));
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    let encoded = serde_json::to_string(&Value::Object(out)).map_err(|e| e.to_string())?;
+    if encoded.len() > ORIGIN_MAX_BYTES {
+        return Err(format!("origin exceeds {ORIGIN_MAX_BYTES} bytes"));
+    }
+    Ok(Some(encoded))
+}
+
+/// Parse a stored origin blob back into JSON, defaulting to `{}`.
+pub fn origin_value(raw: Option<&str>) -> Value {
+    raw.and_then(|o| serde_json::from_str(o).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
 /// Default subscription lifetime. Refreshed on every ack.
 pub const DEFAULT_TTL_SECS: i64 = 24 * 3600;
 pub const MAX_TTL_SECS: i64 = 7 * 24 * 3600;
@@ -73,6 +158,13 @@ pub struct SubscriptionRow {
     /// Path to a file holding the HMAC secret (alternative to the env var).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deliver_secret_file: Option<String>,
+    /// Opaque, validated routing metadata: which chat/topic/user this work came
+    /// from (M17). Stored and echoed verbatim, never interpreted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// The workflow this subscription belongs to (M17).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,6 +196,8 @@ type SubTuple = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 fn sub_from(t: SubTuple) -> SubscriptionRow {
@@ -120,6 +214,8 @@ fn sub_from(t: SubTuple) -> SubscriptionRow {
         deliver_url,
         deliver_secret_env,
         deliver_secret_file,
+        origin,
+        workflow_id,
     ) = t;
     SubscriptionRow {
         id,
@@ -134,6 +230,8 @@ fn sub_from(t: SubTuple) -> SubscriptionRow {
         deliver_url,
         deliver_secret_env,
         deliver_secret_file,
+        origin,
+        workflow_id,
     }
 }
 
@@ -142,7 +240,7 @@ fn parse_list(raw: &str) -> Vec<String> {
 }
 
 const SUB_COLS: &str = "id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, \
-     expires_at, deliver_url, deliver_secret_env, deliver_secret_file";
+     expires_at, deliver_url, deliver_secret_env, deliver_secret_file, origin, workflow_id";
 
 // ---------------------------------------------------------------------------
 // Long-poll hub
@@ -215,6 +313,8 @@ pub async fn create_subscription(
     cursor: i64,
     ttl_secs: i64,
     deliver: &DeliverySpec,
+    origin: Option<&str>,
+    workflow_id: Option<&str>,
 ) -> Result<SubscriptionRow> {
     let id = format!("sub-{}", Uuid::new_v4());
     let ttl = ttl_secs.clamp(1, MAX_TTL_SECS);
@@ -231,12 +331,14 @@ pub async fn create_subscription(
         deliver_url: deliver.url.clone(),
         deliver_secret_env: deliver.secret_env.clone(),
         deliver_secret_file: deliver.secret_file.clone(),
+        origin: origin.map(String::from),
+        workflow_id: workflow_id.map(String::from),
     };
     sqlx::query(
         r#"INSERT INTO subscriptions
              (id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, expires_at,
-              deliver_url, deliver_secret_env, deliver_secret_file)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
+              deliver_url, deliver_secret_env, deliver_secret_file, origin, workflow_id)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"#,
     )
     .bind(&row.id)
     .bind(&row.subscriber)
@@ -250,6 +352,8 @@ pub async fn create_subscription(
     .bind(&row.deliver_url)
     .bind(&row.deliver_secret_env)
     .bind(&row.deliver_secret_file)
+    .bind(&row.origin)
+    .bind(&row.workflow_id)
     .execute(db)
     .await
     .context("INSERT INTO subscriptions")?;
@@ -667,6 +771,8 @@ type DueTuple = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 /// One notification that is due for a webhook push, with everything the
@@ -678,6 +784,10 @@ pub struct DueDelivery {
     pub url: String,
     pub secret_env: Option<String>,
     pub secret_file: Option<String>,
+    /// Correlation context from the owning subscription (M17), echoed in the
+    /// push envelope so the woken turn knows which task and which chat thread.
+    pub workflow_id: Option<String>,
+    pub origin: Value,
 }
 
 /// Notifications whose push is due now.
@@ -691,7 +801,8 @@ pub async fn due_deliveries(db: &Db, now: i64, limit: i64) -> Result<Vec<DueDeli
     let rows: Vec<DueTuple> = sqlx::query_as(
         r#"SELECT n.id, n.sub_id, n.subscriber, n.sid, n.seq, n.kind, n.status, n.payload,
                   n.created_at, n.delivery_state, n.delivery_attempts,
-                  s.deliver_url, s.deliver_secret_env, s.deliver_secret_file
+                  s.deliver_url, s.deliver_secret_env, s.deliver_secret_file,
+                  s.workflow_id, s.origin
            FROM notifications n
            JOIN subscriptions s ON s.id = n.sub_id
            WHERE n.acked_at IS NULL
@@ -715,6 +826,8 @@ pub async fn due_deliveries(db: &Db, now: i64, limit: i64) -> Result<Vec<DueDeli
             url: r.11,
             secret_env: r.12,
             secret_file: r.13,
+            workflow_id: r.14,
+            origin: origin_value(r.15.as_deref()),
         })
         .collect())
 }
@@ -861,6 +974,8 @@ mod tests {
             cursor,
             DEFAULT_TTL_SECS,
             &DeliverySpec::default(),
+            None,
+            None,
         )
         .await
         .unwrap()
@@ -881,6 +996,8 @@ mod tests {
                 secret_env: Some("POK_WEBHOOK_SECRET".into()),
                 secret_file: None,
             },
+            None,
+            None,
         )
         .await
         .unwrap()
@@ -941,6 +1058,8 @@ mod tests {
             0,
             DEFAULT_TTL_SECS,
             &DeliverySpec::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1095,6 +1214,8 @@ mod tests {
             0,
             DEFAULT_TTL_SECS,
             &DeliverySpec::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1139,6 +1260,8 @@ mod tests {
             0,
             1,
             &DeliverySpec::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1238,6 +1361,8 @@ mod tests {
             0,
             120,
             &DeliverySpec::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1312,6 +1437,162 @@ mod tests {
             (0, 1),
             "re-ack still reports already_acked"
         );
+    }
+
+    // --- M17: origin validation ---
+
+    #[test]
+    fn sanitize_origin_keeps_allow_listed_routing_fields() {
+        let raw = json!({
+            "platform": "zulip",
+            "chat_id": "stream:eng",
+            "chat_name": "eng",
+            "chat_type": "channel",
+            "thread_id": "deploy-bug",
+            "parent_chat_id": "stream:eng",
+            "message_id": "12345",
+            "user_id": "42",
+            "user_name": "Tamas",
+            "session_key": "agent:main:zulip:channel:stream:eng:deploy-bug",
+            "hint": "asked in #eng > deploy-bug",
+        });
+        let encoded = sanitize_origin(&raw).unwrap().unwrap();
+        let out: Value = serde_json::from_str(&encoded).unwrap();
+        for key in ORIGIN_KEYS {
+            assert!(out.get(*key).is_some(), "{key} should survive");
+        }
+    }
+
+    #[test]
+    fn sanitize_origin_drops_unknown_keys_and_never_carries_prose_or_secrets() {
+        let raw = json!({
+            "chat_id": "stream:eng",
+            "token": "super-secret",
+            "authorization": "Bearer abc",
+            "last_assistant_message": "a long CC answer…",
+            "transcript": ["turn one", "turn two"],
+        });
+        let out: Value = serde_json::from_str(&sanitize_origin(&raw).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            out.as_object().unwrap().len(),
+            1,
+            "only chat_id survives: {out}"
+        );
+        assert_eq!(out["chat_id"], "stream:eng");
+        let encoded = serde_json::to_string(&out).unwrap();
+        assert!(!encoded.contains("super-secret"));
+        assert!(!encoded.contains("Bearer"));
+        assert!(!encoded.contains("CC answer"));
+    }
+
+    #[test]
+    fn sanitize_origin_coerces_scalars_and_skips_blanks() {
+        let out: Value = serde_json::from_str(
+            &sanitize_origin(&json!({
+                "chat_id": "  stream:eng  ",
+                "message_id": 12345,
+                "user_id": "",
+                "thread_id": Value::Null,
+            }))
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["chat_id"], "stream:eng", "trimmed");
+        assert_eq!(out["message_id"], "12345", "numbers become strings");
+        assert!(out.get("user_id").is_none(), "blank dropped");
+        assert!(out.get("thread_id").is_none(), "null dropped");
+    }
+
+    #[test]
+    fn sanitize_origin_rejects_bad_shapes_and_oversize_values() {
+        assert!(sanitize_origin(&Value::Null).unwrap().is_none());
+        assert!(sanitize_origin(&json!({})).unwrap().is_none());
+        assert!(sanitize_origin(&json!({"unknown": "x"})).unwrap().is_none());
+        for bad in [json!("string"), json!([1, 2]), json!(7), json!(true)] {
+            assert!(sanitize_origin(&bad).is_err(), "{bad} must be rejected");
+        }
+        // Nested values are not scalars.
+        assert!(sanitize_origin(&json!({"chat_id": {"a": 1}})).is_err());
+        assert!(sanitize_origin(&json!({"chat_id": ["a"]})).is_err());
+        // Field length cap.
+        let long = "x".repeat(ORIGIN_MAX_FIELD + 1);
+        let e = sanitize_origin(&json!({"hint": long})).unwrap_err();
+        assert!(e.contains("longer than"), "{e}");
+        // Control characters would corrupt log lines and prompt templates.
+        assert!(sanitize_origin(&json!({"chat_id": "a\nb"})).is_err());
+        // Whole-blob cap: many max-length fields.
+        let big: serde_json::Map<String, Value> = ORIGIN_KEYS
+            .iter()
+            .map(|k| ((*k).to_string(), json!("y".repeat(ORIGIN_MAX_FIELD))))
+            .collect();
+        let e = sanitize_origin(&Value::Object(big)).unwrap_err();
+        assert!(e.contains("exceeds"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn origin_and_workflow_round_trip_through_the_subscription() {
+        let (db, _d) = fresh_db().await;
+        let origin = sanitize_origin(&json!({
+            "platform": "zulip", "chat_id": "stream:eng", "thread_id": "deploy-bug"
+        }))
+        .unwrap()
+        .unwrap();
+        let row = create_subscription(
+            &db,
+            "hermes-1",
+            "sess-1",
+            &[],
+            &[],
+            0,
+            DEFAULT_TTL_SECS,
+            &DeliverySpec::default(),
+            Some(&origin),
+            Some("wf-7"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.workflow_id.as_deref(), Some("wf-7"));
+        let stored = get_subscription(&db, &row.id).await.unwrap().unwrap();
+        let parsed = origin_value(stored.origin.as_deref());
+        assert_eq!(parsed["thread_id"], "deploy-bug");
+        assert_eq!(stored.workflow_id.as_deref(), Some("wf-7"));
+
+        // Backward compatibility: a subscription without origin/workflow works.
+        let plain = sub_for(&db, "sess-2", 0).await;
+        assert!(plain.origin.is_none() && plain.workflow_id.is_none());
+        assert_eq!(origin_value(plain.origin.as_deref()), json!({}));
+    }
+
+    #[tokio::test]
+    async fn due_deliveries_carry_workflow_and_origin() {
+        let (db, _d) = fresh_db().await;
+        let origin = sanitize_origin(&json!({"chat_id": "stream:eng", "thread_id": "t"}))
+            .unwrap()
+            .unwrap();
+        create_subscription(
+            &db,
+            "hermes-1",
+            "s1",
+            &[],
+            &[],
+            0,
+            DEFAULT_TTL_SECS,
+            &DeliverySpec {
+                url: Some("http://127.0.0.1:9/webhooks/pok".into()),
+                secret_env: Some("POK_WEBHOOK_SECRET".into()),
+                secret_file: None,
+            },
+            Some(&origin),
+            Some("wf-9"),
+        )
+        .await
+        .unwrap();
+        match_event(&db, "s1", "stop", 5, "t", &ev()).await.unwrap();
+        let due = due_deliveries(&db, now_epoch(), 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].workflow_id.as_deref(), Some("wf-9"));
+        assert_eq!(due[0].origin["chat_id"], "stream:eng");
     }
 
     // --- M16: webhook delivery state ---
@@ -1582,13 +1863,26 @@ mod tests {
             0,
             MAX_TTL_SECS * 10,
             &DeliverySpec::default(),
+            None,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(huge.ttl_secs, MAX_TTL_SECS);
-        let zero = create_subscription(&db, "h", "s2", &[], &[], 0, 0, &DeliverySpec::default())
-            .await
-            .unwrap();
+        let zero = create_subscription(
+            &db,
+            "h",
+            "s2",
+            &[],
+            &[],
+            0,
+            0,
+            &DeliverySpec::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             zero.ttl_secs, 1,
             "a non-positive ttl clamps to 1s, never 0 or negative"

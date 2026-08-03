@@ -120,12 +120,46 @@ class FakeClient:
         return {"events": [], "next_cursor": offset if offset >= 0 else 0}
 
     def create_subscription(self, sid, *, subscriber, kinds=None, statuses=None,
-                            ttl_secs=None, cursor=None, deliver=None):
+                            ttl_secs=None, cursor=None, deliver=None, origin=None,
+                            max_turns=None, budget_secs=None):
         self.calls.append(("create_subscription", sid, subscriber, kinds, statuses,
-                           ttl_secs, cursor, deliver))
+                           ttl_secs, cursor, deliver, origin, max_turns, budget_secs))
         return {"subscription_id": "sub-1", "session_id": sid, "subscriber": subscriber,
                 "cursor": 20, "cursor_source": "session",
-                "deliver": {"mode": "webhook" if deliver else "poll"}}
+                "deliver": {"mode": "webhook" if deliver else "poll"},
+                "origin": origin or {},
+                "workflow": {"workflow_id": "wf-1", "state": "active",
+                             "turns_remaining": 8, "origin": origin or {}}}
+
+    # -- M17 workflow surface --
+
+    def list_workflows(self, **filters):
+        self.calls.append(("list_workflows", dict(filters)))
+        return {"workflows": [{"workflow_id": "wf-1", "session_id": "s1",
+                               "state": "waiting_for_human"}], "count": 1}
+
+    def get_workflow(self, workflow_id):
+        self.calls.append(("get_workflow", workflow_id))
+        return {"workflow_id": workflow_id, "state": "active", "turns_remaining": 3,
+                "origin": {"chat_id": "stream:eng", "thread_id": "deploy-bug"}}
+
+    def claim_workflow(self, workflow_id, owner, lease_secs=None):
+        self.calls.append(("claim_workflow", workflow_id, owner, lease_secs))
+        if getattr(self, "claim_refused", False):
+            return {"claimed": False, "reason": "busy",
+                    "detail": {"lease_owner": "other"},
+                    "guidance": "do NOT send pok_prompt for this session"}
+        return {"claimed": True, "owner": owner,
+                "workflow": {"workflow_id": workflow_id, "turns_remaining": 3}}
+
+    def release_workflow(self, workflow_id, owner, outcome, note=""):
+        self.calls.append(("release_workflow", workflow_id, owner, outcome, note))
+        return {"ok": True, "workflow": {"workflow_id": workflow_id, "state": outcome}}
+
+    def resume_workflow(self, workflow_id, note=""):
+        self.calls.append(("resume_workflow", workflow_id, note))
+        return {"ok": True, "resumed": True,
+                "workflow": {"workflow_id": workflow_id, "state": "active"}}
 
     def set_subscription_delivery(self, subscription_id, *, deliver=None, clear=False):
         self.calls.append(("set_subscription_delivery", subscription_id, deliver, clear))
@@ -603,7 +637,7 @@ def run_notifications() -> int:
     for t in ("pok_subscribe", "pok_subscriptions", "pok_notifications"):
         _check(f"{t} registered", t in names)
     _check("no duplicate tool names", len(names) == len(set(names)))
-    _check("21 tools registered", len(tools._TOOLS) == 21, str(len(tools._TOOLS)))
+    _check("22 tools registered", len(tools._TOOLS) == 22, str(len(tools._TOOLS)))
     for schema, _h in tools._TOOLS:
         params = schema["parameters"]
         _check(f"{schema['name']} schema is a well-formed object",
@@ -824,11 +858,13 @@ def run_hook() -> int:
 
         from hermes_plugins import pok as pkg
         pkg.register(_Ctx())
-        _check("plugin registers exactly one hook", len(registered) == 1, str(registered))
-        _check("…and it is pre_llm_call", registered and registered[0][0] == "pre_llm_call",
-               str(registered))
+        names = [n for n, _cb in registered]
+        _check("plugin registers both lifecycle hooks", len(registered) == 2, str(registered))
+        _check("…pre_llm_call for notification surfacing", "pre_llm_call" in names, str(names))
+        _check("…pre_gateway_dispatch for origin capture",
+               "pre_gateway_dispatch" in names, str(names))
         _check("…bound to the notifier callback",
-               registered and registered[0][1] is notifier.on_pre_llm_call)
+               any(cb is notifier.on_pre_llm_call for _n, cb in registered))
 
         # A Hermes build without register_hook must still load the tools.
         class _OldCtx:
@@ -856,6 +892,250 @@ def run_hook() -> int:
 # --------------------------------------------------------------------------- #
 # Tests: round trip through the Hermes framework (skipped without hermes-agent)
 # --------------------------------------------------------------------------- #
+
+def run_origin() -> int:
+    """Origin capture + workflow correlation tools (deterministic, no network)."""
+    global _passes, _failures
+    _passes = _failures = 0
+
+    import os as _os
+    from hermes_plugins.pok import origin as origin_mod
+    from hermes_plugins.pok import tools
+
+    class _Src:
+        """Stand-in for gateway SessionSource (gateway/session.py:71-93)."""
+
+        def __init__(self, **kw):
+            class _P:
+                value = kw.pop("platform", "zulip")
+
+            self.platform = _P()
+            self.chat_id = kw.pop("chat_id", "stream:eng")
+            self.chat_name = kw.pop("chat_name", "eng")
+            self.chat_type = kw.pop("chat_type", "channel")
+            self.thread_id = kw.pop("thread_id", "deploy-bug")
+            self.parent_chat_id = kw.pop("parent_chat_id", "stream:eng")
+            self.message_id = kw.pop("message_id", "9001")
+            self.user_id = kw.pop("user_id", "42")
+            self.user_name = kw.pop("user_name", "Tamas")
+            self.user_id_alt = None
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    class _Event:
+        def __init__(self, source, text="deploy the thing"):
+            self.source = source
+            self.text = text
+
+    class _Gw:
+        def _session_key_for_source(self, source):
+            return f"agent:main:zulip:channel:{source.chat_id}:{source.thread_id}"
+
+    print("\norigin capture (pre_gateway_dispatch)")
+    origin_mod.reset_for_tests()
+    ret = origin_mod.on_pre_gateway_dispatch(event=_Event(_Src()), gateway=_Gw(),
+                                             session_store=None)
+    _check("hook returns None (never influences dispatch)", ret is None)
+    cur = origin_mod.current()
+    _check("captures platform", cur.get("platform") == "zulip", str(cur))
+    _check("captures chat_id (stream)", cur.get("chat_id") == "stream:eng", str(cur))
+    _check("captures thread_id (topic)", cur.get("thread_id") == "deploy-bug", str(cur))
+    _check("captures user", cur.get("user_name") == "Tamas", str(cur))
+    _check("captures message id", cur.get("message_id") == "9001", str(cur))
+    _check("captures a stable session key",
+           cur.get("session_key", "").startswith("agent:main:zulip"), str(cur))
+    _check("builds a human hint", "deploy-bug" in cur.get("hint", ""), str(cur))
+    _check("only allow-listed keys are present",
+           set(cur).issubset(set(origin_mod.ORIGIN_KEYS)), str(set(cur)))
+    _check("never captures message text",
+           not any("deploy the thing" in v for v in cur.values()), str(cur))
+
+    print("\norigin capture: safety")
+    origin_mod.reset_for_tests()
+    origin_mod.on_pre_gateway_dispatch(
+        event=_Event(_Src(user_name="a" * 500, chat_id="stream:x\nInjected: y")),
+        gateway=_Gw(), session_store=None)
+    cur = origin_mod.current()
+    _check("long fields are truncated",
+           len(cur.get("user_name", "")) <= origin_mod.MAX_FIELD, str(len(cur.get("user_name", ""))))
+    _check("control characters are stripped",
+           "\n" not in cur.get("chat_id", ""), repr(cur.get("chat_id")))
+    origin_mod.reset_for_tests()
+    _check("no source → no capture, no raise",
+           origin_mod.on_pre_gateway_dispatch(event=None) is None
+           and origin_mod.known_sessions() == 0)
+    _check("a source without chat_id is ignored",
+           origin_mod.on_pre_gateway_dispatch(
+               event=_Event(_Src(chat_id="")), gateway=_Gw()) is None
+           and origin_mod.known_sessions() == 0)
+    _check("a raising gateway does not break capture",
+           origin_mod.on_pre_gateway_dispatch(event=_Event(_Src()), gateway=object()) is None
+           and origin_mod.known_sessions() == 1)
+
+    print("\norigin capture: bounded memory + per-session lookup")
+    origin_mod.reset_for_tests()
+    for i in range(origin_mod._MAX_SESSIONS + 20):
+        origin_mod.on_pre_gateway_dispatch(
+            event=_Event(_Src(chat_id=f"stream:s{i}", thread_id=f"t{i}")), gateway=_Gw())
+    _check("session cache is bounded",
+           origin_mod.known_sessions() <= origin_mod._MAX_SESSIONS,
+           str(origin_mod.known_sessions()))
+    _check("most recent origin wins for current()",
+           origin_mod.current()["chat_id"].startswith("stream:s"), str(origin_mod.current()))
+    key = _Gw()._session_key_for_source(_Src(chat_id="stream:s70", thread_id="t70"))
+    _check("lookup by session key returns that conversation",
+           origin_mod.current(key).get("thread_id") == "t70", str(origin_mod.current(key)))
+    _check("for_lookup returns just the routing pair",
+           set(origin_mod.for_lookup()) <= {"chat_id", "thread_id"}, str(origin_mod.for_lookup()))
+
+    print("\norigin: CLI runs and configured fallback")
+    origin_mod.reset_for_tests()
+    _saved = {k: _os.environ.get(k) for k in
+              ("POK_FALLBACK_CHAT_ID", "POK_FALLBACK_THREAD_ID", "POK_FALLBACK_PLATFORM")}
+    try:
+        for k in _saved:
+            _os.environ.pop(k, None)
+        _check("no gateway origin (CLI) → empty", origin_mod.current() == {})
+        _os.environ["POK_FALLBACK_CHAT_ID"] = "stream:ops"
+        _os.environ["POK_FALLBACK_THREAD_ID"] = "pok-reports"
+        fb = origin_mod.current()
+        _check("configured fallback is used when there is no live origin",
+               fb.get("chat_id") == "stream:ops" and fb.get("thread_id") == "pok-reports", str(fb))
+        origin_mod.on_pre_gateway_dispatch(event=_Event(_Src()), gateway=_Gw())
+        _check("a live origin beats the fallback",
+               origin_mod.current().get("chat_id") == "stream:eng", str(origin_mod.current()))
+    finally:
+        for k, v in _saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+    print("\npok_subscribe attaches the origin")
+    fake = FakeClient()
+    tools._client = lambda: fake  # type: ignore[assignment]
+    origin_mod.reset_for_tests()
+    origin_mod.on_pre_gateway_dispatch(event=_Event(_Src()), gateway=_Gw())
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_subscribe,
+                  {"session_id": "s1", "max_turns": 4, "budget_secs": 1800})
+    call = [c for c in fake.calls if c[0] == "create_subscription"][0]
+    sent_origin = call[8]
+    _check("origin forwarded to Xpo-k",
+           isinstance(sent_origin, dict) and sent_origin["chat_id"] == "stream:eng", str(call))
+    _check("thread/topic forwarded", sent_origin.get("thread_id") == "deploy-bug", str(call))
+    _check("bounds forwarded", (call[9], call[10]) == (4, 1800), str(call))
+    _check("response surfaces the workflow", res.get("workflow", {}).get("workflow_id") == "wf-1",
+           str(res))
+
+    fake.calls.clear()
+    _invoke(tools._handle_pok_subscribe, {"session_id": "s1", "no_origin": True})
+    call = [c for c in fake.calls if c[0] == "create_subscription"][0]
+    _check("no_origin suppresses capture", call[8] is None, str(call))
+
+    origin_mod.reset_for_tests()
+    fake.calls.clear()
+    _invoke(tools._handle_pok_subscribe, {"session_id": "s1"})
+    call = [c for c in fake.calls if c[0] == "create_subscription"][0]
+    _check("CLI-origin subscribe sends no origin", call[8] is None, str(call))
+
+    print("\npok_workflow")
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_workflow, {"action": "get", "workflow_id": "wf-1"})
+    _check("get returns the workflow view", res.get("state") == "active", str(res))
+    _check("get exposes the origin for reply routing",
+           res["origin"]["thread_id"] == "deploy-bug", str(res))
+    res = _invoke(tools._handle_pok_workflow, {"action": "get"})
+    _check("get without id rejected", res.get("success") is False, str(res))
+
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_workflow,
+                  {"action": "claim", "workflow_id": "wf-1", "owner": "ntf-9",
+                   "lease_secs": 300})
+    _check("claim succeeds", res.get("success") is True and res.get("claimed") is True, str(res))
+    _check("claim forwards owner + lease",
+           ("claim_workflow", "wf-1", "ntf-9", 300) in fake.calls, str(fake.calls))
+    res = _invoke(tools._handle_pok_workflow, {"action": "claim", "workflow_id": "wf-1"})
+    _check("claim without owner rejected", res.get("success") is False, str(res))
+
+    fake.claim_refused = True
+    res = _invoke(tools._handle_pok_workflow,
+                  {"action": "claim", "workflow_id": "wf-1", "owner": "ntf-2"})
+    _check("a refused claim is reported as failure, not success",
+           res.get("success") is False and res.get("claimed") is False, str(res))
+    _check("refusal carries the reason", res.get("reason") == "busy", str(res))
+    _check("refusal tells the agent not to prompt",
+           "do NOT send pok_prompt" in res.get("guidance", ""), str(res))
+    fake.claim_refused = False
+
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_workflow,
+                  {"action": "release", "workflow_id": "wf-1", "owner": "ntf-9",
+                   "outcome": "continued", "note": "sent follow-up"})
+    _check("release forwards the outcome",
+           ("release_workflow", "wf-1", "ntf-9", "continued", "sent follow-up") in fake.calls,
+           str(fake.calls))
+    for bad in ({"outcome": "sideways"}, {}):
+        res = _invoke(tools._handle_pok_workflow,
+                      {"action": "release", "workflow_id": "wf-1", "owner": "o", **bad})
+        _check(f"release with outcome={bad.get('outcome')!r} rejected",
+               res.get("success") is False, str(res))
+
+    # `find` resolves the CURRENT conversation, so re-establish a live origin
+    # (the CLI-origin check above deliberately cleared it).
+    origin_mod.reset_for_tests()
+    origin_mod.on_pre_gateway_dispatch(event=_Event(_Src()), gateway=_Gw())
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_workflow, {"action": "find"})
+    call = [c for c in fake.calls if c[0] == "list_workflows"][0]
+    _check("find scopes to the current chat",
+           call[1].get("origin_chat_id") == "stream:eng", str(call))
+    _check("find scopes to the current topic",
+           call[1].get("origin_thread_id") == "deploy-bug", str(call))
+    _check("find returns the waiting workflow",
+           res["workflows"][0]["state"] == "waiting_for_human", str(res))
+
+    fake.calls.clear()
+    _invoke(tools._handle_pok_workflow,
+            {"action": "find", "origin_chat_id": "stream:x", "origin_thread_id": "y"})
+    call = [c for c in fake.calls if c[0] == "list_workflows"][0]
+    _check("explicit origin overrides the captured one",
+           call[1].get("origin_chat_id") == "stream:x", str(call))
+
+    origin_mod.reset_for_tests()
+    _saved_fb = _os.environ.pop("POK_FALLBACK_CHAT_ID", None)
+    try:
+        res = _invoke(tools._handle_pok_workflow, {"action": "find"})
+        _check("find without chat context is rejected with guidance",
+               res.get("success") is False and "origin_chat_id" in res.get("error", ""), str(res))
+    finally:
+        if _saved_fb is not None:
+            _os.environ["POK_FALLBACK_CHAT_ID"] = _saved_fb
+
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_workflow,
+                  {"action": "resume", "workflow_id": "wf-1", "note": "user answered"})
+    _check("resume forwards the note",
+           ("resume_workflow", "wf-1", "user answered") in fake.calls, str(fake.calls))
+    _check("resume reports the new state", res.get("resumed") is True, str(res))
+    res = _invoke(tools._handle_pok_workflow, {"action": "nope"})
+    _check("unknown action rejected", res.get("success") is False, str(res))
+
+    print("\nschemas")
+    _check("pok_workflow registered",
+           "pok_workflow" in [sch["name"] for sch, _h in tools._TOOLS])
+    desc = tools.POK_WORKFLOW_SCHEMA["description"]
+    _check("workflow schema explains claim-before-prompt", "BEFORE sending any pok_prompt" in desc)
+    _check("workflow schema explains waiting_for_human", "waiting_for_human" in desc)
+    _check("workflow schema warns against acking while waiting",
+           "do NOT ack" in desc, desc[:200])
+    _check("pok_subscribe documents the workflow", "WORKFLOW" in tools.POK_SUBSCRIBE_SCHEMA["description"])
+    _check("pok_subscribe exposes bounds",
+           "max_turns" in tools.POK_SUBSCRIBE_SCHEMA["parameters"]["properties"])
+
+    print(f"\norigin/workflow results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
 
 def run_gate() -> int:
     """Cron wake-gate script: deterministic, injected fetch, no network."""
@@ -1118,6 +1398,10 @@ def test_cron_wake_gate() -> None:
     assert run_gate() == 0
 
 
+def test_origin_and_workflow() -> None:
+    assert run_origin() == 0
+
+
 def test_framework_round_trip() -> None:
     assert run_framework() == 0
 
@@ -1127,5 +1411,6 @@ if __name__ == "__main__":
     rc2 = run_notifications()
     rc3 = run_hook()
     rc4 = run_gate()
-    rc5 = run_framework()
-    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5)
+    rc5 = run_origin()
+    rc6 = run_framework()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5 | rc6)

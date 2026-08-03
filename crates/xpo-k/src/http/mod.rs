@@ -14,6 +14,7 @@ use crate::state::XState;
 pub mod health;
 pub mod profiles;
 pub mod subscriptions;
+pub mod workflows;
 
 pub fn router(state: XState) -> Router {
     let protected = Router::new()
@@ -29,6 +30,11 @@ pub fn router(state: XState) -> Router {
         )
         .route("/notifications", get(subscriptions::poll))
         .route("/notifications/ack", post(subscriptions::ack))
+        .route("/workflows", get(workflows::list))
+        .route("/workflows/{id}", get(workflows::get))
+        .route("/workflows/{id}/claim", post(workflows::claim))
+        .route("/workflows/{id}/release", post(workflows::release))
+        .route("/workflows/{id}/resume", post(workflows::resume))
         .route("/profiles", get(profiles::list).post(profiles::create))
         .route(
             "/profiles/{name}",

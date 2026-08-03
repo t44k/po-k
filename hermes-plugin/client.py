@@ -63,6 +63,15 @@ class XpokClient:
         r.raise_for_status()
         return r.json()
 
+    def _post_allow_conflict(self, path: str, body: Optional[Dict] = None,
+                             timeout: int = _DEFAULT_TIMEOUT) -> Dict[str, Any]:
+        """POST where 409 carries a meaningful body (lease refusals)."""
+        url = f"{self.base_url}{path}"
+        r = requests.post(url, headers=self._headers(), json=body, timeout=timeout)
+        if r.status_code != 409:
+            r.raise_for_status()
+        return r.json()
+
     def _delete(self, path: str, timeout: int = _DEFAULT_TIMEOUT) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         r = requests.delete(url, headers=self._headers(), timeout=timeout)
@@ -192,6 +201,9 @@ class XpokClient:
         ttl_secs: Optional[int] = None,
         cursor: Optional[int] = None,
         deliver: Optional[Dict[str, Any]] = None,
+        origin: Optional[Dict[str, Any]] = None,
+        max_turns: Optional[int] = None,
+        budget_secs: Optional[int] = None,
     ) -> Dict[str, Any]:
         # `deliver` is {url, secret_env|secret_file} — a *reference* to the HMAC
         # secret. Xpo-k refuses an inline secret, so none is ever sent here.
@@ -206,6 +218,12 @@ class XpokClient:
             body["cursor"] = cursor
         if deliver:
             body["deliver"] = deliver
+        if origin:
+            body["origin"] = origin
+        if max_turns is not None:
+            body["max_turns"] = max_turns
+        if budget_secs is not None:
+            body["budget_secs"] = budget_secs
         return self._post("/subscriptions", body)
 
     def set_subscription_delivery(
@@ -249,6 +267,34 @@ class XpokClient:
 
     def ack_notifications(self, ids: list) -> Dict[str, Any]:
         return self._post("/notifications/ack", {"ids": ids})
+
+    # -- Workflows: correlation + bounded autonomous continuation (M17) --
+
+    def list_workflows(self, **filters: Any) -> Dict[str, Any]:
+        params = {k: v for k, v in filters.items() if v not in (None, "")}
+        return self._get("/workflows", params=params or None)
+
+    def get_workflow(self, workflow_id: str) -> Dict[str, Any]:
+        return self._get(f"/workflows/{workflow_id}")
+
+    def claim_workflow(self, workflow_id: str, owner: str,
+                       lease_secs: Optional[int] = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"owner": owner}
+        if lease_secs is not None:
+            body["lease_secs"] = lease_secs
+        # A 409 is an expected answer ("someone else holds it"), not an error, so
+        # the caller gets the parsed body instead of an exception.
+        return self._post_allow_conflict(f"/workflows/{workflow_id}/claim", body)
+
+    def release_workflow(self, workflow_id: str, owner: str, outcome: str,
+                         note: str = "") -> Dict[str, Any]:
+        body: Dict[str, Any] = {"owner": owner, "outcome": outcome}
+        if note:
+            body["note"] = note
+        return self._post_allow_conflict(f"/workflows/{workflow_id}/release", body)
+
+    def resume_workflow(self, workflow_id: str, note: str = "") -> Dict[str, Any]:
+        return self._post(f"/workflows/{workflow_id}/resume", {"note": note} if note else {})
 
     # -- Profile endpoints --
 

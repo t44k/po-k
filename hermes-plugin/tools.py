@@ -888,7 +888,11 @@ POK_SUBSCRIBE_SCHEMA = {
         "When a webhook target is configured (webhook_url or POK_WEBHOOK_URL), Xpo-k "
         "also pushes each notification to Hermes immediately, which starts a fresh "
         "isolated turn — you do not have to be polling. The queue remains the source "
-        "of truth, so a failed push is recovered by the hourly cron fallback."
+        "of truth, so a failed push is recovered by the hourly cron fallback.\n\n"
+        "Subscribing also creates (or finds) the WORKFLOW for this CC task: a durable "
+        "id that ties the CC session to this conversation's stream/topic and bounds how "
+        "many autonomous follow-up turns may run. When called from a chat turn the "
+        "current stream/topic/user is attached automatically so reports come back here."
     ),
     "parameters": {
         "type": "object",
@@ -932,6 +936,25 @@ POK_SUBSCRIBE_SCHEMA = {
                     "sent through this tool."
                 ),
             },
+            "max_turns": {
+                "type": "integer",
+                "description": (
+                    "Bound on autonomous continuation for this task (default 8, max 100). "
+                    "Each accepted follow-up prompt consumes one."
+                ),
+            },
+            "budget_secs": {
+                "type": "integer",
+                "description": "Wall-clock bound for autonomous continuation (default 6h, max 7d).",
+            },
+            "no_origin": {
+                "type": "boolean",
+                "description": (
+                    "Do not attach the current chat's routing metadata. Reports then go "
+                    "to the webhook route's configured fallback channel instead of this "
+                    "conversation's stream/topic."
+                ),
+            },
         },
         "required": ["session_id"],
     },
@@ -962,6 +985,17 @@ def _handle_pok_subscribe(args: dict, **_kw) -> str:
                 or os.getenv("POK_WEBHOOK_SECRET_ENV", "POK_WEBHOOK_SECRET")
             ).strip(),
         }
+    # Routing metadata for the origin conversation (Zulip stream/topic/user), so
+    # a webhook-woken turn can report back here instead of into the void. Only
+    # allow-listed scalars; captured by the pre_gateway_dispatch hook.
+    origin = None
+    if not args.get("no_origin"):
+        try:
+            from . import origin as origin_mod
+
+            origin = origin_mod.current() or None
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("po-k: origin capture unavailable: %s", e)
     try:
         data = _client().create_subscription(
             sid,
@@ -971,6 +1005,9 @@ def _handle_pok_subscribe(args: dict, **_kw) -> str:
             ttl_secs=args.get("ttl_secs"),
             cursor=args.get("cursor"),
             deliver=deliver,
+            origin=origin,
+            max_turns=args.get("max_turns"),
+            budget_secs=args.get("budget_secs"),
         )
         # Let the pre_llm_call hook start surfacing immediately instead of
         # waiting for its next subscription probe.
@@ -1100,6 +1137,157 @@ def _handle_pok_notifications(args: dict, **_kw) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool: pok_workflow
+#
+# The state a webhook-woken turn needs but cannot remember. A workflow is one
+# long-running CC task: it ties the CC session to the chat thread that asked,
+# counts autonomous turns against a bound, and hands out a single-writer lease so
+# two turns can never prompt the same CC session concurrently.
+# ---------------------------------------------------------------------------
+
+POK_WORKFLOW_SCHEMA = {
+    "name": "pok_workflow",
+    "description": (
+        "Inspect and drive a po-k workflow — one long-running CC task plus the chat "
+        "thread that asked for it.\n\n"
+        "Use it in this order when you were woken by a po-k notification:\n"
+        "1. action='get' (or 'find') to learn the task's origin chat/topic, state, and "
+        "how much autonomous budget is left.\n"
+        "2. action='claim' BEFORE sending any pok_prompt to that CC session. If the "
+        "claim is refused (busy/exhausted/expired/state) you must NOT prompt — report "
+        "or observe only.\n"
+        "3. action='release' when done, with the outcome: 'continued' (you sent a "
+        "follow-up prompt that was accepted), 'waiting_for_human' (you asked a question "
+        "and are waiting for a reply — do NOT ack the notification), 'done' (task "
+        "finished, final report delivered), 'failed', or 'noop'.\n\n"
+        "action='find' locates the workflow for the CURRENT conversation (this "
+        "stream/topic) — use it when a user replies about an ongoing task. "
+        "action='resume' moves a waiting_for_human workflow back to active after you "
+        "have relayed the user's answer with pok_prompt."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["get", "find", "list", "claim", "release", "resume"],
+                "description": "Operation to perform.",
+            },
+            "workflow_id": {
+                "type": "string",
+                "description": "Workflow id (required for get/claim/release/resume).",
+            },
+            "session_id": {"type": "string", "description": "Filter/lookup by CC session."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Lease owner for claim/release — use the notification_id you were "
+                    "woken with so the lease is traceable to this turn."
+                ),
+            },
+            "outcome": {
+                "type": "string",
+                "enum": ["continued", "waiting_for_human", "done", "failed", "noop"],
+                "description": "Required for release. Only 'continued' consumes turn budget.",
+            },
+            "note": {
+                "type": "string",
+                "description": "Short operator-facing note (e.g. the question you asked).",
+            },
+            "state": {"type": "string", "description": "Filter list/find by workflow state."},
+            "lease_secs": {
+                "type": "integer",
+                "description": "How long to hold the lease (default 900, max 3600).",
+            },
+            "origin_chat_id": {
+                "type": "string",
+                "description": "Override the chat id used by action='find'.",
+            },
+            "origin_thread_id": {
+                "type": "string",
+                "description": "Override the topic/thread used by action='find'.",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+
+def _handle_pok_workflow(args: dict, **_kw) -> str:
+    action = args.get("action", "")
+    wf_id = str(args.get("workflow_id") or "").strip()
+    try:
+        c = _client()
+        if action == "get":
+            if not wf_id:
+                return _err("workflow_id is required for get")
+            return _ok(c.get_workflow(wf_id))
+        elif action in ("find", "list"):
+            filters: Dict[str, Any] = {
+                "subscriber": _subscriber(args),
+                "session_id": args.get("session_id", ""),
+                "state": args.get("state", ""),
+            }
+            if action == "find":
+                # Scope to the conversation this turn is happening in, so a user
+                # reply resolves the task it refers to.
+                chat = str(args.get("origin_chat_id") or "").strip()
+                thread = str(args.get("origin_thread_id") or "").strip()
+                if not chat:
+                    try:
+                        from . import origin as origin_mod
+
+                        lookup = origin_mod.for_lookup()
+                    except Exception:
+                        lookup = {}
+                    chat = lookup.get("chat_id", "")
+                    thread = thread or lookup.get("thread_id", "")
+                if not chat:
+                    return _err(
+                        "no chat context available for find — pass origin_chat_id, or "
+                        "use action='list' with session_id"
+                    )
+                filters["origin_chat_id"] = chat
+                if thread:
+                    filters["origin_thread_id"] = thread
+            return _ok(c.list_workflows(**filters))
+        elif action == "claim":
+            if not wf_id:
+                return _err("workflow_id is required for claim")
+            owner = str(args.get("owner") or "").strip()
+            if not owner:
+                return _err(
+                    "owner is required for claim — pass the notification_id you were woken with"
+                )
+            data = c.claim_workflow(wf_id, owner, args.get("lease_secs"))
+            # A refusal is a normal answer; surface it as success:false so the
+            # agent treats it as "do not prompt" rather than a transport error.
+            if not data.get("claimed"):
+                return json.dumps({"success": False, **data})
+            return _ok(data)
+        elif action == "release":
+            if not wf_id:
+                return _err("workflow_id is required for release")
+            owner = str(args.get("owner") or "").strip()
+            outcome = str(args.get("outcome") or "").strip()
+            if not owner:
+                return _err("owner is required for release")
+            if outcome not in {"continued", "waiting_for_human", "done", "failed", "noop"}:
+                return _err(
+                    "outcome must be one of: continued, waiting_for_human, done, failed, noop"
+                )
+            return _ok(c.release_workflow(wf_id, owner, outcome, args.get("note", "")))
+        elif action == "resume":
+            if not wf_id:
+                return _err("workflow_id is required for resume")
+            return _ok(c.resume_workflow(wf_id, args.get("note", "")))
+        else:
+            return _err(f"unknown action: {action!r}")
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -1125,6 +1313,7 @@ _TOOLS = [
     (POK_SUBSCRIBE_SCHEMA, _handle_pok_subscribe),
     (POK_SUBSCRIPTIONS_SCHEMA, _handle_pok_subscriptions),
     (POK_NOTIFICATIONS_SCHEMA, _handle_pok_notifications),
+    (POK_WORKFLOW_SCHEMA, _handle_pok_workflow),
 ]
 
 

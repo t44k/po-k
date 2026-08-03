@@ -1174,3 +1174,544 @@ async fn a_missing_secret_is_a_config_error_not_a_retry_storm() {
     assert_eq!(pending["count"], 1, "and the cron fallback still has it");
     assert_eq!(pending["notifications"][0]["delivery_state"], "failed");
 }
+
+// ---------------------------------------------------------------------------
+// M17: origin correlation + workflow lifecycle end to end.
+// ---------------------------------------------------------------------------
+
+const ORIGIN: fn() -> serde_json::Value = || {
+    serde_json::json!({
+        "platform": "zulip",
+        "chat_id": "stream:eng",
+        "chat_name": "eng",
+        "chat_type": "channel",
+        "thread_id": "deploy-bug",
+        "message_id": "9001",
+        "user_id": "42",
+        "user_name": "Tamas",
+        "session_key": "agent:main:zulip:channel:stream:eng:deploy-bug",
+        "hint": "asked in #eng > deploy-bug"
+    })
+};
+
+#[tokio::test]
+async fn origin_flows_from_subscribe_into_the_push_envelope() {
+    std::env::set_var("POK_TEST_WEBHOOK_SECRET", "hmac-test-secret");
+    let (addr, state) = start_server().await;
+    let (mut sink, _stream) = connect_fake_pok(addr).await;
+    let (recv_addr, seen) = start_stub_receiver(vec![StubReply::Accept]).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let sub: serde_json::Value = client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "session_id": "s1",
+            "subscriber": "origin-a",
+            "cursor": 0,
+            "origin": ORIGIN(),
+            "max_turns": 3,
+            "deliver": {
+                "url": format!("http://{recv_addr}/webhooks/pok"),
+                "secret_env": "POK_TEST_WEBHOOK_SECRET"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The subscribe response echoes both correlation halves.
+    assert_eq!(sub["origin"]["thread_id"], "deploy-bug");
+    let wf_id = sub["workflow"]["workflow_id"].as_str().unwrap().to_string();
+    assert!(wf_id.starts_with("wf-"), "{sub}");
+    assert_eq!(sub["workflow"]["state"], "active");
+    assert_eq!(sub["workflow"]["max_turns"], 3);
+    assert_eq!(sub["workflow"]["origin"]["chat_id"], "stream:eng");
+
+    // po-k reports the turn boundary.
+    let ev = WsMsg::SessionEvent {
+        sid: "s1".into(),
+        event: pok_proto::EventEnvelope {
+            kind: "stop".into(),
+            payload: serde_json::json!({"last_assistant_message": "SECRET PROSE"}),
+            seq: 77,
+            ts: "2026-08-03T10:00:00Z".into(),
+        },
+    };
+    sink.send(Message::Text(serde_json::to_string(&ev).unwrap()))
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    for _ in 0..40 {
+        let (_a, d) = xpo_k::deliver::run_pass(&state, &http).await;
+        if d > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let calls = seen.lock().unwrap().calls.clone();
+    assert_eq!(calls.len(), 1, "one push");
+    let body: serde_json::Value = serde_json::from_str(&calls[0].2).unwrap();
+
+    // Everything the woken turn needs to route a reply and resume the task.
+    assert_eq!(body["workflow_id"], wf_id);
+    assert_eq!(body["session_id"], "s1");
+    assert_eq!(body["seq"], 77);
+    assert_eq!(body["origin"]["chat_id"], "stream:eng");
+    assert_eq!(body["origin"]["thread_id"], "deploy-bug");
+    assert_eq!(body["origin"]["user_name"], "Tamas");
+    // …and still no CC prose on the trigger path.
+    assert!(!calls[0].2.contains("SECRET PROSE"));
+}
+
+#[tokio::test]
+async fn a_subscription_without_origin_pushes_empty_routing_fields() {
+    std::env::set_var("POK_TEST_WEBHOOK_SECRET", "hmac-test-secret");
+    let (addr, state) = start_server().await;
+    let (mut sink, _stream) = connect_fake_pok(addr).await;
+    let (recv_addr, seen) = start_stub_receiver(vec![StubReply::Accept]).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // CLI-origin subscription: no origin at all (backward compatible).
+    let sub: serde_json::Value = client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "session_id": "s1", "subscriber": "no-origin", "cursor": 0,
+            "deliver": {"url": format!("http://{recv_addr}/webhooks/pok"),
+                        "secret_env": "POK_TEST_WEBHOOK_SECRET"}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sub["origin"], serde_json::json!({}));
+    assert!(
+        sub["workflow"]["workflow_id"].as_str().is_some(),
+        "still gets a workflow"
+    );
+
+    sink.send(Message::Text(
+        serde_json::to_string(&WsMsg::SessionEvent {
+            sid: "s1".into(),
+            event: pok_proto::EventEnvelope {
+                kind: "stop".into(),
+                payload: serde_json::Value::Null,
+                seq: 4,
+                ts: "t".into(),
+            },
+        })
+        .unwrap(),
+    ))
+    .await
+    .unwrap();
+
+    let http = reqwest::Client::new();
+    for _ in 0..40 {
+        let (_a, d) = xpo_k::deliver::run_pass(&state, &http).await;
+        if d > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let calls = seen.lock().unwrap().calls.clone();
+    let body: serde_json::Value = serde_json::from_str(&calls[0].2).unwrap();
+    // Present-but-empty: a Hermes route templating {origin.chat_id} renders ""
+    // and falls back to its configured home channel, instead of sending to a
+    // channel literally named "{origin.chat_id}".
+    assert_eq!(body["origin"]["chat_id"], "");
+    assert_eq!(body["origin"]["thread_id"], "");
+    assert!(body["origin"].as_object().unwrap().contains_key("chat_id"));
+}
+
+#[tokio::test]
+async fn oversized_or_malformed_origin_is_rejected_at_subscribe_time() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    for bad in [
+        serde_json::json!("a string"),
+        serde_json::json!([1, 2, 3]),
+        serde_json::json!({"chat_id": {"nested": true}}),
+        serde_json::json!({"hint": "x".repeat(400)}),
+    ] {
+        let r = client
+            .post(format!("{base}/subscriptions"))
+            .bearer_auth("secret")
+            .json(&serde_json::json!({
+                "session_id": "s1", "subscriber": "bad-origin", "cursor": 0, "origin": bad
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "origin {bad} must be rejected");
+    }
+}
+
+#[tokio::test]
+async fn workflow_lookup_by_origin_thread_resolves_the_cc_session() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    for (sid, topic) in [("sess-a", "deploy-bug"), ("sess-b", "other-topic")] {
+        let mut origin = ORIGIN();
+        origin["thread_id"] = serde_json::json!(topic);
+        client
+            .post(format!("{base}/subscriptions"))
+            .bearer_auth("secret")
+            .json(&serde_json::json!({
+                "session_id": sid, "subscriber": "lookup", "cursor": 0, "origin": origin
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    // This is the query a Zulip turn runs when the user replies in a topic.
+    let found: serde_json::Value = client
+        .get(format!(
+            "{base}/workflows?origin_chat_id=stream:eng&origin_thread_id=deploy-bug"
+        ))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found["count"], 1, "{found}");
+    assert_eq!(found["workflows"][0]["session_id"], "sess-a");
+
+    // Whole stream → both; unknown topic → none.
+    let all: serde_json::Value = client
+        .get(format!("{base}/workflows?origin_chat_id=stream:eng"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all["count"], 2);
+    let none: serde_json::Value = client
+        .get(format!("{base}/workflows?origin_thread_id=nope"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(none["count"], 0);
+}
+
+#[tokio::test]
+async fn workflow_claim_release_serialises_autonomous_turns_over_http() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let sub: serde_json::Value = client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "session_id": "s1", "subscriber": "lease", "cursor": 0,
+            "origin": ORIGIN(), "max_turns": 2
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wf = sub["workflow"]["workflow_id"].as_str().unwrap().to_string();
+
+    // Turn A claims.
+    let a = client
+        .post(format!("{base}/workflows/{wf}/claim"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-1", "lease_secs": 120}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(a.status(), 200);
+    let a_body: serde_json::Value = a.json().await.unwrap();
+    assert_eq!(a_body["claimed"], true);
+    assert_eq!(a_body["workflow"]["turns_remaining"], 2);
+
+    // A duplicate/concurrent turn is refused with actionable guidance.
+    let b = client
+        .post(format!("{base}/workflows/{wf}/claim"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-2"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(b.status(), 409);
+    let b_body: serde_json::Value = b.json().await.unwrap();
+    assert_eq!(b_body["claimed"], false);
+    assert_eq!(b_body["reason"], "busy");
+    assert_eq!(b_body["detail"]["lease_owner"], "ntf-1");
+    assert!(b_body["guidance"]
+        .as_str()
+        .unwrap()
+        .contains("do NOT send pok_prompt"));
+
+    // Wrong owner cannot release.
+    let bad = client
+        .post(format!("{base}/workflows/{wf}/release"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-2", "outcome": "done"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 409);
+
+    // Turn A continues (a prompt was accepted) → budget consumed.
+    let rel: serde_json::Value = client
+        .post(format!("{base}/workflows/{wf}/release"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "owner": "ntf-1", "outcome": "continued", "note": "sent follow-up prompt"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rel["workflow"]["turns"], 1);
+    assert_eq!(rel["workflow"]["turns_remaining"], 1);
+    assert_eq!(rel["workflow"]["state"], "active");
+
+    // Second (final) turn exhausts the budget; the third is refused.
+    client
+        .post(format!("{base}/workflows/{wf}/claim"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-2"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!("{base}/workflows/{wf}/release"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-2", "outcome": "continued"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let denied = client
+        .post(format!("{base}/workflows/{wf}/claim"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-3"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 409);
+    let d_body: serde_json::Value = denied.json().await.unwrap();
+    assert!(
+        d_body["reason"] == "exhausted" || d_body["detail"]["state"] == "exhausted",
+        "{d_body}"
+    );
+    assert_eq!(d_body["workflow"]["terminal"], true);
+}
+
+#[tokio::test]
+async fn question_flow_waits_for_human_then_resumes_on_reply() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let sub: serde_json::Value = client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "session_id": "s1", "subscriber": "qa", "cursor": 0, "origin": ORIGIN()
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wf = sub["workflow"]["workflow_id"].as_str().unwrap().to_string();
+
+    // The woken turn asks a question in the origin topic and stops.
+    client
+        .post(format!("{base}/workflows/{wf}/claim"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-1"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let waiting: serde_json::Value = client
+        .post(format!("{base}/workflows/{wf}/release"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "owner": "ntf-1", "outcome": "waiting_for_human",
+            "note": "asked: deploy to prod or staging?"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(waiting["workflow"]["state"], "waiting_for_human");
+    assert_eq!(waiting["workflow"]["turns"], 0, "a question is not a turn");
+    assert!(waiting["workflow"]["last_note"]
+        .as_str()
+        .unwrap()
+        .contains("prod or staging"));
+
+    // No autonomous turn may proceed while a human owes an answer.
+    let blocked = client
+        .post(format!("{base}/workflows/{wf}/claim"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-2"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), 409);
+    assert_eq!(
+        blocked.json::<serde_json::Value>().await.unwrap()["detail"]["state"],
+        "waiting_for_human"
+    );
+
+    // The user replies in Zulip: that session looks the workflow up by topic…
+    let found: serde_json::Value = client
+        .get(format!(
+            "{base}/workflows?origin_chat_id=stream:eng&origin_thread_id=deploy-bug&state=waiting_for_human"
+        ))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found["count"], 1);
+    assert_eq!(found["workflows"][0]["workflow_id"], wf);
+    assert_eq!(found["workflows"][0]["session_id"], "s1");
+
+    // …resumes it, and autonomy is available again.
+    let resumed: serde_json::Value = client
+        .post(format!("{base}/workflows/{wf}/resume"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"note": "user said staging"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resumed["resumed"], true);
+    assert_eq!(resumed["workflow"]["state"], "active");
+    let ok = client
+        .post(format!("{base}/workflows/{wf}/claim"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-3"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+
+    // Resume is a no-op on a finished workflow (cannot revive it).
+    client
+        .post(format!("{base}/workflows/{wf}/release"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "ntf-3", "outcome": "done"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let stray: serde_json::Value = client
+        .post(format!("{base}/workflows/{wf}/resume"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stray["resumed"], false);
+    assert_eq!(stray["workflow"]["state"], "done");
+}
+
+#[tokio::test]
+async fn workflow_endpoints_require_auth_and_404_on_unknown_ids() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    assert_eq!(
+        client
+            .get(format!("{base}/workflows"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/workflows/wf-x/claim"))
+            .json(&serde_json::json!({"owner": "o"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    for (path, body) in [("wf-nope", serde_json::json!({"owner": "o"}))] {
+        let r = client
+            .post(format!("{base}/workflows/{path}/claim"))
+            .bearer_auth("secret")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+    }
+    let r = client
+        .get(format!("{base}/workflows/wf-nope"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    // Blank owner is a client error.
+    let sub: serde_json::Value = client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"session_id": "s1", "subscriber": "auth", "cursor": 0}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wf = sub["workflow"]["workflow_id"].as_str().unwrap();
+    let r = client
+        .post(format!("{base}/workflows/{wf}/claim"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"owner": "   "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+}

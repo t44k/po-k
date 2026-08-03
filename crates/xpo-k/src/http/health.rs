@@ -110,7 +110,7 @@ pub async fn help() -> Json<Value> {
                 "method": "POST",
                 "path": "/subscriptions",
                 "auth": true,
-                "description": "Register interest in a session so completions are queued even when no call is blocked. Body: {session_id, subscriber?, kinds?, statuses?, ttl_secs?, cursor?, deliver?}. Cursor defaults to the session's current event seq (only NEW events notify); pass cursor:0 to include history. `deliver: {url, secret_env|secret_file}` enables webhook push to Hermes: metadata only (no CC prose), HMAC-SHA256 over the exact body in X-Webhook-Signature, X-Request-ID = notification id. The secret is referenced by env-var name or file path and is never stored, logged, or returned."
+                "description": "Register interest in a session so completions are queued even when no call is blocked. Body: {session_id, subscriber?, kinds?, statuses?, ttl_secs?, cursor?, deliver?, origin?, max_turns?, budget_secs?}. `origin` is opaque allow-listed routing metadata (platform, chat_id, thread_id, user_id/name, session_key, hint) — validated, 2KB cap, echoed in responses and push envelopes so a woken turn can report back to the right chat thread. Creating a subscription also find-or-creates the workflow for (subscriber, session_id) and returns it. Cursor defaults to the session's current event seq (only NEW events notify); pass cursor:0 to include history. `deliver: {url, secret_env|secret_file}` enables webhook push to Hermes: metadata only (no CC prose), HMAC-SHA256 over the exact body in X-Webhook-Signature, X-Request-ID = notification id. The secret is referenced by env-var name or file path and is never stored, logged, or returned."
             },
             {
                 "method": "GET",
@@ -135,6 +135,36 @@ pub async fn help() -> Json<Value> {
                 "path": "/notifications",
                 "auth": true,
                 "description": "Pending (unacked) notifications, oldest first. Optional query: subscriber, session_id, limit (default 20, max 500), wait (long-poll seconds, max 60; requires subscriber). Reading never consumes — a notification stays pending until acked, so delivery is at-least-once. Webhook push and this poll are independent: a pushed notification is still pending here until the woken turn acks it, which is what makes the cron fallback able to recover a failed push."
+            },
+            {
+                "method": "GET",
+                "path": "/workflows",
+                "auth": true,
+                "description": "List/lookup workflows (one long-running CC task + the chat thread that asked for it). Query: subscriber, session_id, state, origin_chat_id, origin_thread_id, limit. origin_* is how a chat turn resolves which CC session a topic belongs to."
+            },
+            {
+                "method": "GET",
+                "path": "/workflows/{id}",
+                "auth": true,
+                "description": "Get one workflow: state, origin, turns/max_turns, deadline, lease."
+            },
+            {
+                "method": "POST",
+                "path": "/workflows/{id}/claim",
+                "auth": true,
+                "description": "Take the single-writer lease before prompting the CC session. Body: {owner, lease_secs?}. 200 = granted; 409 = refused with reason busy|exhausted|expired|state — on refusal do NOT send pok_prompt. Enforces the turn and wall-clock budgets."
+            },
+            {
+                "method": "POST",
+                "path": "/workflows/{id}/release",
+                "auth": true,
+                "description": "Release the lease and record the outcome. Body: {owner, outcome: continued|waiting_for_human|done|failed|noop, note?}. Only `continued` consumes turn budget."
+            },
+            {
+                "method": "POST",
+                "path": "/workflows/{id}/resume",
+                "auth": true,
+                "description": "The human answered: move waiting_for_human back to active. Body: {note?}. No-op on any other state."
             },
             {
                 "method": "POST",

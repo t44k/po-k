@@ -58,9 +58,40 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     -- holding the HMAC secret is persisted — never the secret itself.
     deliver_url         TEXT,
     deliver_secret_env  TEXT,
-    deliver_secret_file TEXT
+    deliver_secret_file TEXT,
+    -- M17 correlation. `origin` is opaque, validated, size-capped routing
+    -- metadata captured by the orchestrator (which chat/topic/user asked for
+    -- this work). Xpo-k stores and echoes it, never interprets it.
+    origin      TEXT,
+    workflow_id TEXT
 );
 CREATE INDEX IF NOT EXISTS subscriptions_by_sid ON subscriptions (sid);
+CREATE INDEX IF NOT EXISTS subscriptions_by_workflow ON subscriptions (workflow_id);
+
+-- M17: a workflow is one long-running CC task as the orchestrator sees it —
+-- the durable join between a CC session, the chat thread that asked for it, and
+-- the bounded sequence of autonomous Hermes turns that drive it. One row per
+-- (subscriber, CC session); notifications and webhook envelopes carry its id.
+CREATE TABLE IF NOT EXISTS workflows (
+    id           TEXT PRIMARY KEY,
+    subscriber   TEXT NOT NULL,
+    sid          TEXT NOT NULL,          -- the CC session being driven
+    origin       TEXT,                   -- same opaque shape as above
+    state        TEXT NOT NULL,          -- active|waiting_for_human|done|failed|exhausted|expired
+    turns        INTEGER NOT NULL DEFAULT 0,
+    max_turns    INTEGER NOT NULL,
+    deadline_at  INTEGER NOT NULL,       -- unix epoch; hard stop for autonomy
+    -- Single-writer lease. A webhook turn must hold it before prompting the CC
+    -- session, which is what prevents two concurrent pok_prompt calls.
+    lease_owner      TEXT,
+    lease_expires_at INTEGER,
+    last_note    TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS workflows_unique_task
+    ON workflows (subscriber, sid);
+CREATE INDEX IF NOT EXISTS workflows_by_state ON workflows (state);
 CREATE INDEX IF NOT EXISTS subscriptions_by_subscriber ON subscriptions (subscriber);
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -134,7 +165,11 @@ pub fn now_iso() -> String {
     let sod = (secs % 86_400) as i64;
     let (h, mi, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
@@ -305,12 +340,11 @@ pub async fn profile_history(db: &Db, name: &str) -> Result<Vec<Value>> {
 /// Live (not-ended) sessions: `(sid, pok_id, profile_names)`. Used by Phase 4
 /// to find sessions affected by a profile change.
 pub async fn live_sessions(db: &Db) -> Result<Vec<(String, String, Vec<String>)>> {
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT sid, pok_id, profiles FROM xpok_sessions WHERE ended_at IS NULL",
-    )
-    .fetch_all(db)
-    .await
-    .context("SELECT live xpok_sessions")?;
+    let rows: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT sid, pok_id, profiles FROM xpok_sessions WHERE ended_at IS NULL")
+            .fetch_all(db)
+            .await
+            .context("SELECT live xpok_sessions")?;
     Ok(rows
         .into_iter()
         .map(|(sid, pok_id, profiles)| {
@@ -346,7 +380,10 @@ mod tests {
         upsert_profile(&db, &p2).await.unwrap();
         let hist = profile_history(&db, "base").await.unwrap();
         assert_eq!(hist.len(), 2);
-        assert_eq!(get_profile(&db, "base").await.unwrap().unwrap().version, "1.1.0");
+        assert_eq!(
+            get_profile(&db, "base").await.unwrap().unwrap().version,
+            "1.1.0"
+        );
 
         assert!(delete_profile(&db, "base").await.unwrap());
         assert!(get_profile(&db, "base").await.unwrap().is_none());

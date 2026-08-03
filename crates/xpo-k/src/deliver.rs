@@ -76,18 +76,41 @@ pub fn sign_body(secret: &str, body: &[u8]) -> String {
 }
 
 /// The push envelope: metadata only, and enough of it that the woken turn knows
-/// exactly what to poll and inspect.
-pub fn build_body(n: &NotificationRow) -> Value {
+/// exactly what to poll, inspect, and report back to.
+///
+/// `origin.*` keys are ALWAYS present (empty string when unknown) — a Hermes
+/// route templates `deliver_extra.chat_id: "{origin.chat_id}"` from them, and an
+/// absent key would render as the literal `{origin.chat_id}` instead of falling
+/// back to the platform's home channel.
+pub fn build_body(n: &NotificationRow, workflow_id: Option<&str>, origin: &Value) -> Value {
+    let field = |key: &str| -> String {
+        origin
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
     json!({
         "event_type": EVENT_TYPE,
         "notification_id": n.id,
         "subscription_id": n.subscription_id,
+        "workflow_id": workflow_id.unwrap_or_default(),
         "subscriber": n.subscriber,
         "session_id": n.session_id,
         "seq": n.seq,
         "kind": n.kind,
         "status": n.status,
         "created_at": n.created_at,
+        "origin": {
+            "platform": field("platform"),
+            "chat_id": field("chat_id"),
+            "chat_name": field("chat_name"),
+            "thread_id": field("thread_id"),
+            "user_id": field("user_id"),
+            "user_name": field("user_name"),
+            "session_key": field("session_key"),
+            "hint": field("hint"),
+        },
     })
 }
 
@@ -162,7 +185,11 @@ pub fn resolve_secret(due: &DueDelivery) -> Result<String, String> {
 /// never touches ack state.
 pub async fn deliver_once(client: &reqwest::Client, due: &DueDelivery, secret: &str) -> Outcome {
     // Serialise ONCE — the signature must cover the exact bytes sent.
-    let body = match serde_json::to_vec(&build_body(&due.notification)) {
+    let body = match serde_json::to_vec(&build_body(
+        &due.notification,
+        due.workflow_id.as_deref(),
+        &due.origin,
+    )) {
         Ok(b) => b,
         Err(e) => return Outcome::Fatal(format!("cannot serialise envelope: {e}")),
     };
@@ -318,12 +345,23 @@ mod tests {
         }
     }
 
+    fn test_origin() -> Value {
+        json!({
+            "platform": "zulip",
+            "chat_id": "stream:eng",
+            "thread_id": "deploy-bug",
+            "user_name": "Tamas",
+        })
+    }
+
     fn due(attempts: i64) -> DueDelivery {
         DueDelivery {
             notification: notif(attempts),
             url: "http://127.0.0.1:1/webhooks/pok".into(),
             secret_env: Some("POK_TEST_SECRET".into()),
             secret_file: None,
+            workflow_id: Some("wf-1".into()),
+            origin: test_origin(),
         }
     }
 
@@ -344,7 +382,8 @@ mod tests {
 
     #[test]
     fn signature_covers_the_exact_body_bytes() {
-        let body = serde_json::to_vec(&build_body(&notif(0))).unwrap();
+        let body =
+            serde_json::to_vec(&build_body(&notif(0), Some("wf-1"), &test_origin())).unwrap();
         let sig = sign_body("s3cret", &body);
         // Same bytes → same signature; one flipped byte → different signature.
         assert_eq!(sig, sign_body("s3cret", &body));
@@ -357,7 +396,7 @@ mod tests {
 
     #[test]
     fn body_is_metadata_only_and_carries_no_cc_prose() {
-        let body = build_body(&notif(0));
+        let body = build_body(&notif(0), Some("wf-1"), &test_origin());
         let raw = serde_json::to_string(&body).unwrap();
         assert!(!raw.contains("SECRET PROSE"), "CC prose leaked: {raw}");
         assert!(!raw.contains("payload"), "payload forwarded: {raw}");
@@ -379,7 +418,48 @@ mod tests {
         assert_eq!(body["notification_id"], "ntf-abc");
         assert_eq!(body["seq"], 214);
         // Exactly the declared keys — nothing else rides along.
-        assert_eq!(body.as_object().unwrap().len(), 9);
+        assert_eq!(body.as_object().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn envelope_carries_workflow_and_origin_for_reply_routing() {
+        let body = build_body(&notif(0), Some("wf-42"), &test_origin());
+        assert_eq!(body["workflow_id"], "wf-42");
+        assert_eq!(body["origin"]["platform"], "zulip");
+        assert_eq!(body["origin"]["chat_id"], "stream:eng");
+        assert_eq!(body["origin"]["thread_id"], "deploy-bug");
+        assert_eq!(body["origin"]["user_name"], "Tamas");
+    }
+
+    /// Every templated origin key must exist even when unknown: Hermes' route
+    /// renders `{origin.chat_id}` literally if the key is absent, which would
+    /// send the report to a channel named "{origin.chat_id}" instead of falling
+    /// back to the platform home channel.
+    #[test]
+    fn origin_keys_are_always_present_so_templates_never_render_literally() {
+        let body = build_body(&notif(0), None, &json!({}));
+        assert_eq!(body["workflow_id"], "", "empty, not missing");
+        let origin = body["origin"].as_object().expect("origin object");
+        for key in [
+            "platform",
+            "chat_id",
+            "chat_name",
+            "thread_id",
+            "user_id",
+            "user_name",
+            "session_key",
+            "hint",
+        ] {
+            assert_eq!(
+                origin.get(key).and_then(|v| v.as_str()),
+                Some(""),
+                "origin.{key} must be present and empty"
+            );
+        }
+        // A partially-filled origin keeps what it has and blanks the rest.
+        let partial = build_body(&notif(0), None, &json!({"chat_id": "stream:ops"}));
+        assert_eq!(partial["origin"]["chat_id"], "stream:ops");
+        assert_eq!(partial["origin"]["thread_id"], "");
     }
 
     #[test]

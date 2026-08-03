@@ -25,3 +25,12 @@ def register(ctx) -> None:
         logger.info("po-k plugin: registered pre_llm_call notification hook")
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("po-k plugin: notification hook not registered: %s", e)
+    # Origin capture: remembers which chat/topic/user a turn came from so a
+    # webhook-woken turn can report back there. Returns None (allow) always.
+    try:
+        from .origin import on_pre_gateway_dispatch
+
+        ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
+        logger.info("po-k plugin: registered pre_gateway_dispatch origin hook")
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning("po-k plugin: origin hook not registered: %s", e)
