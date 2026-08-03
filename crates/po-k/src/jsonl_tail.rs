@@ -122,7 +122,7 @@ async fn pump(
                 if !trimmed.is_empty() {
                     if let Some((kind, payload)) = project_event(trimmed) {
                         let ts = events_store::now_iso();
-                        if events_store::append_jsonl_event(
+                        if let Ok(seq) = events_store::append_jsonl_event(
                             db,
                             sid,
                             &ts,
@@ -131,12 +131,12 @@ async fn pump(
                             next_offset as i64,
                         )
                         .await
-                        .is_ok()
                         {
                             state.bus.notify(sid).await;
                             // Forward to Xpo-k (the atomic offset bump can't go
                             // through `record`, so forward explicitly).
-                            crate::core::events::forward(state, sid, &kind, &payload).await;
+                            crate::core::events::forward(state, sid, &kind, &payload, seq, &ts)
+                                .await;
                         }
                     } else {
                         // Unprojectable line: still advance the offset so we

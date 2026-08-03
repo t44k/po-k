@@ -39,6 +39,42 @@ CREATE TABLE IF NOT EXISTS xpok_sessions (
     started_at  TEXT NOT NULL,
     ended_at    TEXT
 );
+
+-- M15: durable notification subscriptions. An orchestrator registers interest
+-- in a session once; Xpo-k then matches the session_event / status_update
+-- frames po-k already pushes and queues notifications that survive both the
+-- orchestrator being idle and an Xpo-k restart.
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id          TEXT PRIMARY KEY,
+    subscriber  TEXT NOT NULL,
+    sid         TEXT NOT NULL,
+    kinds       TEXT NOT NULL,          -- JSON array of event kinds
+    statuses    TEXT NOT NULL,          -- JSON array of derived statuses
+    cursor      INTEGER NOT NULL DEFAULT 0,  -- advanced on ACK only
+    created_at  TEXT NOT NULL,
+    expires_at  INTEGER NOT NULL        -- unix epoch seconds
+);
+CREATE INDEX IF NOT EXISTS subscriptions_by_sid ON subscriptions (sid);
+CREATE INDEX IF NOT EXISTS subscriptions_by_subscriber ON subscriptions (subscriber);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id          TEXT PRIMARY KEY,
+    sub_id      TEXT NOT NULL,
+    subscriber  TEXT NOT NULL,
+    sid         TEXT NOT NULL,
+    seq         INTEGER NOT NULL,       -- -1 for status-derived notifications
+    kind        TEXT NOT NULL,
+    status      TEXT,
+    payload     TEXT,
+    created_at  TEXT NOT NULL,
+    acked_at    TEXT
+);
+-- Delivery is at-least-once; this makes re-delivery of an already-queued
+-- sequenced event a no-op (replay after reconnect, duplicate push, retry).
+CREATE UNIQUE INDEX IF NOT EXISTS notifications_unique_seq
+    ON notifications (sub_id, seq, kind) WHERE seq >= 0;
+CREATE INDEX IF NOT EXISTS notifications_pending
+    ON notifications (subscriber, acked_at);
 "#;
 
 pub async fn open(path: &Path) -> Result<Db> {
@@ -61,6 +97,15 @@ pub async fn open(path: &Path) -> Result<Db> {
         .await
         .context("applying schema")?;
     Ok(pool)
+}
+
+/// Unix epoch seconds. Used for subscription expiry, where comparing integers
+/// beats string-comparing ISO timestamps.
+pub fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub fn now_iso() -> String {

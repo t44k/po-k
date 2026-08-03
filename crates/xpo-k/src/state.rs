@@ -6,6 +6,7 @@ use crate::auth::Token;
 use crate::config::Config;
 use crate::registry::Registry;
 use crate::store::Db;
+use crate::subs::NotifyHub;
 
 #[derive(Clone)]
 pub struct XState {
@@ -13,6 +14,8 @@ pub struct XState {
     pub token: Token,
     pub db: Db,
     pub registry: Registry,
+    /// Per-subscriber wakeups for notification long-polls (M15).
+    pub notify_hub: NotifyHub,
 }
 
 impl XState {
@@ -22,6 +25,7 @@ impl XState {
             token,
             db,
             registry: Registry::default(),
+            notify_hub: NotifyHub::default(),
         }
     }
 }

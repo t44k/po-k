@@ -103,10 +103,54 @@ class FakeClient:
         self.calls.append(("list",))
         return [{"name": "base"}]
 
+    # -- M15: wait/events cursor discipline + subscriptions --
+
+    def get_status(self, sid):
+        self.calls.append(("get_status", sid))
+        # Mirrors po-k: `cursor` is the event-stream tail, `boundary_cursor` the
+        # deciding turn boundary. They differ whenever anything follows the stop.
+        return {"session_id": sid, "status": "idle", "cursor": 30, "boundary_cursor": 20}
+
+    def wait(self, sid, since=0, timeout=600):
+        self.calls.append(("wait", sid, since, timeout))
+        return {"session_id": sid, "status": "idle", "cursor": 30, "boundary_cursor": 20}
+
+    def get_events(self, sid, offset=-1, size=10, wait=2, follow=False):
+        self.calls.append(("get_events", sid, offset, size, wait, follow))
+        return {"events": [], "next_cursor": offset if offset >= 0 else 0}
+
+    def create_subscription(self, sid, *, subscriber, kinds=None, statuses=None,
+                            ttl_secs=None, cursor=None):
+        self.calls.append(("create_subscription", sid, subscriber, kinds, statuses,
+                           ttl_secs, cursor))
+        return {"subscription_id": "sub-1", "session_id": sid, "subscriber": subscriber,
+                "cursor": 20, "cursor_source": "session"}
+
+    def list_subscriptions(self, *, subscriber="", sid=""):
+        self.calls.append(("list_subscriptions", subscriber, sid))
+        return {"subscriptions": [{"id": "sub-1", "sid": sid or "s1"}], "count": 1}
+
+    def delete_subscription(self, subscription_id):
+        self.calls.append(("delete_subscription", subscription_id))
+        return {"ok": True, "subscription_id": subscription_id}
+
+    def poll_notifications(self, *, subscriber="", sid="", limit=20, wait=0):
+        self.calls.append(("poll_notifications", subscriber, sid, limit, wait))
+        return {"notifications": [{"id": "ntf-1", "kind": "stop", "seq": 21}], "count": 1}
+
+    def ack_notifications(self, ids):
+        self.calls.append(("ack_notifications", list(ids)))
+        return {"ok": True, "acked": len(ids), "already_acked": 0}
+
 
 def _call(tools, args: dict) -> dict:
     """Invoke the pok_profiles handler and parse its JSON envelope."""
     return json.loads(tools._handle_pok_profiles(args))
+
+
+def _invoke(handler, args: dict) -> dict:
+    """Invoke any pok tool handler and parse its JSON envelope."""
+    return json.loads(handler(args))
 
 
 # --------------------------------------------------------------------------- #
@@ -340,6 +384,186 @@ def run() -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Tests: M15 cursor discipline + notification subscriptions
+# --------------------------------------------------------------------------- #
+
+def run_notifications() -> int:
+    global _passes, _failures
+    _passes = _failures = 0
+
+    from hermes_plugins.pok import tools
+
+    fake = FakeClient()
+    tools._client = lambda: fake  # type: ignore[assignment]
+
+    print("\npok_wait: never defaults to a stale since=0")
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_wait, {"session_id": "s1"})
+    waits = [c for c in fake.calls if c[0] == "wait"]
+    _check("wait succeeds", res.get("success") is True, str(res))
+    _check("resolved the boundary via get_status",
+           ("get_status", "s1") in fake.calls, str(fake.calls))
+    _check("since = boundary_cursor (20), not 0 and not the tail 30",
+           waits and waits[0][2] == 20, str(fake.calls))
+    _check("reports which cursor it used",
+           res.get("since_used") == 20 and res.get("since_source") == "status.boundary_cursor",
+           str(res))
+
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_wait, {"session_id": "s1", "since": 7})
+    waits = [c for c in fake.calls if c[0] == "wait"]
+    _check("explicit since is passed through", waits and waits[0][2] == 7, str(fake.calls))
+    _check("explicit since skips the status lookup",
+           not any(c[0] == "get_status" for c in fake.calls), str(fake.calls))
+    _check("since_source records the caller", res.get("since_source") == "caller", str(res))
+
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_wait, {"session_id": "s1", "since": 0})
+    waits = [c for c in fake.calls if c[0] == "wait"]
+    _check("since=0 is honoured when explicitly asked for (compat)",
+           waits and waits[0][2] == 0, str(fake.calls))
+
+    res = _invoke(tools._handle_pok_wait, {})
+    _check("wait without session_id rejected", res.get("success") is False, str(res))
+
+    _check("wait schema documents the boundary rule",
+           "boundary_cursor" in tools.POK_WAIT_SCHEMA["description"])
+    _check("wait schema warns against next_cursor",
+           "next_cursor" in tools.POK_WAIT_SCHEMA["description"])
+
+    print("\npok_events: follow flag for a real tail long-poll")
+    fake.calls.clear()
+    _invoke(tools._handle_pok_events, {"session_id": "s1", "follow": True, "wait": 5})
+    calls = [c for c in fake.calls if c[0] == "get_events"]
+    _check("follow forwarded to the client", calls and calls[0][5] is True, str(fake.calls))
+    fake.calls.clear()
+    _invoke(tools._handle_pok_events, {"session_id": "s1"})
+    calls = [c for c in fake.calls if c[0] == "get_events"]
+    _check("default stays offset=-1, follow off (compat)",
+           calls and calls[0][2] == -1 and calls[0][5] is False, str(fake.calls))
+    _check("follow is in the schema",
+           "follow" in tools.POK_EVENTS_SCHEMA["parameters"]["properties"])
+
+    print("\nsubscriber identity")
+    import os as _os
+    saved = _os.environ.pop("POK_SUBSCRIBER", None)
+    try:
+        default_id = tools._subscriber({})
+        _check("default identity is hostname-derived and stable",
+               default_id.startswith("hermes-") and default_id == tools._subscriber({}),
+               default_id)
+        _os.environ["POK_SUBSCRIBER"] = "ange-prod"
+        _check("POK_SUBSCRIBER wins over the default",
+               tools._subscriber({}) == "ange-prod")
+        _check("explicit argument wins over the env",
+               tools._subscriber({"subscriber": "explicit"}) == "explicit")
+    finally:
+        _os.environ.pop("POK_SUBSCRIBER", None)
+        if saved is not None:
+            _os.environ["POK_SUBSCRIBER"] = saved
+
+    print("\npok_subscribe")
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_subscribe,
+                  {"session_id": "s1", "subscriber": "sub-a", "ttl_secs": 60})
+    _check("subscribe succeeds", res.get("success") is True, str(res))
+    _check("returns the subscription id", res.get("subscription_id") == "sub-1", str(res))
+    call = [c for c in fake.calls if c[0] == "create_subscription"][0]
+    _check("session + subscriber forwarded", call[1] == "s1" and call[2] == "sub-a", str(call))
+    _check("ttl forwarded", call[5] == 60, str(call))
+    _check("no kinds/statuses sent when unset (server defaults apply)",
+           call[3] is None and call[4] is None, str(call))
+
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_subscribe,
+                  {"session_id": "s1", "kinds": ["stop", "user_question"]})
+    call = [c for c in fake.calls if c[0] == "create_subscription"][0]
+    _check("explicit kinds forwarded", call[3] == ["stop", "user_question"], str(call))
+
+    res = _invoke(tools._handle_pok_subscribe, {})
+    _check("subscribe without session_id rejected", res.get("success") is False, str(res))
+    res = _invoke(tools._handle_pok_subscribe, {"session_id": "s1", "kinds": "stop"})
+    _check("non-array kinds rejected client-side", res.get("success") is False, str(res))
+    _check("kinds error is specific", "kinds must be an array" in res.get("error", ""), str(res))
+
+    print("\npok_subscriptions")
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_subscriptions, {"action": "list", "subscriber": "sub-a"})
+    call = [c for c in fake.calls if c[0] == "list_subscriptions"][0]
+    _check("list scoped to this subscriber by default", call[1] == "sub-a", str(call))
+    _check("list returns rows", res.get("count") == 1, str(res))
+    fake.calls.clear()
+    _invoke(tools._handle_pok_subscriptions, {"action": "list", "all_subscribers": True})
+    call = [c for c in fake.calls if c[0] == "list_subscriptions"][0]
+    _check("all_subscribers drops the filter", call[1] == "", str(call))
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_subscriptions,
+                  {"action": "delete", "subscription_id": "sub-1"})
+    _check("delete forwards the id",
+           ("delete_subscription", "sub-1") in fake.calls, str(fake.calls))
+    _check("delete succeeds", res.get("success") is True, str(res))
+    res = _invoke(tools._handle_pok_subscriptions, {"action": "delete"})
+    _check("delete without id rejected", res.get("success") is False, str(res))
+    res = _invoke(tools._handle_pok_subscriptions, {"action": "nope"})
+    _check("unknown action rejected",
+           res.get("success") is False and "unknown action" in res.get("error", ""), str(res))
+
+    print("\npok_notifications")
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_notifications,
+                  {"action": "poll", "subscriber": "sub-a", "wait": 5})
+    call = [c for c in fake.calls if c[0] == "poll_notifications"][0]
+    _check("poll forwards subscriber and wait", call[1] == "sub-a" and call[4] == 5, str(call))
+    _check("poll returns notifications", res.get("count") == 1, str(res))
+    _check("notification carries an id to ack",
+           res["notifications"][0]["id"] == "ntf-1", str(res))
+    fake.calls.clear()
+    _invoke(tools._handle_pok_notifications,
+            {"action": "poll", "subscriber": "sub-a", "wait": 999})
+    call = [c for c in fake.calls if c[0] == "poll_notifications"][0]
+    _check("poll wait clamped to 60", call[4] == 60, str(call))
+
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_notifications, {"action": "ack", "ids": ["ntf-1", "ntf-2"]})
+    _check("ack forwards both ids",
+           ("ack_notifications", ["ntf-1", "ntf-2"]) in fake.calls, str(fake.calls))
+    _check("ack succeeds", res.get("success") is True and res.get("acked") == 2, str(res))
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_notifications, {"action": "ack", "ids": "ntf-9"})
+    _check("a bare string id is accepted as a single-element list",
+           ("ack_notifications", ["ntf-9"]) in fake.calls, str(fake.calls))
+    fake.calls.clear()
+    res = _invoke(tools._handle_pok_notifications, {"action": "ack"})
+    _check("ack without ids rejected", res.get("success") is False, str(res))
+    _check("ack makes no HTTP call when rejected", fake.calls == [], str(fake.calls))
+    res = _invoke(tools._handle_pok_notifications, {"action": "ack", "ids": []})
+    _check("ack with an empty list rejected", res.get("success") is False, str(res))
+    res = _invoke(tools._handle_pok_notifications, {"action": "frob"})
+    _check("unknown action rejected", res.get("success") is False, str(res))
+
+    print("\nregistration + schemas")
+    names = [s["name"] for s, _ in tools._TOOLS]
+    for t in ("pok_subscribe", "pok_subscriptions", "pok_notifications"):
+        _check(f"{t} registered", t in names)
+    _check("no duplicate tool names", len(names) == len(set(names)))
+    _check("21 tools registered", len(tools._TOOLS) == 21, str(len(tools._TOOLS)))
+    for schema, _h in tools._TOOLS:
+        params = schema["parameters"]
+        _check(f"{schema['name']} schema is a well-formed object",
+               params.get("type") == "object" and isinstance(params.get("properties"), dict))
+        for req in params.get("required", []):
+            _check(f"{schema['name']}.required[{req}] exists in properties",
+                   req in params["properties"])
+    _check("pok_notifications documents the ack duty",
+           "ack" in tools.POK_NOTIFICATIONS_SCHEMA["description"].lower())
+    _check("pok_subscribe tells the agent to subscribe before prompting",
+           "BEFORE" in tools.POK_SUBSCRIBE_SCHEMA["description"])
+
+    print(f"\nnotification results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
+# --------------------------------------------------------------------------- #
 # Tests: round trip through the Hermes framework (skipped without hermes-agent)
 # --------------------------------------------------------------------------- #
 
@@ -405,11 +629,16 @@ def test_pok_profiles() -> None:
     assert run() == 0
 
 
+def test_notifications() -> None:
+    assert run_notifications() == 0
+
+
 def test_framework_round_trip() -> None:
     assert run_framework() == 0
 
 
 if __name__ == "__main__":
     rc1 = run()
-    rc2 = run_framework()
-    sys.exit(rc1 | rc2)
+    rc2 = run_notifications()
+    rc3 = run_framework()
+    sys.exit(rc1 | rc2 | rc3)

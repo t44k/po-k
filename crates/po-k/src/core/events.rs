@@ -44,10 +44,23 @@ pub async fn page(
     offset: i64,
     size: i64,
     wait: u64,
+    follow: bool,
 ) -> CoreResult<CoreResponse> {
     ensure_exists(state, sid).await?;
     let wait = wait.min(MAX_WAIT);
     let size = size.clamp(1, MAX_SIZE);
+    // `follow` turns the cursor-less tail request into a cursor request pinned
+    // at the session's current seq: the caller gets only events that arrive
+    // *after* the call started, long-polling like `offset >= 0` does. Without
+    // it, a tail page on an active session always has rows and so returns
+    // immediately, silently ignoring `wait`.
+    let mut offset = offset;
+    if follow && offset < 0 {
+        offset = events_store::current_cursor(&state.db, sid)
+            .await
+            .map_err(internal)?
+            .unwrap_or(0);
+    }
     let tail = offset < 0;
     let select = || async {
         match (tail, transcript_only) {
@@ -60,11 +73,19 @@ pub async fn page(
         }
     };
 
+    // Register as a waiter BEFORE the first select. `EventBus` wakes waiters
+    // with `notify_waiters()`, which leaves no permit behind, so a writer that
+    // commits between the select and the subscribe would otherwise be missed
+    // and this call would park for the full `wait` despite the row existing.
+    // `Notified::enable()` registers the waiter without awaiting it, so any
+    // notification from this point on is delivered to the timeout below.
+    let notify = state.bus.subscribe(sid).await;
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+
     let mut rows = select().await.map_err(internal)?;
     if rows.is_empty() && wait > 0 {
-        let notify = state.bus.subscribe(sid).await;
-        let notified = notify.notified();
-        tokio::pin!(notified);
         let _ = tokio::time::timeout(Duration::from_secs(wait), notified).await;
         rows = select().await.map_err(internal)?;
     }
@@ -133,23 +154,36 @@ pub async fn record(
     kind: &str,
     payload: &serde_json::Value,
 ) -> anyhow::Result<i64> {
-    let seq = events_store::append_event(&state.db, sid, &events_store::now_iso(), kind, payload)
-        .await?;
+    let ts = events_store::now_iso();
+    let seq = events_store::append_event(&state.db, sid, &ts, kind, payload).await?;
     state.bus.notify(sid).await;
-    forward(state, sid, kind, payload).await;
+    forward(state, sid, kind, payload, seq, &ts).await;
     Ok(seq)
 }
 
 /// Forward an already-persisted event to Xpo-k and emit a status_update when
 /// the derived status changed. Call this after `append_jsonl_event` (whose
 /// atomic offset bump can't go through `record`).
-pub async fn forward(state: &AppState, sid: &str, kind: &str, payload: &serde_json::Value) {
+///
+/// `seq`/`ts` are the values the row was persisted with. Xpo-k needs the seq to
+/// order, deduplicate and resume subscription deliveries — never forward 0 for
+/// a persisted event.
+pub async fn forward(
+    state: &AppState,
+    sid: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+    seq: i64,
+    ts: &str,
+) {
     state
         .uplink_send(pok_proto::WsMsg::SessionEvent {
             sid: sid.to_string(),
             event: pok_proto::EventEnvelope {
                 kind: kind.to_string(),
                 payload: payload.clone(),
+                seq,
+                ts: ts.to_string(),
             },
         })
         .await;

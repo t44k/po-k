@@ -41,11 +41,15 @@ async fn connect_fake_pok(
     addr: SocketAddr,
 ) -> (
     futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
         Message,
     >,
     futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
     >,
 ) {
     let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
@@ -151,7 +155,9 @@ async fn sse_stream_bridge() {
 
     let responder = tokio::spawn(async move {
         if let WsMsg::WsRequest {
-            request_id, stream: true, ..
+            request_id,
+            stream: true,
+            ..
         } = next_msg(&mut stream).await
         {
             for i in 0..2 {
@@ -208,7 +214,9 @@ async fn profile_update_pushes_to_live_session() {
     let handle = tokio::spawn(async move {
         loop {
             match next_msg(&mut stream).await {
-                WsMsg::WsRequest { request_id, path, .. } if path == "/sessions" => {
+                WsMsg::WsRequest {
+                    request_id, path, ..
+                } if path == "/sessions" => {
                     let resp = WsMsg::WsResponse {
                         request_id,
                         status: 201,
@@ -219,7 +227,11 @@ async fn profile_update_pushes_to_live_session() {
                         .await
                         .unwrap();
                 }
-                WsMsg::ProfileUpdate { session_id, changed_fields, .. } => {
+                WsMsg::ProfileUpdate {
+                    session_id,
+                    changed_fields,
+                    ..
+                } => {
                     break Some((session_id, changed_fields));
                 }
                 _ => {}
@@ -297,4 +309,346 @@ async fn profile_crud_and_merge() {
     let md = merged["claude_md"].as_str().unwrap();
     assert!(md.contains("## From profile: base"));
     assert!(md.contains("## From profile: rev"));
+}
+
+// ---------------------------------------------------------------------------
+// M15: notification subscriptions end-to-end (HTTP → WS → queue → HTTP)
+// ---------------------------------------------------------------------------
+
+/// Subscribe, have the fake po-k push a `stop`, collect it over HTTP, ack it.
+#[tokio::test]
+async fn subscription_queues_forwarded_stop_and_ack_clears_it() {
+    let (addr, _state) = start_server().await;
+    let (mut sink, _stream) = connect_fake_pok(addr).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Subscribe with an explicit cursor so no po-k round trip is needed.
+    let sub: serde_json::Value = client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "session_id": "s1", "subscriber": "hermes-test", "cursor": 0
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sub["session_id"], "s1");
+    assert_eq!(sub["cursor_source"], "explicit");
+    let sub_id = sub["subscription_id"].as_str().unwrap().to_string();
+    // Defaults are reported back so the agent knows what it will receive.
+    assert!(sub["kinds"].as_array().unwrap().iter().any(|k| k == "stop"));
+
+    // po-k forwards the turn's stop (with the seq M15 added to the envelope).
+    let ev = WsMsg::SessionEvent {
+        sid: "s1".into(),
+        event: pok_proto::EventEnvelope {
+            kind: "stop".into(),
+            payload: serde_json::json!({"last_assistant_message": "done"}),
+            seq: 12,
+            ts: "2026-08-03T10:00:00Z".into(),
+        },
+    };
+    sink.send(Message::Text(serde_json::to_string(&ev).unwrap()))
+        .await
+        .unwrap();
+
+    // Long-poll picks it up without any /wait ever having been in flight.
+    let pending: serde_json::Value = client
+        .get(format!(
+            "{base}/notifications?subscriber=hermes-test&wait=5"
+        ))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending["count"], 1, "got {pending}");
+    let n = &pending["notifications"][0];
+    assert_eq!(n["kind"], "stop");
+    assert_eq!(n["seq"], 12);
+    assert_eq!(n["session_id"], "s1");
+    assert_eq!(n["subscription_id"].as_str().unwrap(), sub_id);
+    assert_eq!(
+        n["payload"]["event"]["payload"]["last_assistant_message"],
+        "done"
+    );
+    let ntf_id = n["id"].as_str().unwrap().to_string();
+
+    // Reading doesn't consume.
+    let again: serde_json::Value = client
+        .get(format!("{base}/notifications?subscriber=hermes-test"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["count"], 1, "unacked notifications stay pending");
+
+    // Ack, then it's gone; re-acking is idempotent.
+    let acked: serde_json::Value = client
+        .post(format!("{base}/notifications/ack"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({ "ids": [ntf_id.clone()] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(acked["acked"], 1);
+    let re: serde_json::Value = client
+        .post(format!("{base}/notifications/ack"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({ "ids": [ntf_id] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(re["acked"], 0);
+    assert_eq!(re["already_acked"], 1);
+
+    let empty: serde_json::Value = client
+        .get(format!("{base}/notifications?subscriber=hermes-test"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["count"], 0);
+
+    // The subscription is still listed (and its cursor advanced past the ack).
+    let list: serde_json::Value = client
+        .get(format!("{base}/subscriptions?subscriber=hermes-test"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["count"], 1);
+    assert_eq!(list["subscriptions"][0]["cursor"], 12);
+
+    // Unsubscribe.
+    let del = client
+        .delete(format!(
+            "{base}/subscriptions/{}",
+            sub["subscription_id"].as_str().unwrap()
+        ))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 200);
+    let after: serde_json::Value = client
+        .get(format!("{base}/subscriptions?subscriber=hermes-test"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["count"], 0);
+}
+
+/// A `status_update` is the level-triggered safety net: it notifies even when
+/// the sequenced event that caused the transition never arrived.
+#[tokio::test]
+async fn status_update_notifies_and_events_for_other_sessions_do_not() {
+    let (addr, _state) = start_server().await;
+    let (mut sink, _stream) = connect_fake_pok(addr).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({ "session_id": "s1", "subscriber": "sub-a", "cursor": 0 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // An event for a session nobody subscribed to must not enqueue anything.
+    for msg in [
+        WsMsg::SessionEvent {
+            sid: "other".into(),
+            event: pok_proto::EventEnvelope {
+                kind: "stop".into(),
+                payload: serde_json::Value::Null,
+                seq: 3,
+                ts: "t".into(),
+            },
+        },
+        WsMsg::StatusUpdate {
+            sid: "s1".into(),
+            status: "idle".into(),
+        },
+    ] {
+        sink.send(Message::Text(serde_json::to_string(&msg).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    let pending: serde_json::Value = client
+        .get(format!("{base}/notifications?subscriber=sub-a&wait=5"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        pending["count"], 1,
+        "only the subscribed session notifies: {pending}"
+    );
+    assert_eq!(pending["notifications"][0]["kind"], "status");
+    assert_eq!(pending["notifications"][0]["status"], "idle");
+}
+
+/// On reconnect Xpo-k replays what po-k persisted while the uplink was down,
+/// using the existing `/events` page API. Replaying an already-delivered window
+/// is idempotent.
+#[tokio::test]
+async fn reconnect_replays_missed_events_once() {
+    let (addr, _state) = start_server().await;
+    let (sink, stream) = connect_fake_pok(addr).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({ "session_id": "s1", "subscriber": "sub-r", "cursor": 0 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // Drop the connection without ever forwarding the stop.
+    drop(sink);
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Reconnect; answer the replay request with the persisted events.
+    let (mut sink2, mut stream2) = connect_fake_pok(addr).await;
+    let replayed = tokio::spawn(async move {
+        loop {
+            if let WsMsg::WsRequest {
+                request_id, path, ..
+            } = next_msg(&mut stream2).await
+            {
+                if path.starts_with("/sessions/s1/events") {
+                    let resp = WsMsg::WsResponse {
+                        request_id,
+                        status: 200,
+                        headers: Default::default(),
+                        body: r#"{"events":[{"seq":5,"ts":"t","kind":"stop"}],"next_cursor":5}"#
+                            .into(),
+                    };
+                    sink2
+                        .send(Message::Text(serde_json::to_string(&resp).unwrap()))
+                        .await
+                        .unwrap();
+                    break path;
+                }
+            }
+        }
+    });
+    let path = tokio::time::timeout(Duration::from_secs(5), replayed)
+        .await
+        .expect("no replay request arrived")
+        .unwrap();
+    assert!(
+        path.contains("offset=0"),
+        "replay must resume from the cursor: {path}"
+    );
+
+    // Give the matcher a moment, then assert exactly one notification.
+    let pending: serde_json::Value = client
+        .get(format!("{base}/notifications?subscriber=sub-r&wait=5"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending["count"], 1, "{pending}");
+    assert_eq!(pending["notifications"][0]["seq"], 5);
+
+    // A duplicate push of the same seq changes nothing (at-least-once, deduped).
+    let dup = WsMsg::SessionEvent {
+        sid: "s1".into(),
+        event: pok_proto::EventEnvelope {
+            kind: "stop".into(),
+            payload: serde_json::Value::Null,
+            seq: 5,
+            ts: "t".into(),
+        },
+    };
+    let (mut sink3, _s3) = connect_fake_pok(addr).await;
+    sink3
+        .send(Message::Text(serde_json::to_string(&dup).unwrap()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after: serde_json::Value = client
+        .get(format!("{base}/notifications?subscriber=sub-r"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["count"], 1, "duplicate suppressed: {after}");
+}
+
+/// The new endpoints sit behind the bearer middleware like everything else.
+#[tokio::test]
+async fn subscription_endpoints_require_auth() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    for (method, path) in [("GET", "/subscriptions"), ("GET", "/notifications")] {
+        let r = client
+            .request(method.parse().unwrap(), format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "{method} {path} must require auth");
+    }
+    let r = client
+        .post(format!("{base}/subscriptions"))
+        .json(&serde_json::json!({ "session_id": "s1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    // …and bad input is rejected with 400, not 500.
+    let r = client
+        .post(format!("{base}/notifications/ack"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({ "ids": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
 }

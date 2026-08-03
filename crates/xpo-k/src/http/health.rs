@@ -105,6 +105,37 @@ pub async fn help() -> Json<Value> {
                 "auth": true,
                 "description": "Preview the composition of profiles without persisting. Body: {\"profiles\": [\"name\", ...]}."
             },
+            // --- notification subscriptions (M15) ---
+            {
+                "method": "POST",
+                "path": "/subscriptions",
+                "auth": true,
+                "description": "Register interest in a session so completions are queued even when no call is blocked. Body: {session_id, subscriber?, kinds?, statuses?, ttl_secs?, cursor?}. Cursor defaults to the session's current event seq (only NEW events notify); pass cursor:0 to include history. Served by Xpo-k, no po-k round trip except the cursor lookup."
+            },
+            {
+                "method": "GET",
+                "path": "/subscriptions",
+                "auth": true,
+                "description": "List subscriptions. Optional query: subscriber, session_id."
+            },
+            {
+                "method": "DELETE",
+                "path": "/subscriptions/{id}",
+                "auth": true,
+                "description": "Unsubscribe and drop that subscription's queued notifications."
+            },
+            {
+                "method": "GET",
+                "path": "/notifications",
+                "auth": true,
+                "description": "Pending (unacked) notifications, oldest first. Optional query: subscriber, session_id, limit (default 20, max 500), wait (long-poll seconds, max 60; requires subscriber). Reading never consumes — a notification stays pending until acked, so delivery is at-least-once."
+            },
+            {
+                "method": "POST",
+                "path": "/notifications/ack",
+                "auth": true,
+                "description": "Acknowledge notifications. Body: {\"ids\": [\"ntf-...\"]}. Idempotent: unknown/already-acked ids are counted in `already_acked`. Acking advances the subscription cursor and refreshes its TTL."
+            },
             // --- projects ---
             {
                 "method": "GET",
@@ -147,7 +178,7 @@ pub async fn help() -> Json<Value> {
                 "method": "GET",
                 "path": "/sessions/{id}/messages",
                 "auth": true,
-                "description": "Read messages. Required query params: offset (int), size (int). offset=-1 = tail (latest size); offset>=0 = cursor (seq > offset). size capped at 1000; missing either → 400. Optional: wait (int seconds)."
+                "description": "Read messages. Required query params: offset (int), size (int). offset=-1 = tail (latest size); offset>=0 = cursor (seq > offset). size capped at 1000; missing either → 400. Optional: wait (long-poll seconds, max 60) and follow (1 = pin a tail request to the current cursor so it long-polls for NEW events). NOTE: a plain tail (offset=-1) on a session that already has events returns immediately and ignores wait — use follow=1, or page forward with offset=next_cursor."
             },
             {
                 "method": "GET",
@@ -177,7 +208,7 @@ pub async fn help() -> Json<Value> {
                 "method": "GET",
                 "path": "/sessions/{id}/events",
                 "auth": true,
-                "description": "Read events. Required query params: offset (int), size (int). offset=-1 = tail (latest size); offset>=0 = cursor (seq > offset). size capped at 1000; missing either → 400. Optional: wait (int seconds)."
+                "description": "Read events. Required query params: offset (int), size (int). offset=-1 = tail (latest size); offset>=0 = cursor (seq > offset). size capped at 1000; missing either → 400. Optional: wait (long-poll seconds, max 60) and follow (1 = pin a tail request to the current cursor so it long-polls for NEW events). NOTE: a plain tail (offset=-1) on a session that already has events returns immediately and ignores wait — use follow=1, or page forward with offset=next_cursor."
             },
             {
                 "method": "GET",
@@ -201,7 +232,7 @@ pub async fn help() -> Json<Value> {
                 "method": "GET",
                 "path": "/sessions/{id}/wait",
                 "auth": true,
-                "description": "Block until the session becomes idle/awaiting_input/ended. Optional query: since (cursor), timeout (int seconds, max 600)."
+                "description": "Block until the session reaches a turn boundary NEWER than `since`. Optional query: since (BOUNDARY cursor), timeout (int seconds, max 600). `since` is compared against the deciding event's seq, not the event-stream tail: re-arm with `boundary_cursor` from this response or from /status, or with the `cursor` returned by POST /messages — never with `cursor` (the tail), which is normally higher than the boundary and would block until the next turn."
             },
             {
                 "method": "GET",

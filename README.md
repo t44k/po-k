@@ -147,11 +147,15 @@ curl -sH "$H" -H 'Content-Type: application/json' \
    $X/sessions/$SID/messages
 
 # 5. Stream the response — long-poll or SSE.
-curl -sH "$H" "$X/sessions/$SID/events?since=0&wait=30"
+#    offset/size are required; follow=1 turns a cursor-less tail into a
+#    long-poll for NEW events only (see "Cursors" below).
+curl -sH "$H" "$X/sessions/$SID/events?offset=-1&size=10&wait=30&follow=1"
 curl -NsH "$H" "$X/sessions/$SID/events/stream"
 
-# 6. Block until CC is idle again.
-curl -sH "$H" "$X/sessions/$SID/wait?since=0&timeout=120"
+# 6. Block until CC reaches a NEW turn boundary. `since` is the BOUNDARY
+#    cursor — the one POST /messages returned, or boundary_cursor from
+#    /status or a previous /wait.
+curl -sH "$H" "$X/sessions/$SID/wait?since=$CURSOR&timeout=120"
 
 # 7. Interrupt / tear down.
 curl -sH "$H" -X POST   $X/sessions/$SID/interrupt
@@ -160,6 +164,100 @@ curl -sH "$H" -X DELETE $X/sessions/$SID
 
 A plain `{"project":"..."}` body (no `profiles`) still works — it spawns CC with
 project-local config only, exactly as before profiles existed.
+
+## Cursors
+
+Three different cursors travel through this API. Mixing them up is the classic
+source of "the orchestrator never noticed the turn finished".
+
+| Cursor | Where it comes from | What it means | Use it for |
+|---|---|---|---|
+| **tail cursor** | `cursor` on `/status` and `/wait`; `next_cursor` on `/events` | highest event `seq` persisted so far | paging forward: `/events?offset=<tail>` |
+| **boundary cursor** | `boundary_cursor` on `/status` and `/wait`; `cursor` from `POST /messages` | `seq` of the *deciding* turn-boundary event (the `stop` / notification / lifecycle event) | `/wait?since=<boundary>` |
+| **subscription cursor** | `cursor` on a subscription; advanced by **ack** only | how far a subscriber has consumed | nothing manual — the server owns it |
+
+Rules:
+
+- **`/wait?since=` takes the boundary cursor, never the tail.** The two differ
+  routinely: the JSONL tailer flushes a turn's final `assistant_message` *after*
+  the Stop hook, so the tail is usually higher than the boundary. Re-arming with
+  the tail blocks until the *next* turn even though the session is already idle.
+- **Never re-arm `/wait` with `next_cursor` from `/events`.** That is a tail
+  cursor.
+- **`since=0` means "any past boundary counts"** — a stop from a previous turn
+  satisfies the wait instantly and looks like a fresh completion. Arm with the
+  cursor `POST /messages` gave you (captured *before* the prompt was written), or
+  with `boundary_cursor`. The `pok_wait` tool resolves the current
+  `boundary_cursor` automatically when you omit `since`.
+- **A plain tail read (`offset=-1`) returns immediately and ignores `wait`** once
+  a session has any events — it is "give me the latest N", not a subscription.
+  To watch for new output, either page forward with `offset=<next_cursor>` or
+  pass `follow=1`, which pins the request to the current cursor and long-polls.
+
+## Background notifications
+
+`/wait` only helps while a call is in flight. An orchestrator that has to handle
+other work (or ends its turn) needs completions to survive the gap, so Xpo-k
+keeps the interest itself:
+
+```sh
+# 1. Subscribe BEFORE prompting. The cursor defaults to the session's current
+#    event seq, so the subscription can neither miss this turn's stop nor fire
+#    on history. (Pass "cursor": 0 to include everything po-k still holds.)
+SUB=$(curl -sH "$H" -H 'Content-Type: application/json' \
+  -d "{\"session_id\":\"$SID\",\"subscriber\":\"ange\"}" \
+  $X/subscriptions | jq -r .subscription_id)
+
+# 2. Send the long task, then go do something else entirely.
+curl -sH "$H" -H 'Content-Type: application/json' \
+  -d '{"text":"Refactor the payment module and run the suite."}' \
+  $X/sessions/$SID/messages
+
+# 3. Later — or from another process — collect what happened. Reading does not
+#    consume; `wait` long-polls (max 60s) when nothing is queued yet.
+curl -sH "$H" "$X/notifications?subscriber=ange&wait=30"
+
+# 4. Ack what you acted on. Unacked notifications are redelivered, so nothing
+#    is lost if you crash in between. Acking advances the subscription cursor
+#    and refreshes its TTL.
+curl -sH "$H" -H 'Content-Type: application/json' \
+  -d '{"ids":["ntf-…"]}' $X/notifications/ack
+
+curl -sH "$H" "$X/subscriptions?subscriber=ange"      # what am I watching?
+curl -sH "$H" -X DELETE "$X/subscriptions/$SUB"       # stop watching
+```
+
+Contract:
+
+- **Server-owned.** Subscriptions and queued notifications live in Xpo-k's
+  SQLite, so they survive an idle orchestrator, an Xpo-k restart, and a po-k
+  reconnect.
+- **What fires.** Event kinds `stop`, `session_end`, `cc_exited`,
+  `notification`, `user_question`, `permission_request` (override with
+  `kinds`), plus derived-status changes to `idle`, `awaiting_input`, `ended`
+  (override with `statuses`). The status path is a level-triggered safety net:
+  it still fires when the sequenced event that caused the transition never
+  reached Xpo-k.
+- **At-least-once, deduplicated.** Sequenced events are unique per
+  `(subscription, seq, kind)`, so a duplicate push or a reconnect replay cannot
+  double-deliver. A status notification is suppressed while an unacked one for
+  the same status is already queued.
+- **Reconnect replay.** When a po-k registers, Xpo-k replays the events it
+  persisted while the uplink was down (via the existing `/events` page API,
+  from each subscription's cursor) — bounded to the most recent 200 events per
+  session.
+- **Expiry.** Subscriptions default to a 24 h TTL (max 7 days), refreshed on
+  every ack; expired ones and their queued rows are swept automatically.
+
+**Hermes plugin usage.** `pok_subscribe` → do other work → `pok_notifications
+(action="poll")` → `pok_notifications(action="ack", ids=[…])`. The plugin
+deliberately does **not** spawn a background thread to inject into the
+conversation: `ctx.inject_message` is unavailable in gateway mode, so a
+thread-based design would drop notifications exactly where they matter most.
+Instead the queue is authoritative on the server and polled explicitly — from
+the agent's own turn, or from a gateway-side heartbeat/cron that polls
+`/notifications` and starts a turn when something is pending. Either way an
+unacked notification is never lost.
 
 ## Permission round-trip
 
@@ -194,6 +292,11 @@ All endpoints except `/health` require `Authorization: Bearer <xpo-k token>`.
 | `GET` | `/profiles/{name}/history` | version history |
 | `POST` | `/profiles/merge` | `{profiles:[...]}` → merged profile (not stored) |
 | `POST` | `/profiles/preview` | merge + capabilities preview for a project |
+| `POST` | `/subscriptions` | `{session_id, subscriber?, kinds?, statuses?, ttl_secs?, cursor?}` → watch a session |
+| `GET` | `/subscriptions[?subscriber=&session_id=]` | list subscriptions |
+| `DELETE` | `/subscriptions/{id}` | unsubscribe (drops its queued notifications) |
+| `GET` | `/notifications[?subscriber=&session_id=&limit=&wait=]` | pending notifications; reading does not consume |
+| `POST` | `/notifications/ack` | `{ids:[...]}` → acknowledge (idempotent) |
 
 **Session API (routed to the owning po-k over WebSocket):**
 
@@ -203,12 +306,12 @@ All endpoints except `/health` require `Authorization: Bearer <xpo-k token>`.
 | `POST` | `/sessions` | `{project, profiles?, agent?, cc_flags?, bare?}` → spawn |
 | `GET` | `/sessions` | fan-out list |
 | `GET`/`DELETE` | `/sessions/:id` | detail / teardown |
-| `POST` | `/sessions/:id/messages` | `{text}` → write to pane |
-| `GET` | `/sessions/:id/messages[?since=&wait=]` · `/messages/stream` | transcript poll / SSE |
+| `POST` | `/sessions/:id/messages` | `{text}` → write to pane; returns the **boundary cursor** to arm `/wait` with |
+| `GET` | `/sessions/:id/messages?offset=&size=[&wait=&follow=]` · `/messages/stream` | transcript poll / SSE |
 | `POST` | `/sessions/:id/interrupt` · `/clear` | ESC / `/clear` into pane |
 | `POST` | `/sessions/:id/files` | `{filename, content_base64}` → `<cwd>/.po-k-inbox/` |
-| `GET` | `/sessions/:id/events[?since=&wait=]` · `/events/stream` | event poll / SSE |
-| `GET` | `/sessions/:id/cost` · `/status` · `/wait` · `/pane` | derived views |
+| `GET` | `/sessions/:id/events?offset=&size=[&wait=&follow=]` · `/events/stream` | event poll / SSE; `follow=1` = long-poll for new events |
+| `GET` | `/sessions/:id/cost` · `/status` · `/wait` · `/pane` | derived views; `/status` + `/wait` return `cursor` (tail) **and** `boundary_cursor` |
 | `GET` | `/sessions/:id/capabilities` | agents/skills/MCP the session actually has |
 | `POST` | `/sessions/:id/permission_requests/:req_id` | orchestrator decides |
 

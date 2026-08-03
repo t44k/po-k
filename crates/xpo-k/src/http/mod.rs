@@ -13,11 +13,22 @@ use crate::state::XState;
 
 pub mod health;
 pub mod profiles;
+pub mod subscriptions;
 
 pub fn router(state: XState) -> Router {
     let protected = Router::new()
         .route("/registry", get(health::registry))
         .route("/clients", get(health::clients))
+        .route(
+            "/subscriptions",
+            get(subscriptions::list).post(subscriptions::create),
+        )
+        .route(
+            "/subscriptions/{id}",
+            axum::routing::delete(subscriptions::delete),
+        )
+        .route("/notifications", get(subscriptions::poll))
+        .route("/notifications/ack", post(subscriptions::ack))
         .route("/profiles", get(profiles::list).post(profiles::create))
         .route(
             "/profiles/{name}",

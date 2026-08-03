@@ -40,6 +40,25 @@ def _check() -> bool:
     return bool(os.getenv("XPOK_URL"))
 
 
+def _subscriber(args: dict) -> str:
+    """Resolve the subscriber identity for notification subscriptions.
+
+    Subscriptions are server-side and outlive any single tool call, so they
+    need a stable name for this Hermes instance. Explicit `subscriber` wins,
+    then `POK_SUBSCRIBER`, then a hostname-derived default — never a random id,
+    which would orphan subscriptions across restarts.
+    """
+    explicit = str(args.get("subscriber") or "").strip()
+    if explicit:
+        return explicit
+    env = os.getenv("POK_SUBSCRIBER", "").strip()
+    if env:
+        return env
+    import socket
+
+    return f"hermes-{socket.gethostname()}"
+
+
 # ---------------------------------------------------------------------------
 # Tool: pok_clients
 # ---------------------------------------------------------------------------
@@ -241,9 +260,17 @@ def _handle_pok_status(args: dict, **_kw) -> str:
 POK_WAIT_SCHEMA = {
     "name": "pok_wait",
     "description": (
-        "Block until a CC session becomes idle, awaiting_input, or ended. "
-        "Returns the deciding event. Use 'since' cursor from pok_prompt to avoid "
-        "seeing stale events. Max server-side timeout is 600s; returns timed_out: true on timeout."
+        "Block until a CC session reaches a NEW turn boundary — idle, awaiting_input, "
+        "or ended — and return the deciding event.\n\n"
+        "Cursor rule: 'since' is compared against the *boundary* seq, not the tail of "
+        "the event stream. Pass the 'cursor' returned by pok_prompt, or the "
+        "'boundary_cursor' from a previous pok_wait/pok_status. Never pass pok_events' "
+        "'next_cursor' (a tail cursor, normally higher than the boundary — the wait "
+        "would block until the next turn). When 'since' is omitted this tool resolves "
+        "the session's current boundary_cursor first, so it waits for the NEXT "
+        "completion instead of returning a stale one.\n\n"
+        "Max server-side timeout is 600s; returns timed_out: true on timeout. For long "
+        "tasks where you cannot keep a call blocked, use pok_subscribe + pok_notifications."
     ),
     "parameters": {
         "type": "object",
@@ -251,7 +278,10 @@ POK_WAIT_SCHEMA = {
             "session_id": {"type": "string", "description": "Session UUID."},
             "since": {
                 "type": "integer",
-                "description": "Cursor from pok_prompt. Only events after this seq are considered.",
+                "description": (
+                    "Boundary cursor: pok_prompt's 'cursor', or 'boundary_cursor' from a "
+                    "previous pok_wait/pok_status. Omit to auto-resolve the current boundary."
+                ),
             },
             "timeout": {
                 "type": "integer",
@@ -267,11 +297,20 @@ def _handle_pok_wait(args: dict, **_kw) -> str:
     sid = args.get("session_id", "")
     if not sid:
         return _err("session_id is required")
-    since = args.get("since", 0)
     timeout = min(args.get("timeout", 600), 600)
     try:
-        data = _client().wait(sid, since=since, timeout=timeout)
-        return _ok(data)
+        c = _client()
+        since = args.get("since")
+        resolved_from = "caller"
+        if since is None:
+            # Defaulting to 0 would make the PREVIOUS turn's stop satisfy the
+            # wait immediately (stale completion). Baseline at the session's
+            # current boundary so only a new one counts.
+            status = c.get_status(sid)
+            since = status.get("boundary_cursor", status.get("cursor", 0)) or 0
+            resolved_from = "status.boundary_cursor"
+        data = c.wait(sid, since=int(since), timeout=timeout)
+        return _ok({**data, "since_used": int(since), "since_source": resolved_from})
     except Exception as e:
         return _err(str(e))
 
@@ -310,7 +349,19 @@ POK_EVENTS_SCHEMA = {
             },
             "wait": {
                 "type": "integer",
-                "description": "Long-poll seconds (default 2). Always pass >= 2.",
+                "description": (
+                    "Long-poll seconds (default 2). ⚠️ Only effective for a cursor read "
+                    "(offset>=0) or with follow=true — a plain tail (offset=-1) on a "
+                    "session that already has events returns immediately."
+                ),
+            },
+            "follow": {
+                "type": "boolean",
+                "description": (
+                    "Pin a tail request to the session's current cursor and long-poll for "
+                    "NEW events only. Use when watching for output you haven't seen yet "
+                    "without knowing the cursor. Ignored when offset>=0."
+                ),
             },
         },
         "required": ["session_id"],
@@ -325,8 +376,9 @@ def _handle_pok_events(args: dict, **_kw) -> str:
     offset = args.get("offset", -1)
     size = args.get("size", 10)
     wait = args.get("wait", 2)
+    follow = bool(args.get("follow", False))
     try:
-        data = _client().get_events(sid, offset=offset, size=size, wait=wait)
+        data = _client().get_events(sid, offset=offset, size=size, wait=wait, follow=follow)
         return _ok(data)
     except Exception as e:
         return _err(str(e))
@@ -801,6 +853,198 @@ def _handle_pok_profiles(args: dict, **_kw) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool: pok_subscribe / pok_subscriptions / pok_notifications
+#
+# Background completion handling. A subscription lives in Xpo-k, so a CC turn
+# that finishes while no tool call is blocked still queues a notification;
+# nothing is lost because a notification stays pending until it is acked.
+#
+# Deliberately poll-based: this plugin registers plain tools and must not
+# assume a background thread may inject into the conversation (ctx-based
+# injection is unavailable in gateway mode). See README "Background
+# notifications" for the intended gateway loop.
+# ---------------------------------------------------------------------------
+
+POK_SUBSCRIBE_SCHEMA = {
+    "name": "pok_subscribe",
+    "description": (
+        "Register interest in a CC session so its completion is queued server-side "
+        "even when no pok_wait is blocked. Subscribe BEFORE sending the prompt: the "
+        "subscription starts at the session's current event seq, so it can neither "
+        "miss that turn's stop nor fire on history. Then handle other work and call "
+        "pok_notifications(action='poll') later. Notifications persist across Xpo-k "
+        "restarts and po-k reconnects until acked."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session UUID to watch."},
+            "kinds": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Event kinds to notify on. Default: stop, session_end, cc_exited, "
+                    "notification, user_question, permission_request."
+                ),
+            },
+            "statuses": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Derived statuses to notify on. Default: idle, awaiting_input, ended.",
+            },
+            "ttl_secs": {
+                "type": "integer",
+                "description": "Lifetime in seconds (default 86400, max 604800). Refreshed on each ack.",
+            },
+            "subscriber": {
+                "type": "string",
+                "description": "Subscriber identity. Defaults to POK_SUBSCRIBER or hermes-<hostname>.",
+            },
+        },
+        "required": ["session_id"],
+    },
+}
+
+
+def _handle_pok_subscribe(args: dict, **_kw) -> str:
+    sid = args.get("session_id", "")
+    if not sid:
+        return _err("session_id is required")
+    kinds = args.get("kinds") or None
+    statuses = args.get("statuses") or None
+    if kinds is not None and not isinstance(kinds, list):
+        return _err("kinds must be an array of event-kind strings")
+    if statuses is not None and not isinstance(statuses, list):
+        return _err("statuses must be an array of status strings")
+    try:
+        data = _client().create_subscription(
+            sid,
+            subscriber=_subscriber(args),
+            kinds=kinds,
+            statuses=statuses,
+            ttl_secs=args.get("ttl_secs"),
+            cursor=args.get("cursor"),
+        )
+        return _ok(data)
+    except Exception as e:
+        return _err(str(e))
+
+
+POK_SUBSCRIPTIONS_SCHEMA = {
+    "name": "pok_subscriptions",
+    "description": (
+        "List or cancel session notification subscriptions. "
+        "action='list' shows this subscriber's active subscriptions (and their cursors); "
+        "action='delete' cancels one and drops its queued notifications."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "delete"],
+                "description": "Operation to perform.",
+            },
+            "subscription_id": {
+                "type": "string",
+                "description": "Subscription id (required for delete).",
+            },
+            "session_id": {"type": "string", "description": "Filter the list by session."},
+            "all_subscribers": {
+                "type": "boolean",
+                "description": "List subscriptions from every subscriber, not just this one.",
+            },
+            "subscriber": {"type": "string", "description": "Override the subscriber identity."},
+        },
+        "required": ["action"],
+    },
+}
+
+
+def _handle_pok_subscriptions(args: dict, **_kw) -> str:
+    action = args.get("action", "")
+    try:
+        c = _client()
+        if action == "list":
+            subscriber = "" if args.get("all_subscribers") else _subscriber(args)
+            data = c.list_subscriptions(
+                subscriber=subscriber, sid=args.get("session_id", "")
+            )
+            return _ok(data)
+        elif action == "delete":
+            sub_id = args.get("subscription_id", "")
+            if not sub_id:
+                return _err("subscription_id is required for delete")
+            return _ok(c.delete_subscription(sub_id))
+        else:
+            return _err(f"unknown action: {action!r}")
+    except Exception as e:
+        return _err(str(e))
+
+
+POK_NOTIFICATIONS_SCHEMA = {
+    "name": "pok_notifications",
+    "description": (
+        "Collect queued session notifications (completions, awaiting-input, session end) "
+        "for sessions you subscribed to with pok_subscribe.\n\n"
+        "action='poll' returns pending notifications, oldest first — reading does NOT "
+        "consume them. action='ack' marks them delivered (idempotent) and advances the "
+        "subscription cursor. ALWAYS ack what you have acted on, otherwise the same "
+        "notification is returned again; conversely nothing is lost if you crash before "
+        "acking. Pass wait>0 to long-poll while you have nothing else to do."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["poll", "ack"],
+                "description": "Operation to perform.",
+            },
+            "ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Notification ids to acknowledge (required for ack).",
+            },
+            "session_id": {"type": "string", "description": "Only notifications for this session."},
+            "limit": {"type": "integer", "description": "Max notifications to return (default 20, max 500)."},
+            "wait": {
+                "type": "integer",
+                "description": "Long-poll seconds when nothing is pending (default 0, max 60).",
+            },
+            "subscriber": {"type": "string", "description": "Override the subscriber identity."},
+        },
+        "required": ["action"],
+    },
+}
+
+
+def _handle_pok_notifications(args: dict, **_kw) -> str:
+    action = args.get("action", "")
+    try:
+        c = _client()
+        if action == "poll":
+            data = c.poll_notifications(
+                subscriber=_subscriber(args),
+                sid=args.get("session_id", ""),
+                limit=args.get("limit", 20),
+                wait=min(args.get("wait", 0) or 0, 60),
+            )
+            return _ok(data)
+        elif action == "ack":
+            ids = args.get("ids")
+            if isinstance(ids, str):
+                ids = [ids]
+            if not ids or not isinstance(ids, list):
+                return _err("ids (array of notification ids) is required for ack")
+            return _ok(c.ack_notifications([str(i) for i in ids]))
+        else:
+            return _err(f"unknown action: {action!r}")
+    except Exception as e:
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -823,6 +1067,9 @@ _TOOLS = [
     (POK_PERMISSION_SCHEMA, _handle_pok_permission),
     (POK_HEALTH_SCHEMA, _handle_pok_health),
     (POK_PROFILES_SCHEMA, _handle_pok_profiles),
+    (POK_SUBSCRIBE_SCHEMA, _handle_pok_subscribe),
+    (POK_SUBSCRIPTIONS_SCHEMA, _handle_pok_subscriptions),
+    (POK_NOTIFICATIONS_SCHEMA, _handle_pok_notifications),
 ]
 
 

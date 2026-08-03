@@ -141,10 +141,15 @@ class XpokClient:
         return self._get(f"/sessions/{sid}/wait", params=params, timeout=_WAIT_TIMEOUT)
 
     def get_events(self, sid: str, offset: int = -1, size: int = 10,
-                   wait: int = 2) -> Dict[str, Any]:
+                   wait: int = 2, follow: bool = False) -> Dict[str, Any]:
         # offset and size are REQUIRED by the server. offset=-1 returns the
         # latest `size` events (tail); offset>=0 returns events with seq > offset.
+        # A plain tail returns immediately and ignores `wait` once the session
+        # has any events — pass follow=True (pins the request to the current
+        # cursor) or an explicit offset to actually long-poll.
         params: Dict[str, Any] = {"offset": offset, "size": size, "wait": wait}
+        if follow:
+            params["follow"] = 1
         return self._get(f"/sessions/{sid}/events", params=params, timeout=wait + 10)
 
     def get_pane(self, sid: str) -> Dict[str, Any]:
@@ -174,6 +179,53 @@ class XpokClient:
 
     def registry(self) -> Any:
         return self._get("/registry")
+
+    # -- Notification subscriptions (M15) --
+
+    def create_subscription(
+        self,
+        sid: str,
+        *,
+        subscriber: str,
+        kinds: Optional[list] = None,
+        statuses: Optional[list] = None,
+        ttl_secs: Optional[int] = None,
+        cursor: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"session_id": sid, "subscriber": subscriber}
+        if kinds:
+            body["kinds"] = kinds
+        if statuses:
+            body["statuses"] = statuses
+        if ttl_secs is not None:
+            body["ttl_secs"] = ttl_secs
+        if cursor is not None:
+            body["cursor"] = cursor
+        return self._post("/subscriptions", body)
+
+    def list_subscriptions(self, *, subscriber: str = "",
+                           sid: str = "") -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if subscriber:
+            params["subscriber"] = subscriber
+        if sid:
+            params["session_id"] = sid
+        return self._get("/subscriptions", params=params or None)
+
+    def delete_subscription(self, subscription_id: str) -> Dict[str, Any]:
+        return self._delete(f"/subscriptions/{subscription_id}")
+
+    def poll_notifications(self, *, subscriber: str = "", sid: str = "",
+                           limit: int = 20, wait: int = 0) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"limit": limit, "wait": wait}
+        if subscriber:
+            params["subscriber"] = subscriber
+        if sid:
+            params["session_id"] = sid
+        return self._get("/notifications", params=params, timeout=wait + 15)
+
+    def ack_notifications(self, ids: list) -> Dict[str, Any]:
+        return self._post("/notifications/ack", {"ids": ids})
 
     # -- Profile endpoints --
 

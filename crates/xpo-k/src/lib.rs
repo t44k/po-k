@@ -11,6 +11,7 @@ pub mod registry;
 pub mod routed;
 pub mod state;
 pub mod store;
+pub mod subs;
 pub mod ws;
 
 use anyhow::Result;

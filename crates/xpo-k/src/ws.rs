@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use crate::registry::{PokConn, StreamFrame, WsResult};
 use crate::state::XState;
 use crate::store;
+use crate::subs;
 
 pub fn router(state: XState) -> Router {
     Router::new()
@@ -79,6 +80,75 @@ async fn handle(socket: WebSocket, state: XState) {
     writer.abort();
 }
 
+/// Match one forwarded event against the subscriptions for its session and
+/// wake anyone long-polling. Failures are logged, never fatal: notification
+/// delivery must not break event forwarding or session routing.
+async fn deliver(state: &XState, sid: &str, event: &pok_proto::EventEnvelope) {
+    match subs::match_event(
+        &state.db,
+        sid,
+        &event.kind,
+        event.seq,
+        &event.ts,
+        &event.payload,
+    )
+    .await
+    {
+        Ok(woken) => wake_all(state, woken),
+        Err(e) => tracing::warn!(sid, error = %e, "event notification match failed"),
+    }
+}
+
+fn wake_all(state: &XState, subscribers: Vec<String>) {
+    for s in subscribers {
+        state.notify_hub.wake(&s);
+    }
+}
+
+/// After a po-k (re)registers, replay the events it persisted while the uplink
+/// was down into any subscription that is still waiting on one of its sessions.
+/// Uniqueness on `(sub_id, seq, kind)` makes this idempotent, so replaying a
+/// window we already delivered is a no-op.
+fn spawn_replay(state: &XState, pok_id: &str) {
+    let state = state.clone();
+    let pok_id = pok_id.to_string();
+    tokio::spawn(async move {
+        let subs_list = match subs::all_active(&state.db).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "replay: cannot list subscriptions");
+                return;
+            }
+        };
+        for sub in subs_list {
+            if state.registry.pok_for_session(&sub.sid).as_deref() != Some(pok_id.as_str()) {
+                continue;
+            }
+            let events = crate::routed::replay_events(&state, &pok_id, &sub.sid, sub.cursor).await;
+            if events.is_empty() {
+                continue;
+            }
+            let mut woken = Vec::new();
+            for ev in &events {
+                let kind = ev.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                let seq = ev.get("seq").and_then(|s| s.as_i64()).unwrap_or(0);
+                let ts = ev.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+                match subs::match_event(&state.db, &sub.sid, kind, seq, ts, ev).await {
+                    Ok(w) => woken.extend(w),
+                    Err(e) => tracing::warn!(sid = %sub.sid, error = %e, "replay match failed"),
+                }
+            }
+            if !woken.is_empty() {
+                tracing::info!(
+                    sid = %sub.sid, pok_id = %pok_id, replayed = events.len(),
+                    "replayed missed events into subscription"
+                );
+                wake_all(&state, woken);
+            }
+        }
+    });
+}
+
 async fn inbound(
     state: &XState,
     tx: &mpsc::UnboundedSender<WsMsg>,
@@ -123,7 +193,10 @@ async fn inbound(
                         .await;
                     }
                     tracing::info!(pok_id = %id, hostname = %hostname, projects = projects.len(), "po-k registered");
-                    let _ = tx.send(WsMsg::Registered { pok_id: id });
+                    let _ = tx.send(WsMsg::Registered { pok_id: id.clone() });
+                    // Catch subscriptions up on anything this po-k persisted
+                    // while it was disconnected.
+                    spawn_replay(state, &id);
                 }
                 Err(existing_pok_id) => {
                     tracing::warn!(
@@ -186,6 +259,7 @@ async fn inbound(
                         .await;
                 }
             }
+            deliver(state, &sid, &event).await;
         }
         WsMsg::StatusUpdate { sid, status } => {
             let _ = sqlx::query("UPDATE xpok_sessions SET status = ?1 WHERE sid = ?2")
@@ -193,6 +267,10 @@ async fn inbound(
                 .bind(&sid)
                 .execute(&state.db)
                 .await;
+            match subs::match_status(&state.db, &sid, &status).await {
+                Ok(woken) => wake_all(state, woken),
+                Err(e) => tracing::warn!(sid, error = %e, "status notification match failed"),
+            }
         }
         WsMsg::Error {
             request_id: Some(rid),

@@ -24,11 +24,23 @@ pub async fn status(state: &AppState, sid: &str) -> CoreResult<CoreResponse> {
         "session_id": sid,
         "status": st.as_str(),
         "cursor": session.last_event_seq,
+        "boundary_cursor": deciding_seq.unwrap_or(0),
         "deciding_event": deciding,
         "ended_at": session.ended_at,
     })))
 }
 
+/// Block until the session reaches a turn boundary newer than `since`.
+///
+/// **Cursor contract.** `since` is compared against the *boundary* seq (the
+/// deciding `stop` / notification / lifecycle event), NOT against the tail of
+/// the event stream. The two differ routinely: the JSONL tailer flushes a
+/// turn's final `assistant_message` after the Stop hook, so `cursor`
+/// (= `last_event_seq`) is usually greater than the boundary. Re-arming a wait
+/// with the tail `cursor` therefore blocks until the *next* boundary even
+/// though the session is already idle. Callers must re-arm with
+/// `boundary_cursor` (returned here and by `status`), or with the `cursor`
+/// captured by `POST /messages` *before* the prompt was written.
 pub async fn wait(
     state: &AppState,
     sid: &str,
@@ -66,6 +78,7 @@ pub async fn wait(
                 "session_id": sid,
                 "status": st.as_str(),
                 "cursor": cursor,
+                "boundary_cursor": deciding_seq.unwrap_or(since),
                 "deciding_event": deciding,
             })));
         }
@@ -77,6 +90,7 @@ pub async fn wait(
                 "session_id": sid,
                 "status": st.as_str(),
                 "cursor": cursor,
+                "boundary_cursor": deciding_seq.unwrap_or(since),
                 "deciding_event": deciding,
                 "timed_out": true,
             })));
