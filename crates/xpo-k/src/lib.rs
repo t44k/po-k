@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod cmd;
 pub mod config;
+pub mod deliver;
 pub mod http;
 pub mod live;
 pub mod merge;

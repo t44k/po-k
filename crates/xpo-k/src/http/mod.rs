@@ -25,7 +25,7 @@ pub fn router(state: XState) -> Router {
         )
         .route(
             "/subscriptions/{id}",
-            axum::routing::delete(subscriptions::delete),
+            axum::routing::delete(subscriptions::delete).patch(subscriptions::update),
         )
         .route("/notifications", get(subscriptions::poll))
         .route("/notifications/ack", post(subscriptions::ack))

@@ -110,7 +110,7 @@ pub async fn help() -> Json<Value> {
                 "method": "POST",
                 "path": "/subscriptions",
                 "auth": true,
-                "description": "Register interest in a session so completions are queued even when no call is blocked. Body: {session_id, subscriber?, kinds?, statuses?, ttl_secs?, cursor?}. Cursor defaults to the session's current event seq (only NEW events notify); pass cursor:0 to include history. Served by Xpo-k, no po-k round trip except the cursor lookup."
+                "description": "Register interest in a session so completions are queued even when no call is blocked. Body: {session_id, subscriber?, kinds?, statuses?, ttl_secs?, cursor?, deliver?}. Cursor defaults to the session's current event seq (only NEW events notify); pass cursor:0 to include history. `deliver: {url, secret_env|secret_file}` enables webhook push to Hermes: metadata only (no CC prose), HMAC-SHA256 over the exact body in X-Webhook-Signature, X-Request-ID = notification id. The secret is referenced by env-var name or file path and is never stored, logged, or returned."
             },
             {
                 "method": "GET",
@@ -125,10 +125,16 @@ pub async fn help() -> Json<Value> {
                 "description": "Unsubscribe and drop that subscription's queued notifications."
             },
             {
+                "method": "PATCH",
+                "path": "/subscriptions/{id}",
+                "auth": true,
+                "description": "Change the webhook push target. Body: {deliver: {url, secret_env|secret_file}} or {clear_deliver: true} to go poll-only. Kinds/statuses/cursor are immutable — re-subscribe to change them."
+            },
+            {
                 "method": "GET",
                 "path": "/notifications",
                 "auth": true,
-                "description": "Pending (unacked) notifications, oldest first. Optional query: subscriber, session_id, limit (default 20, max 500), wait (long-poll seconds, max 60; requires subscriber). Reading never consumes — a notification stays pending until acked, so delivery is at-least-once."
+                "description": "Pending (unacked) notifications, oldest first. Optional query: subscriber, session_id, limit (default 20, max 500), wait (long-poll seconds, max 60; requires subscriber). Reading never consumes — a notification stays pending until acked, so delivery is at-least-once. Webhook push and this poll are independent: a pushed notification is still pending here until the woken turn acks it, which is what makes the cron fallback able to recover a failed push."
             },
             {
                 "method": "POST",

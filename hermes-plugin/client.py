@@ -191,7 +191,10 @@ class XpokClient:
         statuses: Optional[list] = None,
         ttl_secs: Optional[int] = None,
         cursor: Optional[int] = None,
+        deliver: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        # `deliver` is {url, secret_env|secret_file} — a *reference* to the HMAC
+        # secret. Xpo-k refuses an inline secret, so none is ever sent here.
         body: Dict[str, Any] = {"session_id": sid, "subscriber": subscriber}
         if kinds:
             body["kinds"] = kinds
@@ -201,7 +204,22 @@ class XpokClient:
             body["ttl_secs"] = ttl_secs
         if cursor is not None:
             body["cursor"] = cursor
+        if deliver:
+            body["deliver"] = deliver
         return self._post("/subscriptions", body)
+
+    def set_subscription_delivery(
+        self,
+        subscription_id: str,
+        *,
+        deliver: Optional[Dict[str, Any]] = None,
+        clear: bool = False,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"clear_deliver": True} if clear else {"deliver": deliver or {}}
+        url = f"{self.base_url}/subscriptions/{subscription_id}"
+        r = requests.patch(url, headers=self._headers(), json=body, timeout=_DEFAULT_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
 
     def list_subscriptions(self, *, subscriber: str = "", sid: str = "",
                            timeout: int = _DEFAULT_TIMEOUT) -> Dict[str, Any]:

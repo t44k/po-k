@@ -53,7 +53,12 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     cursor      INTEGER NOT NULL DEFAULT 0,  -- advanced on ACK only
     created_at  TEXT NOT NULL,
     ttl_secs    INTEGER NOT NULL,       -- the configured lifetime, reused on refresh
-    expires_at  INTEGER NOT NULL        -- unix epoch seconds
+    expires_at  INTEGER NOT NULL,       -- unix epoch seconds
+    -- M16 webhook push. Only the *name* of the env var / path of the file
+    -- holding the HMAC secret is persisted — never the secret itself.
+    deliver_url         TEXT,
+    deliver_secret_env  TEXT,
+    deliver_secret_file TEXT
 );
 CREATE INDEX IF NOT EXISTS subscriptions_by_sid ON subscriptions (sid);
 CREATE INDEX IF NOT EXISTS subscriptions_by_subscriber ON subscriptions (subscriber);
@@ -68,8 +73,18 @@ CREATE TABLE IF NOT EXISTS notifications (
     status      TEXT,
     payload     TEXT,
     created_at  TEXT NOT NULL,
-    acked_at    TEXT
+    acked_at    TEXT,
+    -- M16 webhook push. Delivery is independent of ack: a delivered
+    -- notification is still pending until the woken turn acks it, and a failed
+    -- delivery leaves it pollable by the cron fallback.
+    delivery_state      TEXT NOT NULL DEFAULT 'none',  -- none|pending|delivered|failed
+    delivery_attempts   INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     INTEGER,                        -- unix epoch seconds
+    last_delivery_error TEXT,
+    delivered_at        TEXT
 );
+CREATE INDEX IF NOT EXISTS notifications_due
+    ON notifications (delivery_state, next_attempt_at);
 -- Delivery is at-least-once; this makes re-delivery of an already-queued
 -- sequenced event a no-op (replay after reconnect, duplicate push, retry).
 CREATE UNIQUE INDEX IF NOT EXISTS notifications_unique_seq

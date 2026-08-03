@@ -652,3 +652,525 @@ async fn subscription_endpoints_require_auth() {
         .unwrap();
     assert_eq!(r.status(), 400);
 }
+
+// ---------------------------------------------------------------------------
+// M16: webhook push. A stub receiver stands in for Hermes' webhook adapter —
+// same contract (HMAC over the exact body, X-Request-ID idempotency, 2xx /
+// duplicate responses), no network beyond loopback.
+// ---------------------------------------------------------------------------
+
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct Received {
+    /// (signature, request_id, raw_body)
+    calls: Vec<(String, String, String)>,
+}
+
+/// Behaviour the stub should exhibit for each request, in order.
+#[derive(Clone, Copy)]
+enum StubReply {
+    Accept,
+    Duplicate,
+    ServerError,
+    Unauthorized,
+}
+
+async fn start_stub_receiver(replies: Vec<StubReply>) -> (SocketAddr, Arc<Mutex<Received>>) {
+    let seen: Arc<Mutex<Received>> = Arc::new(Mutex::new(Received::default()));
+    let seen_clone = seen.clone();
+    let replies = Arc::new(Mutex::new(
+        replies
+            .into_iter()
+            .collect::<std::collections::VecDeque<_>>(),
+    ));
+    let app = axum::Router::new().route(
+        "/webhooks/pok",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let seen = seen_clone.clone();
+            let replies = replies.clone();
+            async move {
+                let sig = headers
+                    .get("x-webhook-signature")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let rid = headers
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                seen.lock().unwrap().calls.push((sig, rid, body));
+                let reply = replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(StubReply::Accept);
+                match reply {
+                    StubReply::Accept => (
+                        axum::http::StatusCode::ACCEPTED,
+                        axum::Json(serde_json::json!({"status": "accepted"})),
+                    ),
+                    StubReply::Duplicate => (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({"status": "duplicate"})),
+                    ),
+                    StubReply::ServerError => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({"error": "boom"})),
+                    ),
+                    StubReply::Unauthorized => (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({"error": "bad signature"})),
+                    ),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, seen)
+}
+
+/// Expected HMAC-SHA256, computed independently of the implementation under
+/// test (same crates, separate code path).
+fn expected_sig(secret: &str, body: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+async fn subscribe_with_webhook(
+    base: &str,
+    client: &reqwest::Client,
+    receiver: SocketAddr,
+    subscriber: &str,
+) -> serde_json::Value {
+    client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "session_id": "s1",
+            "subscriber": subscriber,
+            "cursor": 0,
+            "deliver": {
+                "url": format!("http://{receiver}/webhooks/pok"),
+                "secret_env": "POK_TEST_WEBHOOK_SECRET"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn webhook_push_signs_the_exact_body_and_sends_the_notification_id() {
+    std::env::set_var("POK_TEST_WEBHOOK_SECRET", "hmac-test-secret");
+    let (addr, state) = start_server().await;
+    let (mut sink, _stream) = connect_fake_pok(addr).await;
+    let (recv_addr, seen) = start_stub_receiver(vec![StubReply::Accept]).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let sub = subscribe_with_webhook(&base, &client, recv_addr, "push-a").await;
+    assert_eq!(sub["deliver"]["mode"], "webhook");
+    assert_eq!(sub["deliver"]["secret_source"], "env");
+    assert_eq!(sub["deliver"]["secret_ref"], "POK_TEST_WEBHOOK_SECRET");
+    let raw = serde_json::to_string(&sub).unwrap();
+    assert!(
+        !raw.contains("hmac-test-secret"),
+        "secret leaked into the response"
+    );
+
+    // po-k forwards a completion, carrying CC prose in the payload.
+    let ev = WsMsg::SessionEvent {
+        sid: "s1".into(),
+        event: pok_proto::EventEnvelope {
+            kind: "stop".into(),
+            payload: serde_json::json!({"last_assistant_message": "TOP SECRET PROSE"}),
+            seq: 214,
+            ts: "2026-08-03T10:00:00Z".into(),
+        },
+    };
+    sink.send(Message::Text(serde_json::to_string(&ev).unwrap()))
+        .await
+        .unwrap();
+
+    // The delivery loop is driven explicitly so the test is deterministic.
+    let http = reqwest::Client::new();
+    let mut delivered = 0;
+    for _ in 0..40 {
+        let (_attempted, d) = xpo_k::deliver::run_pass(&state, &http).await;
+        delivered += d;
+        if delivered > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(delivered, 1, "the push must go out");
+
+    let calls = seen.lock().unwrap().calls.clone();
+    assert_eq!(calls.len(), 1);
+    let (sig, rid, body) = &calls[0];
+
+    // Signature covers the exact bytes the receiver got.
+    assert_eq!(
+        *sig,
+        expected_sig("hmac-test-secret", body),
+        "HMAC mismatch"
+    );
+    // X-Request-ID is the notification id → the adapter can dedupe on it.
+    let pending: serde_json::Value = client
+        .get(format!("{base}/notifications?subscriber=push-a"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ntf = &pending["notifications"][0];
+    assert_eq!(rid, ntf["id"].as_str().unwrap());
+    // Metadata only — no CC prose in the push body.
+    assert!(
+        !body.contains("TOP SECRET PROSE"),
+        "CC prose pushed: {body}"
+    );
+    assert!(!body.contains("last_assistant_message"));
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(parsed["event_type"], "pok_notification");
+    assert_eq!(parsed["session_id"], "s1");
+    assert_eq!(parsed["seq"], 214);
+    assert_eq!(parsed["kind"], "stop");
+    assert_eq!(parsed["notification_id"], ntf["id"]);
+
+    // Delivered ≠ handled: still pending until the woken turn acks.
+    assert_eq!(pending["count"], 1, "a pushed notification stays pollable");
+    assert_eq!(ntf["delivery_state"], "delivered");
+
+    // A second pass must not re-push (idempotent success handling).
+    let (attempted, _) = xpo_k::deliver::run_pass(&state, &http).await;
+    assert_eq!(attempted, 0, "delivered rows are not retried");
+    assert_eq!(seen.lock().unwrap().calls.len(), 1);
+}
+
+#[tokio::test]
+async fn webhook_duplicate_response_counts_as_delivered() {
+    std::env::set_var("POK_TEST_WEBHOOK_SECRET", "hmac-test-secret");
+    let (addr, state) = start_server().await;
+    let (mut sink, _stream) = connect_fake_pok(addr).await;
+    let (recv_addr, seen) = start_stub_receiver(vec![StubReply::Duplicate]).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    subscribe_with_webhook(&base, &client, recv_addr, "push-dup").await;
+
+    let ev = WsMsg::SessionEvent {
+        sid: "s1".into(),
+        event: pok_proto::EventEnvelope {
+            kind: "stop".into(),
+            payload: serde_json::Value::Null,
+            seq: 9,
+            ts: "t".into(),
+        },
+    };
+    sink.send(Message::Text(serde_json::to_string(&ev).unwrap()))
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    let mut delivered = 0;
+    for _ in 0..40 {
+        let (_a, d) = xpo_k::deliver::run_pass(&state, &http).await;
+        delivered += d;
+        if delivered > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(delivered, 1, "duplicate is success — Hermes already has it");
+    assert_eq!(seen.lock().unwrap().calls.len(), 1);
+    // No second turn can be created, and no retry storm follows.
+    let (attempted, _) = xpo_k::deliver::run_pass(&state, &http).await;
+    assert_eq!(attempted, 0);
+}
+
+#[tokio::test]
+async fn webhook_failure_retries_with_backoff_and_keeps_it_pollable() {
+    std::env::set_var("POK_TEST_WEBHOOK_SECRET", "hmac-test-secret");
+    let (addr, state) = start_server().await;
+    let (mut sink, _stream) = connect_fake_pok(addr).await;
+    let (recv_addr, seen) = start_stub_receiver(vec![StubReply::ServerError]).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    subscribe_with_webhook(&base, &client, recv_addr, "push-fail").await;
+
+    let ev = WsMsg::SessionEvent {
+        sid: "s1".into(),
+        event: pok_proto::EventEnvelope {
+            kind: "stop".into(),
+            payload: serde_json::Value::Null,
+            seq: 11,
+            ts: "t".into(),
+        },
+    };
+    sink.send(Message::Text(serde_json::to_string(&ev).unwrap()))
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    let mut attempted_total = 0;
+    for _ in 0..40 {
+        let (a, _d) = xpo_k::deliver::run_pass(&state, &http).await;
+        attempted_total += a;
+        if attempted_total > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(attempted_total, 1);
+    assert_eq!(seen.lock().unwrap().calls.len(), 1, "one attempt so far");
+
+    // Backoff: not retried immediately…
+    let (again, _) = xpo_k::deliver::run_pass(&state, &http).await;
+    assert_eq!(again, 0, "must wait for the backoff window");
+    assert_eq!(seen.lock().unwrap().calls.len(), 1);
+
+    // …and the notification is untouched from the agent's point of view, so the
+    // cron fallback still delivers it.
+    let pending: serde_json::Value = client
+        .get(format!("{base}/notifications?subscriber=push-fail"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending["count"], 1);
+    assert_eq!(pending["notifications"][0]["delivery_state"], "pending");
+    assert_eq!(pending["notifications"][0]["delivery_attempts"], 1);
+
+    // The operator can see it in the subscription listing.
+    let subs: serde_json::Value = client
+        .get(format!("{base}/subscriptions?subscriber=push-fail"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(subs["subscriptions"][0]["delivery"]["delivery_pending"], 1);
+    assert_eq!(subs["subscriptions"][0]["delivery"]["unacked"], 1);
+    // …and the listing never exposes the secret.
+    let raw = serde_json::to_string(&subs).unwrap();
+    assert!(!raw.contains("hmac-test-secret"));
+    assert_eq!(subs["subscriptions"][0]["deliver"]["mode"], "webhook");
+}
+
+#[tokio::test]
+async fn a_permanent_rejection_parks_the_delivery_without_acking() {
+    std::env::set_var("POK_TEST_WEBHOOK_SECRET", "hmac-test-secret");
+    let (addr, state) = start_server().await;
+    let (mut sink, _stream) = connect_fake_pok(addr).await;
+    let (recv_addr, _seen) = start_stub_receiver(vec![StubReply::Unauthorized]).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    subscribe_with_webhook(&base, &client, recv_addr, "push-401").await;
+
+    let ev = WsMsg::SessionEvent {
+        sid: "s1".into(),
+        event: pok_proto::EventEnvelope {
+            kind: "stop".into(),
+            payload: serde_json::Value::Null,
+            seq: 3,
+            ts: "t".into(),
+        },
+    };
+    sink.send(Message::Text(serde_json::to_string(&ev).unwrap()))
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    for _ in 0..40 {
+        let (a, _d) = xpo_k::deliver::run_pass(&state, &http).await;
+        if a > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let pending: serde_json::Value = client
+        .get(format!("{base}/notifications?subscriber=push-401"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        pending["count"], 1,
+        "still pollable — cron fallback recovers it"
+    );
+    assert_eq!(pending["notifications"][0]["delivery_state"], "failed");
+    // No further attempts are made against a misconfigured route.
+    let (attempted, _) = xpo_k::deliver::run_pass(&state, &http).await;
+    assert_eq!(attempted, 0);
+}
+
+#[tokio::test]
+async fn subscription_delivery_target_is_patchable_and_validated() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Poll-only to start with.
+    let sub: serde_json::Value = client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"session_id": "s1", "subscriber": "patch-me", "cursor": 0}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sub["deliver"]["mode"], "poll");
+    let id = sub["subscription_id"].as_str().unwrap().to_string();
+
+    // A target without a secret reference is refused outright.
+    let bad = client
+        .patch(format!("{base}/subscriptions/{id}"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"deliver": {"url": "http://127.0.0.1:9/webhooks/pok"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    // So is a non-http scheme.
+    let bad2 = client
+        .patch(format!("{base}/subscriptions/{id}"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "deliver": {"url": "file:///etc/passwd", "secret_env": "X"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad2.status(), 400);
+
+    // A valid target switches the mode…
+    let ok: serde_json::Value = client
+        .patch(format!("{base}/subscriptions/{id}"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "deliver": {"url": "http://127.0.0.1:9/webhooks/pok", "secret_env": "POK_TEST_WEBHOOK_SECRET"}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ok["deliver"]["mode"], "webhook");
+
+    // …and clear_deliver takes it back to poll-only.
+    let cleared: serde_json::Value = client
+        .patch(format!("{base}/subscriptions/{id}"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"clear_deliver": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cleared["deliver"]["mode"], "poll");
+
+    // Unknown id → 404, and the endpoint is behind auth.
+    let missing = client
+        .patch(format!("{base}/subscriptions/sub-nope"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"clear_deliver": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    let unauth = client
+        .patch(format!("{base}/subscriptions/{id}"))
+        .json(&serde_json::json!({"clear_deliver": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), 401);
+}
+
+#[tokio::test]
+async fn a_missing_secret_is_a_config_error_not_a_retry_storm() {
+    std::env::remove_var("POK_TEST_MISSING_SECRET");
+    let (addr, state) = start_server().await;
+    let (mut sink, _stream) = connect_fake_pok(addr).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    client
+        .post(format!("{base}/subscriptions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({
+            "session_id": "s1", "subscriber": "no-secret", "cursor": 0,
+            "deliver": {"url": "http://127.0.0.1:9/webhooks/pok",
+                        "secret_env": "POK_TEST_MISSING_SECRET"}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let ev = WsMsg::SessionEvent {
+        sid: "s1".into(),
+        event: pok_proto::EventEnvelope {
+            kind: "stop".into(),
+            payload: serde_json::Value::Null,
+            seq: 2,
+            ts: "t".into(),
+        },
+    };
+    sink.send(Message::Text(serde_json::to_string(&ev).unwrap()))
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    for _ in 0..40 {
+        let (a, _d) = xpo_k::deliver::run_pass(&state, &http).await;
+        if a > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let (attempted, _) = xpo_k::deliver::run_pass(&state, &http).await;
+    assert_eq!(attempted, 0, "a missing secret is not retried in a loop");
+    let pending: serde_json::Value = client
+        .get(format!("{base}/notifications?subscriber=no-secret"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending["count"], 1, "and the cron fallback still has it");
+    assert_eq!(pending["notifications"][0]["delivery_state"], "failed");
+}

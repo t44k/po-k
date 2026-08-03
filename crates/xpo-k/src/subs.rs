@@ -63,6 +63,16 @@ pub struct SubscriptionRow {
     /// short-lived subscription doesn't silently become a 24h one.
     pub ttl_secs: i64,
     pub expires_at: i64,
+    /// Webhook target for push delivery (M16). `None` = poll-only subscription.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deliver_url: Option<String>,
+    /// Name of the env var holding the HMAC secret. The secret itself is never
+    /// persisted, logged, or returned by the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deliver_secret_env: Option<String>,
+    /// Path to a file holding the HMAC secret (alternative to the env var).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deliver_secret_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,6 +86,9 @@ pub struct NotificationRow {
     pub status: Option<String>,
     pub payload: Value,
     pub created_at: String,
+    /// none | pending | delivered | failed (M16). Independent of `acked_at`.
+    pub delivery_state: String,
+    pub delivery_attempts: i64,
 }
 
 type SubTuple = (
@@ -88,10 +101,26 @@ type SubTuple = (
     String,
     i64,
     i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 fn sub_from(t: SubTuple) -> SubscriptionRow {
-    let (id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, expires_at) = t;
+    let (
+        id,
+        subscriber,
+        sid,
+        kinds,
+        statuses,
+        cursor,
+        created_at,
+        ttl_secs,
+        expires_at,
+        deliver_url,
+        deliver_secret_env,
+        deliver_secret_file,
+    ) = t;
     SubscriptionRow {
         id,
         subscriber,
@@ -102,6 +131,9 @@ fn sub_from(t: SubTuple) -> SubscriptionRow {
         created_at,
         ttl_secs,
         expires_at,
+        deliver_url,
+        deliver_secret_env,
+        deliver_secret_file,
     }
 }
 
@@ -109,8 +141,8 @@ fn parse_list(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
-const SUB_COLS: &str =
-    "id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, expires_at";
+const SUB_COLS: &str = "id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, \
+     expires_at, deliver_url, deliver_secret_env, deliver_secret_file";
 
 // ---------------------------------------------------------------------------
 // Long-poll hub
@@ -146,6 +178,33 @@ impl NotifyHub {
 // Subscription CRUD
 // ---------------------------------------------------------------------------
 
+/// Where and how to push notifications for a subscription. The secret is
+/// referenced by env-var name or file path — never by value — so it cannot end
+/// up in the database, a log line, or an API response.
+#[derive(Debug, Clone, Default)]
+pub struct DeliverySpec {
+    pub url: Option<String>,
+    pub secret_env: Option<String>,
+    pub secret_file: Option<String>,
+}
+
+impl DeliverySpec {
+    pub fn is_configured(&self) -> bool {
+        self.url.as_deref().is_some_and(|u| !u.is_empty())
+    }
+
+    /// Which source the secret comes from, for display only.
+    pub fn secret_source(&self) -> &'static str {
+        if self.secret_env.is_some() {
+            "env"
+        } else if self.secret_file.is_some() {
+            "file"
+        } else {
+            "none"
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_subscription(
     db: &Db,
@@ -155,6 +214,7 @@ pub async fn create_subscription(
     statuses: &[String],
     cursor: i64,
     ttl_secs: i64,
+    deliver: &DeliverySpec,
 ) -> Result<SubscriptionRow> {
     let id = format!("sub-{}", Uuid::new_v4());
     let ttl = ttl_secs.clamp(1, MAX_TTL_SECS);
@@ -168,10 +228,15 @@ pub async fn create_subscription(
         created_at: now_iso(),
         ttl_secs: ttl,
         expires_at: now_epoch() + ttl,
+        deliver_url: deliver.url.clone(),
+        deliver_secret_env: deliver.secret_env.clone(),
+        deliver_secret_file: deliver.secret_file.clone(),
     };
     sqlx::query(
-        r#"INSERT INTO subscriptions (id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, expires_at)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"#,
+        r#"INSERT INTO subscriptions
+             (id, subscriber, sid, kinds, statuses, cursor, created_at, ttl_secs, expires_at,
+              deliver_url, deliver_secret_env, deliver_secret_file)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
     )
     .bind(&row.id)
     .bind(&row.subscriber)
@@ -182,6 +247,9 @@ pub async fn create_subscription(
     .bind(&row.created_at)
     .bind(row.ttl_secs)
     .bind(row.expires_at)
+    .bind(&row.deliver_url)
+    .bind(&row.deliver_secret_env)
+    .bind(&row.deliver_secret_file)
     .execute(db)
     .await
     .context("INSERT INTO subscriptions")?;
@@ -217,6 +285,48 @@ pub async fn list_subscriptions(
     .await
     .context("SELECT subscriptions")?;
     Ok(rows.into_iter().map(sub_from).collect())
+}
+
+/// Point a subscription at a webhook target (or clear it). Returns the updated
+/// row, or `None` when the id is unknown.
+///
+/// Clearing leaves already-queued notifications alone: they stay unacked and
+/// pollable, they just stop being pushed.
+pub async fn set_delivery(
+    db: &Db,
+    id: &str,
+    spec: &DeliverySpec,
+) -> Result<Option<SubscriptionRow>> {
+    let res = sqlx::query(
+        r#"UPDATE subscriptions
+           SET deliver_url = ?1, deliver_secret_env = ?2, deliver_secret_file = ?3
+           WHERE id = ?4"#,
+    )
+    .bind(&spec.url)
+    .bind(&spec.secret_env)
+    .bind(&spec.secret_file)
+    .bind(id)
+    .execute(db)
+    .await
+    .context("UPDATE subscription delivery target")?;
+    if res.rows_affected() == 0 {
+        return Ok(None);
+    }
+    // Arm any already-queued rows for the new target so a subscription that was
+    // poll-only starts pushing what it already holds.
+    if spec.is_configured() {
+        sqlx::query(
+            r#"UPDATE notifications
+               SET delivery_state = 'pending', next_attempt_at = ?1
+               WHERE sub_id = ?2 AND acked_at IS NULL AND delivery_state IN ('none', 'failed')"#,
+        )
+        .bind(now_epoch())
+        .bind(id)
+        .execute(db)
+        .await
+        .context("UPDATE notifications for new delivery target")?;
+    }
+    get_subscription(db, id).await
 }
 
 /// Subscriptions for one session that haven't expired.
@@ -347,6 +457,14 @@ async fn enqueue(
             return Ok(None);
         }
     }
+    // A subscription with a webhook target starts its notification in
+    // `pending` so the delivery loop picks it up on its next pass; otherwise
+    // the row is poll-only and never enters the delivery state machine.
+    let (delivery_state, next_attempt_at) = if sub.deliver_url.is_some() {
+        ("pending", Some(now_epoch()))
+    } else {
+        ("none", None)
+    };
     let row = NotificationRow {
         id: format!("ntf-{}", Uuid::new_v4()),
         subscription_id: sub.id.clone(),
@@ -357,11 +475,14 @@ async fn enqueue(
         status: status.map(String::from),
         payload: payload.clone(),
         created_at: now_iso(),
+        delivery_state: delivery_state.to_string(),
+        delivery_attempts: 0,
     };
     let res = sqlx::query(
         r#"INSERT OR IGNORE INTO notifications
-             (id, sub_id, subscriber, sid, seq, kind, status, payload, created_at, acked_at)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL)"#,
+             (id, sub_id, subscriber, sid, seq, kind, status, payload, created_at, acked_at,
+              delivery_state, delivery_attempts, next_attempt_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10,0,?11)"#,
     )
     .bind(&row.id)
     .bind(&row.subscription_id)
@@ -372,6 +493,8 @@ async fn enqueue(
     .bind(&row.status)
     .bind(serde_json::to_string(&row.payload)?)
     .bind(&row.created_at)
+    .bind(&row.delivery_state)
+    .bind(next_attempt_at)
     .execute(db)
     .await
     .context("INSERT INTO notifications")?;
@@ -461,10 +584,24 @@ type NotifTuple = (
     Option<String>,
     Option<String>,
     String,
+    String,
+    i64,
 );
 
 fn notif_from(t: NotifTuple) -> NotificationRow {
-    let (id, sub_id, subscriber, sid, seq, kind, status, payload, created_at) = t;
+    let (
+        id,
+        sub_id,
+        subscriber,
+        sid,
+        seq,
+        kind,
+        status,
+        payload,
+        created_at,
+        delivery_state,
+        delivery_attempts,
+    ) = t;
     NotificationRow {
         id,
         subscription_id: sub_id,
@@ -477,10 +614,13 @@ fn notif_from(t: NotifTuple) -> NotificationRow {
             .and_then(|p| serde_json::from_str(&p).ok())
             .unwrap_or(Value::Null),
         created_at,
+        delivery_state,
+        delivery_attempts,
     }
 }
 
-const NOTIF_COLS: &str = "id, sub_id, subscriber, sid, seq, kind, status, payload, created_at";
+const NOTIF_COLS: &str = "id, sub_id, subscriber, sid, seq, kind, status, payload, created_at, \
+     delivery_state, delivery_attempts";
 
 /// Unacked notifications, oldest first.
 pub async fn pending(
@@ -503,6 +643,148 @@ pub async fn pending(
     .await
     .context("SELECT pending notifications")?;
     Ok(rows.into_iter().map(notif_from).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Webhook delivery state (M16)
+// ---------------------------------------------------------------------------
+
+/// A `notifications` row joined with its subscription's delivery target.
+/// `NotifTuple` fields first (so `notif_from` can consume them), then
+/// `deliver_url`, `deliver_secret_env`, `deliver_secret_file`.
+type DueTuple = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// One notification that is due for a webhook push, with everything the
+/// delivery worker needs — including the *reference* to the secret, never the
+/// secret itself.
+#[derive(Debug, Clone)]
+pub struct DueDelivery {
+    pub notification: NotificationRow,
+    pub url: String,
+    pub secret_env: Option<String>,
+    pub secret_file: Option<String>,
+}
+
+/// Notifications whose push is due now.
+///
+/// Requirements, all enforced in SQL so a restart resumes correctly:
+/// * the notification is still **unacked** (a handled one needs no push),
+/// * its delivery is `pending` and `next_attempt_at` has passed,
+/// * the owning subscription still exists, has a webhook target, and has not
+///   expired.
+pub async fn due_deliveries(db: &Db, now: i64, limit: i64) -> Result<Vec<DueDelivery>> {
+    let rows: Vec<DueTuple> = sqlx::query_as(
+        r#"SELECT n.id, n.sub_id, n.subscriber, n.sid, n.seq, n.kind, n.status, n.payload,
+                  n.created_at, n.delivery_state, n.delivery_attempts,
+                  s.deliver_url, s.deliver_secret_env, s.deliver_secret_file
+           FROM notifications n
+           JOIN subscriptions s ON s.id = n.sub_id
+           WHERE n.acked_at IS NULL
+             AND n.delivery_state = 'pending'
+             AND IFNULL(n.next_attempt_at, 0) <= ?1
+             AND s.deliver_url IS NOT NULL
+             AND s.expires_at > ?1
+           ORDER BY IFNULL(n.next_attempt_at, 0), n.rowid
+           LIMIT ?2"#,
+    )
+    .bind(now)
+    .bind(limit.clamp(1, 200))
+    .fetch_all(db)
+    .await
+    .context("SELECT due deliveries")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| DueDelivery {
+            notification: notif_from((r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10)),
+            url: r.11,
+            secret_env: r.12,
+            secret_file: r.13,
+        })
+        .collect())
+}
+
+/// Mark a push as delivered. Deliberately does NOT touch `acked_at`: delivery
+/// means "Hermes was told", acking means "Hermes handled it".
+pub async fn mark_delivered(db: &Db, id: &str) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE notifications
+           SET delivery_state = 'delivered', delivered_at = ?1,
+               delivery_attempts = delivery_attempts + 1,
+               next_attempt_at = NULL, last_delivery_error = NULL
+           WHERE id = ?2"#,
+    )
+    .bind(now_iso())
+    .bind(id)
+    .execute(db)
+    .await
+    .context("UPDATE notification delivered")?;
+    Ok(())
+}
+
+/// Record a failed attempt. `retry_at = None` parks the row as `failed` (either
+/// a permanent rejection or the attempt budget is spent) — the notification
+/// stays **unacked and pollable**, so the cron fallback still delivers it.
+pub async fn record_failure(db: &Db, id: &str, error: &str, retry_at: Option<i64>) -> Result<()> {
+    let state = if retry_at.is_some() {
+        "pending"
+    } else {
+        "failed"
+    };
+    // Truncate: the error text is operator-facing, not a log sink.
+    let err: String = error.chars().take(300).collect();
+    sqlx::query(
+        r#"UPDATE notifications
+           SET delivery_state = ?1, delivery_attempts = delivery_attempts + 1,
+               next_attempt_at = ?2, last_delivery_error = ?3
+           WHERE id = ?4"#,
+    )
+    .bind(state)
+    .bind(retry_at)
+    .bind(err)
+    .bind(id)
+    .execute(db)
+    .await
+    .context("UPDATE notification delivery failure")?;
+    Ok(())
+}
+
+/// Operator view of a notification's delivery state (for `GET /subscriptions`).
+pub async fn delivery_summary(db: &Db, sub_id: &str) -> Result<Value> {
+    let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+        r#"SELECT
+             SUM(CASE WHEN delivery_state = 'pending'   THEN 1 ELSE 0 END),
+             SUM(CASE WHEN delivery_state = 'delivered' THEN 1 ELSE 0 END),
+             SUM(CASE WHEN delivery_state = 'failed'    THEN 1 ELSE 0 END),
+             SUM(CASE WHEN acked_at IS NULL             THEN 1 ELSE 0 END)
+           FROM notifications WHERE sub_id = ?1"#,
+    )
+    .bind(sub_id)
+    .fetch_optional(db)
+    .await
+    .context("SELECT delivery summary")?;
+    let (p, d, f, u) = row.unwrap_or((0, 0, 0, 0));
+    Ok(json!({
+        "delivery_pending": p,
+        "delivered": d,
+        "delivery_failed": f,
+        "unacked": u,
+    }))
 }
 
 /// Ack notifications by id. Idempotent: an id that is unknown or already acked
@@ -570,9 +852,38 @@ mod tests {
     }
 
     async fn sub_for(db: &Db, sid: &str, cursor: i64) -> SubscriptionRow {
-        create_subscription(db, "hermes-1", sid, &[], &[], cursor, DEFAULT_TTL_SECS)
-            .await
-            .unwrap()
+        create_subscription(
+            db,
+            "hermes-1",
+            sid,
+            &[],
+            &[],
+            cursor,
+            DEFAULT_TTL_SECS,
+            &DeliverySpec::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A subscription with a webhook target (secret referenced, never stored).
+    async fn push_sub(db: &Db, sid: &str) -> SubscriptionRow {
+        create_subscription(
+            db,
+            "hermes-1",
+            sid,
+            &[],
+            &[],
+            0,
+            DEFAULT_TTL_SECS,
+            &DeliverySpec {
+                url: Some("http://127.0.0.1:9/webhooks/pok".into()),
+                secret_env: Some("POK_WEBHOOK_SECRET".into()),
+                secret_file: None,
+            },
+        )
+        .await
+        .unwrap()
     }
 
     fn ev() -> Value {
@@ -629,6 +940,7 @@ mod tests {
             &[],
             0,
             DEFAULT_TTL_SECS,
+            &DeliverySpec::default(),
         )
         .await
         .unwrap();
@@ -774,9 +1086,18 @@ mod tests {
     async fn list_and_delete_subscriptions() {
         let (db, _d) = fresh_db().await;
         let a = sub_for(&db, "s1", 0).await;
-        create_subscription(&db, "other", "s2", &[], &[], 0, DEFAULT_TTL_SECS)
-            .await
-            .unwrap();
+        create_subscription(
+            &db,
+            "other",
+            "s2",
+            &[],
+            &[],
+            0,
+            DEFAULT_TTL_SECS,
+            &DeliverySpec::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(list_subscriptions(&db, None, None).await.unwrap().len(), 2);
         assert_eq!(
             list_subscriptions(&db, Some("hermes-1"), None)
@@ -809,9 +1130,18 @@ mod tests {
     async fn sweep_removes_expired_subscriptions_and_their_notifications() {
         let (db, _d) = fresh_db().await;
         // Expired 60s ago (deterministic: the TTL is written, not slept through).
-        let expired = create_subscription(&db, "hermes-1", "s1", &[], &[], 0, 1)
-            .await
-            .unwrap();
+        let expired = create_subscription(
+            &db,
+            "hermes-1",
+            "s1",
+            &[],
+            &[],
+            0,
+            1,
+            &DeliverySpec::default(),
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE subscriptions SET expires_at = ?1 WHERE id = ?2")
             .bind(store::now_epoch() - 60)
             .bind(&expired.id)
@@ -899,9 +1229,18 @@ mod tests {
     #[tokio::test]
     async fn ack_refreshes_with_the_configured_ttl() {
         let (db, _d) = fresh_db().await;
-        let short = create_subscription(&db, "hermes-1", "s1", &[], &[], 0, 120)
-            .await
-            .unwrap();
+        let short = create_subscription(
+            &db,
+            "hermes-1",
+            "s1",
+            &[],
+            &[],
+            0,
+            120,
+            &DeliverySpec::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(short.ttl_secs, 120);
         match_event(&db, "s1", "stop", 4, "t", &ev()).await.unwrap();
         let ids: Vec<String> = pending(&db, None, None, 10)
@@ -975,14 +1314,279 @@ mod tests {
         );
     }
 
+    // --- M16: webhook delivery state ---
+
+    #[tokio::test]
+    async fn poll_only_subscriptions_never_enter_the_delivery_queue() {
+        let (db, _d) = fresh_db().await;
+        sub_for(&db, "s1", 0).await;
+        match_event(&db, "s1", "stop", 5, "t", &ev()).await.unwrap();
+        let pend = pending(&db, None, None, 10).await.unwrap();
+        assert_eq!(pend[0].delivery_state, "none");
+        assert!(due_deliveries(&db, now_epoch(), 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_webhook_subscription_queues_the_notification_for_push() {
+        let (db, _d) = fresh_db().await;
+        let sub = push_sub(&db, "s1").await;
+        // The secret reference is persisted; the value never is.
+        assert_eq!(
+            sub.deliver_secret_env.as_deref(),
+            Some("POK_WEBHOOK_SECRET")
+        );
+        assert!(sub.deliver_url.is_some());
+
+        match_event(&db, "s1", "stop", 5, "t", &ev()).await.unwrap();
+        let due = due_deliveries(&db, now_epoch(), 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].notification.seq, 5);
+        assert_eq!(due[0].secret_env.as_deref(), Some("POK_WEBHOOK_SECRET"));
+        assert_eq!(due[0].notification.delivery_state, "pending");
+        assert_eq!(due[0].notification.delivery_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn mark_delivered_does_not_ack() {
+        let (db, _d) = fresh_db().await;
+        push_sub(&db, "s1").await;
+        match_event(&db, "s1", "stop", 5, "t", &ev()).await.unwrap();
+        let id = pending(&db, None, None, 10).await.unwrap()[0].id.clone();
+        mark_delivered(&db, &id).await.unwrap();
+
+        // Delivered → no longer due…
+        assert!(due_deliveries(&db, now_epoch(), 10)
+            .await
+            .unwrap()
+            .is_empty());
+        // …but STILL pending for the agent: push told Hermes, it didn't handle it.
+        let pend = pending(&db, None, None, 10).await.unwrap();
+        assert_eq!(pend.len(), 1, "a delivered notification is still unacked");
+        assert_eq!(pend[0].delivery_state, "delivered");
+        assert_eq!(pend[0].delivery_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn record_failure_reschedules_and_keeps_the_row_pollable() {
+        let (db, _d) = fresh_db().await;
+        push_sub(&db, "s1").await;
+        match_event(&db, "s1", "stop", 5, "t", &ev()).await.unwrap();
+        let id = pending(&db, None, None, 10).await.unwrap()[0].id.clone();
+
+        let retry_at = now_epoch() + 60;
+        record_failure(&db, &id, "HTTP 500: boom", Some(retry_at))
+            .await
+            .unwrap();
+        // Not due until the backoff expires…
+        assert!(due_deliveries(&db, now_epoch(), 10)
+            .await
+            .unwrap()
+            .is_empty());
+        // …and due again afterwards, with the attempt counted.
+        let later = due_deliveries(&db, retry_at, 10).await.unwrap();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].notification.delivery_attempts, 1);
+        assert_eq!(later[0].notification.delivery_state, "pending");
+        // Throughout, the cron fallback can still see it.
+        assert_eq!(pending(&db, None, None, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn giving_up_parks_as_failed_but_never_acks() {
+        let (db, _d) = fresh_db().await;
+        push_sub(&db, "s1").await;
+        match_event(&db, "s1", "stop", 5, "t", &ev()).await.unwrap();
+        let id = pending(&db, None, None, 10).await.unwrap()[0].id.clone();
+
+        record_failure(&db, &id, "gave up", None).await.unwrap();
+        assert!(
+            due_deliveries(&db, now_epoch() + 100_000, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed row is never retried automatically"
+        );
+        let pend = pending(&db, None, None, 10).await.unwrap();
+        assert_eq!(pend.len(), 1, "and the cron fallback still delivers it");
+        assert_eq!(pend[0].delivery_state, "failed");
+    }
+
+    #[tokio::test]
+    async fn error_text_is_bounded() {
+        let (db, _d) = fresh_db().await;
+        push_sub(&db, "s1").await;
+        match_event(&db, "s1", "stop", 5, "t", &ev()).await.unwrap();
+        let id = pending(&db, None, None, 10).await.unwrap()[0].id.clone();
+        record_failure(&db, &id, &"x".repeat(10_000), Some(now_epoch() + 1))
+            .await
+            .unwrap();
+        let stored: (Option<String>,) =
+            sqlx::query_as("SELECT last_delivery_error FROM notifications WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(stored.0.unwrap().len() <= 300);
+    }
+
+    #[tokio::test]
+    async fn acked_and_expired_rows_are_not_pushed() {
+        let (db, _d) = fresh_db().await;
+        // Acked before the push went out (e.g. the cron fallback won the race).
+        push_sub(&db, "s1").await;
+        match_event(&db, "s1", "stop", 5, "t", &ev()).await.unwrap();
+        let id = pending(&db, None, None, 10).await.unwrap()[0].id.clone();
+        ack(&db, std::slice::from_ref(&id)).await.unwrap();
+        assert!(
+            due_deliveries(&db, now_epoch(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an already-handled notification must not be pushed"
+        );
+
+        // Expired subscription: queued row stays, push stops.
+        let expired = push_sub(&db, "s2").await;
+        match_event(&db, "s2", "stop", 5, "t", &ev()).await.unwrap();
+        sqlx::query("UPDATE subscriptions SET expires_at = ?1 WHERE id = ?2")
+            .bind(now_epoch() - 60)
+            .bind(&expired.id)
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(
+            due_deliveries(&db, now_epoch(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an expired subscription must not push"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_deliveries_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.db");
+        let id = {
+            let db = store::open(&path).await.unwrap();
+            push_sub(&db, "s1").await;
+            match_event(&db, "s1", "stop", 7, "t", &ev()).await.unwrap();
+            let id = pending(&db, None, None, 10).await.unwrap()[0].id.clone();
+            // One failed attempt already recorded, retry scheduled in the past.
+            record_failure(&db, &id, "HTTP 503", Some(now_epoch() - 1))
+                .await
+                .unwrap();
+            db.close().await;
+            id
+        };
+        let db2 = store::open(&path).await.unwrap();
+        let due = due_deliveries(&db2, now_epoch(), 10).await.unwrap();
+        assert_eq!(due.len(), 1, "the delivery loop resumes after a restart");
+        assert_eq!(due[0].notification.id, id);
+        assert_eq!(due[0].notification.delivery_attempts, 1);
+        assert_eq!(due[0].secret_env.as_deref(), Some("POK_WEBHOOK_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn due_deliveries_are_ordered_and_batched() {
+        let (db, _d) = fresh_db().await;
+        push_sub(&db, "s1").await;
+        for seq in 1..=5 {
+            match_event(&db, "s1", "stop", seq, "t", &ev())
+                .await
+                .unwrap();
+        }
+        let due = due_deliveries(&db, now_epoch(), 3).await.unwrap();
+        assert_eq!(due.len(), 3, "batch limit honoured");
+        assert_eq!(
+            due.iter().map(|d| d.notification.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "oldest first"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_delivery_switches_modes_and_arms_queued_rows() {
+        let (db, _d) = fresh_db().await;
+        let sub = sub_for(&db, "s1", 0).await; // poll-only
+        match_event(&db, "s1", "stop", 5, "t", &ev()).await.unwrap();
+        assert!(due_deliveries(&db, now_epoch(), 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Point it at a webhook: the already-queued row becomes due.
+        let spec = DeliverySpec {
+            url: Some("http://127.0.0.1:9/webhooks/pok".into()),
+            secret_env: Some("POK_WEBHOOK_SECRET".into()),
+            secret_file: None,
+        };
+        let updated = set_delivery(&db, &sub.id, &spec).await.unwrap().unwrap();
+        assert!(updated.deliver_url.is_some());
+        assert_eq!(due_deliveries(&db, now_epoch(), 10).await.unwrap().len(), 1);
+
+        // Clear it: pushes stop, the notification stays pollable.
+        let cleared = set_delivery(&db, &sub.id, &DeliverySpec::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cleared.deliver_url.is_none());
+        assert!(due_deliveries(&db, now_epoch(), 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(pending(&db, None, None, 10).await.unwrap().len(), 1);
+
+        assert!(set_delivery(&db, "sub-nope", &spec)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn delivery_summary_counts_states() {
+        let (db, _d) = fresh_db().await;
+        let sub = push_sub(&db, "s1").await;
+        for seq in 1..=3 {
+            match_event(&db, "s1", "stop", seq, "t", &ev())
+                .await
+                .unwrap();
+        }
+        let ids: Vec<String> = pending(&db, None, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        mark_delivered(&db, &ids[0]).await.unwrap();
+        record_failure(&db, &ids[1], "nope", None).await.unwrap();
+        let sum = delivery_summary(&db, &sub.id).await.unwrap();
+        assert_eq!(sum["delivered"], 1);
+        assert_eq!(sum["delivery_failed"], 1);
+        assert_eq!(sum["delivery_pending"], 1);
+        assert_eq!(sum["unacked"], 3, "delivery state never implies handled");
+    }
+
     #[tokio::test]
     async fn create_clamps_the_ttl_and_persists_it() {
         let (db, _d) = fresh_db().await;
-        let huge = create_subscription(&db, "h", "s1", &[], &[], 0, MAX_TTL_SECS * 10)
-            .await
-            .unwrap();
+        let huge = create_subscription(
+            &db,
+            "h",
+            "s1",
+            &[],
+            &[],
+            0,
+            MAX_TTL_SECS * 10,
+            &DeliverySpec::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(huge.ttl_secs, MAX_TTL_SECS);
-        let zero = create_subscription(&db, "h", "s2", &[], &[], 0, 0)
+        let zero = create_subscription(&db, "h", "s2", &[], &[], 0, 0, &DeliverySpec::default())
             .await
             .unwrap();
         assert_eq!(

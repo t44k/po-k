@@ -120,11 +120,17 @@ class FakeClient:
         return {"events": [], "next_cursor": offset if offset >= 0 else 0}
 
     def create_subscription(self, sid, *, subscriber, kinds=None, statuses=None,
-                            ttl_secs=None, cursor=None):
+                            ttl_secs=None, cursor=None, deliver=None):
         self.calls.append(("create_subscription", sid, subscriber, kinds, statuses,
-                           ttl_secs, cursor))
+                           ttl_secs, cursor, deliver))
         return {"subscription_id": "sub-1", "session_id": sid, "subscriber": subscriber,
-                "cursor": 20, "cursor_source": "session"}
+                "cursor": 20, "cursor_source": "session",
+                "deliver": {"mode": "webhook" if deliver else "poll"}}
+
+    def set_subscription_delivery(self, subscription_id, *, deliver=None, clear=False):
+        self.calls.append(("set_subscription_delivery", subscription_id, deliver, clear))
+        return {"ok": True, "subscription_id": subscription_id,
+                "deliver": {"mode": "poll" if clear else "webhook"}}
 
     def list_subscriptions(self, *, subscriber="", sid=""):
         self.calls.append(("list_subscriptions", subscriber, sid))
@@ -480,6 +486,57 @@ def run_notifications() -> int:
     call = [c for c in fake.calls if c[0] == "create_subscription"][0]
     _check("explicit kinds forwarded", call[3] == ["stop", "user_question"], str(call))
 
+    print("\npok_subscribe: webhook push target (M16)")
+    import os as _os2
+    _saved = {k: _os2.environ.get(k) for k in ("POK_WEBHOOK_URL", "POK_WEBHOOK_SECRET_ENV")}
+    try:
+        for k in _saved:
+            _os2.environ.pop(k, None)
+        fake.calls.clear()
+        _invoke(tools._handle_pok_subscribe, {"session_id": "s1"})
+        call = [c for c in fake.calls if c[0] == "create_subscription"][0]
+        _check("no webhook configured → poll-only subscription", call[7] is None, str(call))
+
+        fake.calls.clear()
+        _invoke(tools._handle_pok_subscribe, {
+            "session_id": "s1",
+            "webhook_url": "http://127.0.0.1:8644/webhooks/pok",
+        })
+        call = [c for c in fake.calls if c[0] == "create_subscription"][0]
+        _check("webhook_url produces a deliver block",
+               isinstance(call[7], dict) and call[7]["url"].endswith("/webhooks/pok"), str(call))
+        _check("secret is referenced by env-var NAME, never by value",
+               call[7].get("secret_env") == "POK_WEBHOOK_SECRET"
+               and "secret" not in {k for k in call[7] if k != "secret_env"},
+               str(call[7]))
+
+        _os2.environ["POK_WEBHOOK_URL"] = "http://gateway.internal:8644/webhooks/pok"
+        _os2.environ["POK_WEBHOOK_SECRET_ENV"] = "CUSTOM_SECRET_VAR"
+        fake.calls.clear()
+        _invoke(tools._handle_pok_subscribe, {"session_id": "s1"})
+        call = [c for c in fake.calls if c[0] == "create_subscription"][0]
+        _check("POK_WEBHOOK_URL is the default target",
+               call[7]["url"] == "http://gateway.internal:8644/webhooks/pok", str(call))
+        _check("POK_WEBHOOK_SECRET_ENV overrides the referenced var name",
+               call[7]["secret_env"] == "CUSTOM_SECRET_VAR", str(call))
+
+        fake.calls.clear()
+        res = _invoke(tools._handle_pok_subscribe,
+                      {"session_id": "s1", "webhook_url": "file:///etc/passwd"})
+        _check("non-http webhook_url rejected client-side", res.get("success") is False, str(res))
+        _check("rejected target makes no HTTP call", fake.calls == [], str(fake.calls))
+    finally:
+        for k, v in _saved.items():
+            if v is None:
+                _os2.environ.pop(k, None)
+            else:
+                _os2.environ[k] = v
+
+    _check("pok_subscribe documents the push path",
+           "webhook" in tools.POK_SUBSCRIBE_SCHEMA["description"].lower())
+    _check("webhook_url is in the schema",
+           "webhook_url" in tools.POK_SUBSCRIBE_SCHEMA["parameters"]["properties"])
+
     res = _invoke(tools._handle_pok_subscribe, {})
     _check("subscribe without session_id rejected", res.get("success") is False, str(res))
     res = _invoke(tools._handle_pok_subscribe, {"session_id": "s1", "kinds": "stop"})
@@ -800,6 +857,140 @@ def run_hook() -> int:
 # Tests: round trip through the Hermes framework (skipped without hermes-agent)
 # --------------------------------------------------------------------------- #
 
+def run_gate() -> int:
+    """Cron wake-gate script: deterministic, injected fetch, no network."""
+    global _passes, _failures
+    _passes = _failures = 0
+    print("\ncron wake-gate script")
+
+    import importlib.util as _ilu
+    import io
+    import os as _os
+
+    gate_path = PLUGIN_DIR / "scripts" / "pok_notify_gate.py"
+    _check("script ships with the plugin", gate_path.is_file(), str(gate_path))
+    spec = _ilu.spec_from_file_location("pok_notify_gate", gate_path)
+    gate = _ilu.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(gate)  # type: ignore[union-attr]
+
+    def call(rows=None, raiser=None, url="http://xpok.test:8080"):
+        """Run the gate with an injected fetch; returns (stdout, stderr, rc)."""
+        out, err = io.StringIO(), io.StringIO()
+        saved = _os.environ.get("XPOK_URL")
+        if url is None:
+            _os.environ.pop("XPOK_URL", None)
+        else:
+            _os.environ["XPOK_URL"] = url
+
+        def fake_fetch(u, token, sub, limit, timeout):
+            calls.append((u, token, sub, limit, timeout))
+            if raiser:
+                raise raiser
+            return {"notifications": rows or [], "count": len(rows or [])}
+
+        calls: list = []
+        try:
+            rc = gate.run(fetch=fake_fetch, out=out, err=err)
+        finally:
+            if saved is None:
+                _os.environ.pop("XPOK_URL", None)
+            else:
+                _os.environ["XPOK_URL"] = saved
+        return out.getvalue(), err.getvalue(), rc, calls
+
+    def ntf(nid, kind="stop", seq=7, status=None, state="failed"):
+        return {"id": nid, "session_id": "s1", "kind": kind, "seq": seq,
+                "status": status, "delivery_state": state,
+                "payload": {"event": {"payload": {"last_assistant_message": "CC PROSE"}}}}
+
+    _saved_sub = _os.environ.get("POK_SUBSCRIBER")
+    _os.environ["POK_SUBSCRIBER"] = "hermes-gate-test"
+    try:
+        print("\n  empty queue → zero-token tick")
+        out, err, rc, calls = call(rows=[])
+        _check("prints the no-wake gate as the last line",
+               out.strip().splitlines()[-1] == '{"wakeAgent": false}', repr(out))
+        _check("gate JSON parses to wakeAgent False",
+               json.loads(out.strip().splitlines()[-1]) == {"wakeAgent": False}, repr(out))
+        _check("exit code 0 (a non-zero exit would wake the agent)", rc == 0)
+        _check("polled with wait=0 and the subscriber",
+               calls and calls[0][2] == "hermes-gate-test", str(calls))
+
+        print("\n  pending → wake with metadata only")
+        out, err, rc, _ = call(rows=[ntf("ntf-1"), ntf("ntf-2", kind="status", seq=-1, status="idle")])
+        _check("does not print the no-wake gate",
+               "wakeAgent" not in out, repr(out))
+        _check("names both ids", "ntf-1" in out and "ntf-2" in out, out)
+        _check("names the session", "session=s1" in out, out)
+        _check("renders status rows as status=", "status=idle" in out, out)
+        _check("omits a bogus seq for status rows", "seq=-1" not in out, out)
+        _check("surfaces the push state for triage", "push=failed" in out, out)
+        _check("NO CC prose in the wake context", "CC PROSE" not in out, out)
+        _check("no payload blob", "last_assistant_message" not in out, out)
+        _check("instructs pok_events", "pok_events" in out, out)
+        _check("instructs ack only after handling",
+               "pok_notifications(action='ack'" in out and "did not" in out, out)
+        _check("tells the agent these are unacknowledged", "NOT been acknowledged" in out, out)
+
+        print("\n  failures fail closed")
+        out, err, rc, _ = call(raiser=RuntimeError("connection refused"))
+        _check("poll failure → no wake",
+               out.strip().splitlines()[-1] == '{"wakeAgent": false}', repr(out))
+        _check("poll failure still exits 0", rc == 0)
+        _check("diagnostic goes to stderr", "poll failed" in err, err)
+
+        out, err, rc, calls = call(url=None)
+        _check("missing XPOK_URL → no wake, no fetch",
+               out.strip().splitlines()[-1] == '{"wakeAgent": false}' and calls == [], repr(out))
+        _check("missing XPOK_URL is reported on stderr", "XPOK_URL" in err, err)
+
+        print("\n  malformed responses")
+        for label, rows in (("None rows", None), ("rows without ids", [{"kind": "stop"}])):
+            out, _e, _rc, _c = call(rows=rows)
+            _check(f"{label} → no wake",
+                   out.strip().splitlines()[-1] == '{"wakeAgent": false}', repr(out))
+
+        print("\n  token handling")
+        _saved_tok = _os.environ.get("XPOK_TOKEN")
+        _os.environ["XPOK_TOKEN"] = "super-secret-token"
+        try:
+            out, err, _rc, calls = call(rows=[ntf("ntf-3")])
+            _check("token is passed to the fetcher",
+                   calls and calls[0][1] == "super-secret-token", "not forwarded")
+            _check("token never appears on stdout", "super-secret-token" not in out)
+            _check("token never appears on stderr", "super-secret-token" not in err)
+            out2, err2, _rc2, _c2 = call(raiser=RuntimeError("boom super-secret-token"))
+            _check("an error message carrying the token is still not echoed verbatim to stdout",
+                   "super-secret-token" not in out2, out2)
+        finally:
+            if _saved_tok is None:
+                _os.environ.pop("XPOK_TOKEN", None)
+            else:
+                _os.environ["XPOK_TOKEN"] = _saved_tok
+
+        print("\n  subscriber default")
+        _os.environ.pop("POK_SUBSCRIBER")
+        _check("defaults to hermes-<hostname>",
+               gate.subscriber().startswith("hermes-") and len(gate.subscriber()) > 7,
+               gate.subscriber())
+        _check("matches the plugin's identity rule",
+               gate.subscriber() == _plugin_subscriber(), gate.subscriber())
+    finally:
+        if _saved_sub is None:
+            _os.environ.pop("POK_SUBSCRIBER", None)
+        else:
+            _os.environ["POK_SUBSCRIBER"] = _saved_sub
+
+    print(f"\ngate results: {_passes} passed, {_failures} failed")
+    return 0 if _failures == 0 else 1
+
+
+def _plugin_subscriber() -> str:
+    from hermes_plugins.pok import tools
+
+    return tools._subscriber({})
+
+
 def pt_notifier_stub():
     """The plugin's real hook callback with a scripted client behind it, so the
     framework round trip exercises our code, not a lambda."""
@@ -923,6 +1114,10 @@ def test_surfacing_hook() -> None:
     assert run_hook() == 0
 
 
+def test_cron_wake_gate() -> None:
+    assert run_gate() == 0
+
+
 def test_framework_round_trip() -> None:
     assert run_framework() == 0
 
@@ -931,5 +1126,6 @@ if __name__ == "__main__":
     rc1 = run()
     rc2 = run_notifications()
     rc3 = run_hook()
-    rc4 = run_framework()
-    sys.exit(rc1 | rc2 | rc3 | rc4)
+    rc4 = run_gate()
+    rc5 = run_framework()
+    sys.exit(rc1 | rc2 | rc3 | rc4 | rc5)

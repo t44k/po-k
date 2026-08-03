@@ -44,6 +44,72 @@ pub struct CreateBody {
     /// `0` replays everything po-k still holds for the session.
     #[serde(default)]
     pub cursor: Option<i64>,
+    /// Optional webhook push target (M16). Omit for a poll-only subscription.
+    #[serde(default)]
+    pub deliver: Option<DeliverBody>,
+}
+
+/// Webhook target as supplied by an operator.
+///
+/// The HMAC secret is referenced, never inlined: `secret_env` names an
+/// environment variable of the Xpo-k process, `secret_file` a file it can read.
+/// This keeps the secret out of the database, out of logs, and out of every API
+/// response — an inline `secret` field is deliberately not accepted.
+#[derive(Debug, Deserialize)]
+pub struct DeliverBody {
+    pub url: String,
+    #[serde(default)]
+    pub secret_env: Option<String>,
+    #[serde(default)]
+    pub secret_file: Option<String>,
+}
+
+/// Validate a webhook target and convert it to a storable spec.
+fn parse_deliver(body: Option<DeliverBody>) -> Result<subs::DeliverySpec, String> {
+    let Some(d) = body else {
+        return Ok(subs::DeliverySpec::default());
+    };
+    let url = d.url.trim().to_string();
+    if url.is_empty() {
+        return Err("deliver.url must not be empty".into());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("deliver.url must be an http(s) URL".into());
+    }
+    let secret_env = d
+        .secret_env
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let secret_file = d
+        .secret_file
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if secret_env.is_none() && secret_file.is_none() {
+        // Unsigned pushes are refused outright: the receiver authenticates us
+        // by HMAC, so a target without a secret can only ever be rejected.
+        return Err(
+            "deliver requires secret_env or secret_file (the HMAC secret is never sent inline)"
+                .into(),
+        );
+    }
+    Ok(subs::DeliverySpec {
+        url: Some(url),
+        secret_env,
+        secret_file,
+    })
+}
+
+/// Delivery view for API responses — reference only, never the secret value.
+fn deliver_view(row: &subs::SubscriptionRow) -> Value {
+    match row.deliver_url.as_deref() {
+        None => json!({ "mode": "poll" }),
+        Some(url) => json!({
+            "mode": "webhook",
+            "url": url,
+            "secret_source": if row.deliver_secret_env.is_some() { "env" } else { "file" },
+            "secret_ref": row.deliver_secret_env.clone().or_else(|| row.deliver_secret_file.clone()),
+        }),
+    }
 }
 
 /// `POST /subscriptions` — register interest in a session.
@@ -76,6 +142,11 @@ pub async fn create(State(st): State<XState>, Json(body): Json<CreateBody>) -> R
         },
     };
 
+    let deliver = match parse_deliver(body.deliver) {
+        Ok(d) => d,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+
     match subs::create_subscription(
         &st.db,
         &subscriber,
@@ -84,21 +155,78 @@ pub async fn create(State(st): State<XState>, Json(body): Json<CreateBody>) -> R
         &body.statuses,
         cursor,
         body.ttl_secs.unwrap_or(subs::DEFAULT_TTL_SECS),
+        &deliver,
     )
     .await
     {
         Ok(row) => (
             StatusCode::CREATED,
             Json(json!({
-                "subscription_id": row.id,
-                "subscriber": row.subscriber,
-                "session_id": row.sid,
-                "kinds": if row.kinds.is_empty() { subs::DEFAULT_KINDS.iter().map(|s| s.to_string()).collect() } else { row.kinds },
-                "statuses": if row.statuses.is_empty() { subs::DEFAULT_STATUSES.iter().map(|s| s.to_string()).collect() } else { row.statuses },
+                "subscription_id": row.id.clone(),
+                "subscriber": row.subscriber.clone(),
+                "session_id": row.sid.clone(),
+                "kinds": if row.kinds.is_empty() { subs::DEFAULT_KINDS.iter().map(|s| s.to_string()).collect() } else { row.kinds.clone() },
+                "statuses": if row.statuses.is_empty() { subs::DEFAULT_STATUSES.iter().map(|s| s.to_string()).collect() } else { row.statuses.clone() },
                 "cursor": row.cursor,
                 "cursor_source": cursor_source,
                 "expires_at": row.expires_at,
+                "deliver": deliver_view(&row),
             })),
+        ),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateBody {
+    /// New webhook target, or `null`/omitted with `clear_deliver` to go
+    /// poll-only.
+    #[serde(default)]
+    pub deliver: Option<DeliverBody>,
+    #[serde(default)]
+    pub clear_deliver: bool,
+}
+
+/// `PATCH /subscriptions/{id}` — change (or clear) the webhook target.
+///
+/// Only the delivery target is mutable; kinds/statuses/cursor are immutable by
+/// design so an operator can't retroactively change what a running subscription
+/// means. Re-subscribe for that.
+pub async fn update(
+    State(st): State<XState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateBody>,
+) -> Resp {
+    let spec = if body.clear_deliver {
+        subs::DeliverySpec::default()
+    } else {
+        match parse_deliver(body.deliver) {
+            Ok(d) if d.is_configured() => d,
+            Ok(_) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "provide `deliver` or set `clear_deliver: true`",
+                )
+            }
+            Err(e) => return err(StatusCode::BAD_REQUEST, e),
+        }
+    };
+    match subs::set_delivery(&st.db, &id, &spec).await {
+        Ok(Some(row)) => {
+            // A freshly pointed target should drain whatever is already queued.
+            st.delivery_wake.notify_waiters();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "subscription_id": row.id,
+                    "deliver": deliver_view(&row),
+                })),
+            )
+        }
+        Ok(None) => err(
+            StatusCode::NOT_FOUND,
+            format!("subscription {id:?} not found"),
         ),
         Err(e) => internal(e),
     }
@@ -116,10 +244,28 @@ pub struct ListQuery {
 pub async fn list(State(st): State<XState>, Query(q): Query<ListQuery>) -> Resp {
     let _ = subs::sweep(&st.db, ACK_RETENTION_SECS).await;
     match subs::list_subscriptions(&st.db, q.subscriber.as_deref(), q.session_id.as_deref()).await {
-        Ok(rows) => (
-            StatusCode::OK,
-            Json(json!({ "subscriptions": rows, "count": rows.len() })),
-        ),
+        Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let mut v = serde_json::to_value(row).unwrap_or_else(|_| json!({}));
+                if let Value::Object(ref mut m) = v {
+                    // Replace the raw columns with a secret-free view and add
+                    // the delivery counters an operator needs for triage.
+                    m.remove("deliver_url");
+                    m.remove("deliver_secret_env");
+                    m.remove("deliver_secret_file");
+                    m.insert("deliver".into(), deliver_view(row));
+                    if let Ok(summary) = subs::delivery_summary(&st.db, &row.id).await {
+                        m.insert("delivery".into(), summary);
+                    }
+                }
+                out.push(v);
+            }
+            (
+                StatusCode::OK,
+                Json(json!({ "subscriptions": out, "count": out.len() })),
+            )
+        }
         Err(e) => internal(e),
     }
 }

@@ -884,7 +884,11 @@ POK_SUBSCRIBE_SCHEMA = {
         "subscription starts at the session's current event seq, so it can neither "
         "miss that turn's stop nor fire on history. Then handle other work and call "
         "pok_notifications(action='poll') later. Notifications persist across Xpo-k "
-        "restarts and po-k reconnects until acked."
+        "restarts and po-k reconnects until acked.\n\n"
+        "When a webhook target is configured (webhook_url or POK_WEBHOOK_URL), Xpo-k "
+        "also pushes each notification to Hermes immediately, which starts a fresh "
+        "isolated turn — you do not have to be polling. The queue remains the source "
+        "of truth, so a failed push is recovered by the hourly cron fallback."
     ),
     "parameters": {
         "type": "object",
@@ -911,6 +915,23 @@ POK_SUBSCRIBE_SCHEMA = {
                 "type": "string",
                 "description": "Subscriber identity. Defaults to POK_SUBSCRIBER or hermes-<hostname>.",
             },
+            "webhook_url": {
+                "type": "string",
+                "description": (
+                    "Optional Hermes webhook URL for immediate push (e.g. "
+                    "http://127.0.0.1:8644/webhooks/pok). Defaults to POK_WEBHOOK_URL. "
+                    "Push starts a fresh isolated Hermes turn as soon as the session "
+                    "reaches a boundary; the queue still backs it up."
+                ),
+            },
+            "webhook_secret_env": {
+                "type": "string",
+                "description": (
+                    "Name of the env var on the Xpo-k host holding the webhook HMAC "
+                    "secret (default POK_WEBHOOK_SECRET). The secret value is never "
+                    "sent through this tool."
+                ),
+            },
         },
         "required": ["session_id"],
     },
@@ -927,6 +948,20 @@ def _handle_pok_subscribe(args: dict, **_kw) -> str:
         return _err("kinds must be an array of event-kind strings")
     if statuses is not None and not isinstance(statuses, list):
         return _err("statuses must be an array of status strings")
+    # Webhook push is opt-in per subscription. Only a *reference* to the secret
+    # travels — Xpo-k reads the value from its own environment at send time.
+    url = str(args.get("webhook_url") or os.getenv("POK_WEBHOOK_URL", "")).strip()
+    deliver = None
+    if url:
+        if not url.startswith(("http://", "https://")):
+            return _err("webhook_url must be an http(s) URL")
+        deliver = {
+            "url": url,
+            "secret_env": str(
+                args.get("webhook_secret_env")
+                or os.getenv("POK_WEBHOOK_SECRET_ENV", "POK_WEBHOOK_SECRET")
+            ).strip(),
+        }
     try:
         data = _client().create_subscription(
             sid,
@@ -935,6 +970,7 @@ def _handle_pok_subscribe(args: dict, **_kw) -> str:
             statuses=statuses,
             ttl_secs=args.get("ttl_secs"),
             cursor=args.get("cursor"),
+            deliver=deliver,
         )
         # Let the pre_llm_call hook start surfacing immediately instead of
         # waiting for its next subscription probe.

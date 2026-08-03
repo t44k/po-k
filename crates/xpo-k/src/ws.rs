@@ -100,9 +100,15 @@ async fn deliver(state: &XState, sid: &str, event: &pok_proto::EventEnvelope) {
 }
 
 fn wake_all(state: &XState, subscribers: Vec<String>) {
-    for s in subscribers {
-        state.notify_hub.wake(&s);
+    if subscribers.is_empty() {
+        return;
     }
+    for s in &subscribers {
+        state.notify_hub.wake(s);
+    }
+    // Something was queued — kick the webhook delivery loop so the push goes
+    // out now rather than on its next idle tick (M16).
+    state.delivery_wake.notify_waiters();
 }
 
 /// After a po-k (re)registers, replay the events it persisted while the uplink
