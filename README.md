@@ -147,11 +147,15 @@ curl -sH "$H" -H 'Content-Type: application/json' \
    $X/sessions/$SID/messages
 
 # 5. Stream the response — long-poll or SSE.
-curl -sH "$H" "$X/sessions/$SID/events?since=0&wait=30"
+#    offset/size are required; follow=1 turns a cursor-less tail into a
+#    long-poll for NEW events only (see "Cursors" below).
+curl -sH "$H" "$X/sessions/$SID/events?offset=-1&size=10&wait=30&follow=1"
 curl -NsH "$H" "$X/sessions/$SID/events/stream"
 
-# 6. Block until CC is idle again.
-curl -sH "$H" "$X/sessions/$SID/wait?since=0&timeout=120"
+# 6. Block until CC reaches a NEW turn boundary. `since` is the BOUNDARY
+#    cursor — the one POST /messages returned, or boundary_cursor from
+#    /status or a previous /wait.
+curl -sH "$H" "$X/sessions/$SID/wait?since=$CURSOR&timeout=120"
 
 # 7. Interrupt / tear down.
 curl -sH "$H" -X POST   $X/sessions/$SID/interrupt
@@ -160,6 +164,269 @@ curl -sH "$H" -X DELETE $X/sessions/$SID
 
 A plain `{"project":"..."}` body (no `profiles`) still works — it spawns CC with
 project-local config only, exactly as before profiles existed.
+
+## Cursors
+
+Three different cursors travel through this API. Mixing them up is the classic
+source of "the orchestrator never noticed the turn finished".
+
+| Cursor | Where it comes from | What it means | Use it for |
+|---|---|---|---|
+| **tail cursor** | `cursor` on `/status` and `/wait`; `next_cursor` on `/events` | highest event `seq` persisted so far | paging forward: `/events?offset=<tail>` |
+| **boundary cursor** | `boundary_cursor` on `/status` and `/wait`; `cursor` from `POST /messages` | `seq` of the *deciding* turn-boundary event (the `stop` / notification / lifecycle event) | `/wait?since=<boundary>` |
+| **subscription cursor** | `cursor` on a subscription; advanced by **ack** only | how far a subscriber has consumed | nothing manual — the server owns it |
+
+Rules:
+
+- **`/wait?since=` takes the boundary cursor, never the tail.** The two differ
+  routinely: the JSONL tailer flushes a turn's final `assistant_message` *after*
+  the Stop hook, so the tail is usually higher than the boundary. Re-arming with
+  the tail blocks until the *next* turn even though the session is already idle.
+- **Never re-arm `/wait` with `next_cursor` from `/events`.** That is a tail
+  cursor.
+- **`since=0` means "any past boundary counts"** — a stop from a previous turn
+  satisfies the wait instantly and looks like a fresh completion. Arm with the
+  cursor `POST /messages` gave you (captured *before* the prompt was written), or
+  with `boundary_cursor`. The `pok_wait` tool resolves the current
+  `boundary_cursor` automatically when you omit `since`.
+- **A plain tail read (`offset=-1`) returns immediately and ignores `wait`** once
+  a session has any events — it is "give me the latest N", not a subscription.
+  To watch for new output, either page forward with `offset=<next_cursor>` or
+  pass `follow=1`, which pins the request to the current cursor and long-polls.
+
+## Background notifications
+
+`/wait` only helps while a call is in flight. An orchestrator that has to handle
+other work (or ends its turn) needs completions to survive the gap, so Xpo-k
+keeps the interest itself:
+
+```sh
+# 1. Subscribe BEFORE prompting. The cursor defaults to the session's current
+#    event seq, so the subscription can neither miss this turn's stop nor fire
+#    on history. (Pass "cursor": 0 to include everything po-k still holds.)
+#    `deliver` makes it a PUSH subscription: Xpo-k POSTs each notification to
+#    Hermes immediately. secret_env names an env var of the *Xpo-k* process —
+#    the secret value never travels through this API.
+SUB=$(curl -sH "$H" -H 'Content-Type: application/json' -d "{
+    \"session_id\": \"$SID\",
+    \"subscriber\": \"ange\",
+    \"deliver\": {
+      \"url\": \"http://127.0.0.1:8644/webhooks/pok\",
+      \"secret_env\": \"POK_WEBHOOK_SECRET\"
+    }
+  }" $X/subscriptions | jq -r .subscription_id)
+
+# Switch an existing subscription between push and poll at any time:
+curl -sH "$H" -X PATCH -H 'Content-Type: application/json' \
+  -d '{"deliver":{"url":"http://127.0.0.1:8644/webhooks/pok","secret_env":"POK_WEBHOOK_SECRET"}}' \
+  $X/subscriptions/$SUB
+curl -sH "$H" -X PATCH -H 'Content-Type: application/json' \
+  -d '{"clear_deliver":true}' $X/subscriptions/$SUB
+
+# 2. Send the long task, then go do something else entirely.
+curl -sH "$H" -H 'Content-Type: application/json' \
+  -d '{"text":"Refactor the payment module and run the suite."}' \
+  $X/sessions/$SID/messages
+
+# 3. Later — or from another process — collect what happened. Reading does not
+#    consume; `wait` long-polls (max 60s) when nothing is queued yet.
+curl -sH "$H" "$X/notifications?subscriber=ange&wait=30"
+
+# 4. Ack what you acted on. Unacked notifications are redelivered, so nothing
+#    is lost if you crash in between. Acking advances the subscription cursor
+#    and refreshes its TTL.
+curl -sH "$H" -H 'Content-Type: application/json' \
+  -d '{"ids":["ntf-…"]}' $X/notifications/ack
+
+curl -sH "$H" "$X/subscriptions?subscriber=ange"      # what am I watching?
+curl -sH "$H" -X DELETE "$X/subscriptions/$SUB"       # stop watching
+```
+
+Contract:
+
+- **Server-owned.** Subscriptions and queued notifications live in Xpo-k's
+  SQLite, so they survive an idle orchestrator, an Xpo-k restart, and a po-k
+  reconnect.
+- **What fires.** Event kinds `stop`, `session_end`, `cc_exited`,
+  `notification`, `user_question`, `permission_request` (override with
+  `kinds`), plus derived-status changes to `idle`, `awaiting_input`, `ended`
+  (override with `statuses`). The status path is a level-triggered safety net:
+  it still fires when the sequenced event that caused the transition never
+  reached Xpo-k.
+- **At-least-once, deduplicated.** Sequenced events are unique per
+  `(subscription, seq, kind)`, so a duplicate push or a reconnect replay cannot
+  double-deliver. A status notification is suppressed while an unacked one for
+  the same status is already queued.
+- **Reconnect replay.** When a po-k registers, Xpo-k replays the events it
+  persisted while the uplink was down (via the existing `/events` page API,
+  from each subscription's cursor) — bounded to the most recent 200 events per
+  session.
+- **Expiry.** Subscriptions default to a 24 h TTL (max 7 days), refreshed on
+  every ack; expired ones and their queued rows are swept automatically.
+- **Push is primary, the queue is the backstop.** With `deliver` configured,
+  Xpo-k POSTs a *metadata-only* envelope the moment the notification is queued —
+  `{event_type, notification_id, subscription_id, subscriber, session_id, seq,
+  kind, status, created_at}` and nothing else. No CC prose is ever pushed; the
+  woken turn fetches session content itself with `pok_events`.
+- **Signed and idempotent.** The body is serialised once, HMAC-SHA256'd with the
+  route secret, and sent as `X-Webhook-Signature` over exactly those bytes.
+  `X-Request-ID` is the notification id, which Hermes' webhook adapter uses to
+  collapse duplicate deliveries into a single turn.
+- **Delivery ≠ ack.** A delivered notification is still pending until the woken
+  turn acks it. Every failure (timeout, 5xx, missing secret, rejected route)
+  leaves it unacked and pollable, which is precisely what lets the hourly cron
+  fallback recover it. Retries back off 30 s → 1 m → 2 m → 4 m → 8 m → 15 m for
+  8 attempts, then park as `delivery_failed`; permanent rejections (400/401/403/
+  404/405/410/422) and a missing secret park immediately instead of hammering.
+  `GET /subscriptions` reports `delivery: {delivery_pending, delivered,
+  delivery_failed, unacked}` for triage, and never the secret.
+
+### Hermes integration
+
+Three layers. Push is the primary path; the other two are safety nets.
+
+**1. Webhook push → a fresh Hermes turn (primary).** Xpo-k POSTs the notification
+metadata to Hermes' existing generic webhook adapter, which validates the HMAC,
+collapses duplicates on `X-Request-ID`, and starts an agent turn in its **own
+session** (`webhook:<route>:<delivery_id>`). That isolation is the point: the
+notification turn never injects into, interrupts, or pollutes the conversation
+the user is having. No Hermes source changes are needed — only config.
+
+Copy `hermes-plugin/config/webhook-route.reference.yaml` into the gateway's
+`config.yaml` under `platforms.webhook.extra.routes` — it contains the route, the
+reply-routing template, and the full handler prompt. The essentials:
+
+```yaml
+routes:
+  pok:
+    secret: "${POK_WEBHOOK_SECRET}"      # same value as the subscription's secret_env
+    events: ["pok_notification"]
+    deliver: zulip                       # NOT `origin` — see below
+    deliver_extra:
+      chat_id: "{origin.chat_id}"        # the stream that asked
+      thread_id: "{origin.thread_id}"    # the topic that asked
+    prompt: |
+      ...  # see the reference file
+```
+
+Then, on the Xpo-k host, export that secret for the `xpo-k` process and
+reference it by **name** when subscribing (see the `deliver` block above):
+`POK_WEBHOOK_SECRET=<hmac-secret>` — e.g. in the xpo-k systemd unit.
+
+> `deliver: origin` does **not** work for a webhook route. The adapter resolves
+> `deliver` to a real platform (built-ins plus plugin-registered ones like
+> `zulip`); `origin` is a *cron* concept and would be logged as
+> `Unknown deliver type: origin` with the reply dropped. Use `deliver: zulip`
+> with the templated `deliver_extra` above. Xpo-k always emits every
+> `origin.*` key (empty string when unknown), so the template can never render
+> literally — an empty `chat_id` makes the adapter fall back to the Zulip home
+> channel configured in the gateway, and `POK_FALLBACK_CHAT_ID` on the Hermes
+> host gives subscriptions created outside a chat an explicit destination.
+
+The gateway must be running (`hermes gateway run`) with the `webhook` platform
+enabled. Bind it to loopback (or a private interface) unless it genuinely needs
+external reach.
+
+**2. Hourly cron wake-gate (backup).** Recovers anything push never delivered —
+gateway down, wrong secret, route removed, or a poll-only subscription. The
+shipped script polls the durable queue and prints `{"wakeAgent": false}` when
+nothing is pending, which makes Hermes **skip the agent entirely**: an empty tick
+costs one HTTP request and zero tokens.
+
+```sh
+cp hermes-plugin/scripts/pok_notify_gate.py ~/.hermes/scripts/
+hermes cron create 1h "Handle the queued po-k notifications listed above: for \
+each, inspect the session with pok_events, handle it, then ack it with \
+pok_notifications(action='ack', ids=[...]). Ack nothing you did not handle." \
+  --script pok_notify_gate.py --name pok-notifications-fallback
+```
+
+The script needs `XPOK_URL` plus `XPOK_TOKEN_FILE` (or `XPOK_TOKEN`) in the
+scheduler's environment, and honours `POK_SUBSCRIBER`, `POK_GATE_LIMIT` (10) and
+`POK_GATE_TIMEOUT` (10 s). It prints metadata only — never CC output — and fails
+closed: any error means "don't wake the agent", reported on stderr. Because it
+exits 0 even on failure, an Xpo-k outage costs nothing rather than burning a turn
+per tick.
+
+**3. Per-turn surfacing (opportunistic).** The plugin also registers Hermes'
+`pre_llm_call` hook, so if a turn happens to run for any other reason, pending
+notifications are named in that turn's context. Never acks, rate-limited,
+`POK_NOTIFY_SURFACE=0` to disable. See the table below.
+
+| Variable | Where | Default | Meaning |
+|---|---|---|---|
+| `POK_WEBHOOK_SECRET` | Xpo-k host | — | HMAC secret value; referenced by name from a subscription, never sent over the API |
+| `POK_WEBHOOK_URL` | Hermes host | — | default `webhook_url` for `pok_subscribe` |
+| `POK_WEBHOOK_SECRET_ENV` | Hermes host | `POK_WEBHOOK_SECRET` | which env-var name `pok_subscribe` references |
+| `POK_SUBSCRIBER` | both | `hermes-<hostname>` | subscriber identity (stable across restarts) |
+| `POK_FALLBACK_CHAT_ID` | Hermes host | — | origin for subscriptions created outside a chat (e.g. from a cron turn) |
+| `POK_FALLBACK_THREAD_ID` / `POK_FALLBACK_PLATFORM` | Hermes host | — | topic/platform for that fallback |
+| `POK_NOTIFY_SURFACE` | Hermes host | `1` | `0` disables the `pre_llm_call` hook |
+| `POK_NOTIFY_POLL_SECS` | Hermes host | `30` | min seconds between in-turn polls |
+| `POK_NOTIFY_RESURFACE_SECS` | Hermes host | `600` | re-mention an unacked notification after this long |
+| `POK_NOTIFY_TIMEOUT` / `POK_NOTIFY_PROBE_SECS` / `POK_NOTIFY_LIMIT` | Hermes host | `3` / `300` / `5` | in-turn poll timeout, subscription-probe cache, max per turn |
+| `POK_GATE_LIMIT` / `POK_GATE_TIMEOUT` | Hermes host | `10` / `10` | cron gate batch size and HTTP timeout |
+
+**Why no duplicate turns.** Three independent guards: Xpo-k queues each
+sequenced event once per subscription (`UNIQUE(sub_id, seq, kind)`); a delivered
+row is never re-pushed; and the webhook adapter's idempotency cache drops a
+repeat `X-Request-ID` with `200 {"status":"duplicate"}` — which Xpo-k treats as
+success. If the cron fallback and a push race, both paths converge on the same
+queue row: whichever turn acks first wins, the other sees `already_acked`.
+
+**Security.** The HMAC secret is referenced by env-var name or file path and is
+never stored in the database, echoed by any endpoint, or logged. Unsigned targets
+are refused (`deliver` requires `secret_env` or `secret_file`) and non-http(s)
+URLs are rejected. Push bodies carry no CC output, so untrusted model text cannot
+reach a prompt template; the woken turn pulls session content deliberately and
+the prompt tells it to treat that content as data. Scope the woken turn to the
+`pok` toolset (`cronjob` tool's `enabled_toolsets`, or the webhook route's
+`skills`) — cron and webhook turns auto-approve tool calls.
+
+### Workflows: correlation and bounded autonomy
+
+A webhook turn is fresh and isolated — that is what keeps it from interrupting
+the user — so the state it needs lives in a **workflow**: one row per
+`(subscriber, CC session)` that ties the CC task to the chat thread that asked
+for it and bounds how far it may drive itself.
+
+`pok_subscribe` creates or finds it and returns its id. When called from a chat
+turn, the plugin's `pre_gateway_dispatch` hook has already recorded that
+conversation's routing metadata (platform, stream/`chat_id`, topic/`thread_id`,
+parent/message id, user id+name, session key) and attaches it as the
+subscription's `origin`. Only those allow-listed scalar fields are captured —
+never message text, never CC output, never credentials — and Xpo-k re-validates
+the same allow-list with a 2 KB cap. CLI-origin subscriptions simply have no
+origin; pass `no_origin: true` to suppress capture deliberately.
+
+| | |
+|---|---|
+| **States** | `active` → `waiting_for_human` (a question is outstanding) → `active`; terminal: `done`, `failed`, `exhausted` (turn budget), `expired` (wall-clock) |
+| **Bounds** | `max_turns` (default 8, max 100) and `budget_secs` (default 6 h, max 7 d), set at subscribe time. Only an accepted follow-up prompt (`outcome: continued`) consumes a turn |
+| **Single writer** | A turn must `pok_workflow(action='claim', owner=<notification_id>)` before any `pok_prompt` to that session. A concurrent turn gets `409 busy` and must not prompt — this is what prevents two prompts racing into one CC session. A crashed holder's lease expires after 15 min so the task cannot wedge |
+| **Correlation** | `GET /workflows?origin_chat_id=&origin_thread_id=` — how the user's *next* Zulip message finds the CC task it refers to. `pok_workflow(action='find')` does this for the current conversation automatically |
+
+The autonomous loop, per woken turn: `get` context → `pok_events` around the
+seq (treating CC output as untrusted data) → decide → `claim` → at most one
+`pok_prompt` → `release` with `continued`/`done`/`failed`/`waiting_for_human` →
+ack **only** after the prompt was accepted, the report was produced, or a
+waiting/error state was durably recorded. Because bounds are enforced
+server-side and every claim is refused once they are spent, a CC↔Hermes
+ping-pong terminates by construction.
+
+**Follow-up questions.** The webhook turn never blocks on `clarify` — the answer
+would arrive in the *Zulip* session, which cannot resolve a clarify raised in the
+webhook session (`gateway/run.py` keys resolution on the incoming message's
+session key). Instead it posts the question, releases with
+`outcome='waiting_for_human'`, and does **not** ack. When the user replies, that
+Zulip turn runs `pok_workflow(action='find')`, sees the waiting workflow, relays
+the answer with `pok_prompt`, and calls `pok_workflow(action='resume')`. The
+unacked notification is the durable "a human owes an answer" marker, so the
+hourly cron fallback re-raises it if nobody answers.
+
+**Agent flow either way:** `pok_subscribe` → do other work → a turn starts
+(push, cron, or an unrelated turn) → `pok_notifications(action="poll")` →
+`pok_events` → handle → `pok_notifications(action="ack", ids=[…])`.
 
 ## Permission round-trip
 
@@ -194,6 +461,17 @@ All endpoints except `/health` require `Authorization: Bearer <xpo-k token>`.
 | `GET` | `/profiles/{name}/history` | version history |
 | `POST` | `/profiles/merge` | `{profiles:[...]}` → merged profile (not stored) |
 | `POST` | `/profiles/preview` | merge + capabilities preview for a project |
+| `POST` | `/subscriptions` | `{session_id, subscriber?, kinds?, statuses?, ttl_secs?, cursor?, deliver?}` → watch a session; `deliver: {url, secret_env｜secret_file}` enables webhook push |
+| `GET` | `/subscriptions[?subscriber=&session_id=]` | list subscriptions + delivery counters (never the secret) |
+| `PATCH` | `/subscriptions/{id}` | `{deliver:{…}}` or `{clear_deliver:true}` — switch between push and poll |
+| `DELETE` | `/subscriptions/{id}` | unsubscribe (drops its queued notifications) |
+| `GET` | `/notifications[?subscriber=&session_id=&limit=&wait=]` | pending notifications; reading does not consume |
+| `POST` | `/notifications/ack` | `{ids:[...]}` → acknowledge (idempotent) |
+| `GET` | `/workflows[?subscriber=&session_id=&state=&origin_chat_id=&origin_thread_id=]` | lookup; `origin_*` resolves which CC task a chat topic belongs to |
+| `GET` | `/workflows/{id}` | state, origin, turns/max_turns, deadline, lease |
+| `POST` | `/workflows/{id}/claim` | `{owner, lease_secs?}` → single-writer lease; 409 + reason when refused |
+| `POST` | `/workflows/{id}/release` | `{owner, outcome, note?}` — `continued` consumes turn budget |
+| `POST` | `/workflows/{id}/resume` | the human answered: `waiting_for_human` → `active` |
 
 **Session API (routed to the owning po-k over WebSocket):**
 
@@ -203,12 +481,12 @@ All endpoints except `/health` require `Authorization: Bearer <xpo-k token>`.
 | `POST` | `/sessions` | `{project, profiles?, agent?, cc_flags?, bare?}` → spawn |
 | `GET` | `/sessions` | fan-out list |
 | `GET`/`DELETE` | `/sessions/:id` | detail / teardown |
-| `POST` | `/sessions/:id/messages` | `{text}` → write to pane |
-| `GET` | `/sessions/:id/messages[?since=&wait=]` · `/messages/stream` | transcript poll / SSE |
+| `POST` | `/sessions/:id/messages` | `{text}` → write to pane; returns the **boundary cursor** to arm `/wait` with |
+| `GET` | `/sessions/:id/messages?offset=&size=[&wait=&follow=]` · `/messages/stream` | transcript poll / SSE |
 | `POST` | `/sessions/:id/interrupt` · `/clear` | ESC / `/clear` into pane |
 | `POST` | `/sessions/:id/files` | `{filename, content_base64}` → `<cwd>/.po-k-inbox/` |
-| `GET` | `/sessions/:id/events[?since=&wait=]` · `/events/stream` | event poll / SSE |
-| `GET` | `/sessions/:id/cost` · `/status` · `/wait` · `/pane` | derived views |
+| `GET` | `/sessions/:id/events?offset=&size=[&wait=&follow=]` · `/events/stream` | event poll / SSE; `follow=1` = long-poll for new events |
+| `GET` | `/sessions/:id/cost` · `/status` · `/wait` · `/pane` | derived views; `/status` + `/wait` return `cursor` (tail) **and** `boundary_cursor` |
 | `GET` | `/sessions/:id/capabilities` | agents/skills/MCP the session actually has |
 | `POST` | `/sessions/:id/permission_requests/:req_id` | orchestrator decides |
 

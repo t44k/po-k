@@ -138,8 +138,8 @@ pub async fn dispatch(
             unary(core::messages::send(state, &id, &text).await)
         }
         ("GET", Route::Messages) => match page_params(query) {
-            Ok((offset, size, wait)) => {
-                unary(core::events::page(state, &id, true, offset, size, wait).await)
+            Ok((offset, size, wait, follow)) => {
+                unary(core::events::page(state, &id, true, offset, size, wait, follow).await)
             }
             Err(e) => unary(Err(e)),
         },
@@ -152,15 +152,17 @@ pub async fn dispatch(
             unary(core::messages::upload_file(state, &id, filename, content).await)
         }
         ("GET", Route::Events) => match page_params(query) {
-            Ok((offset, size, wait)) => {
-                unary(core::events::page(state, &id, false, offset, size, wait).await)
+            Ok((offset, size, wait, follow)) => {
+                unary(core::events::page(state, &id, false, offset, size, wait, follow).await)
             }
             Err(e) => unary(Err(e)),
         },
         ("GET", Route::Cost) => unary(core::events::cost(state, &id).await),
         ("GET", Route::Status) => unary(core::control::status(state, &id).await),
         ("GET", Route::Wait) => {
-            let since = qget(query, "since").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let since = qget(query, "since")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             let timeout =
                 crate::core::control::wait_defaults(qget(query, "timeout").and_then(|s| s.parse().ok()));
             unary(core::control::wait(state, &id, since, timeout).await)
@@ -186,7 +188,9 @@ pub async fn dispatch(
             {
                 return unary(Err(CoreError::not_found(&id)));
             }
-            let since = qget(query, "since").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let since = qget(query, "since")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             let transcript_only = route == Route::MessagesStream;
             let s = core::events::stream_rows(state.clone(), id, transcript_only, since)
                 .map(|row| core::events::sse_frame(&row));
@@ -196,18 +200,26 @@ pub async fn dispatch(
     }
 }
 
-/// Parse the required `offset` + `size` (and optional `wait`) for the page API.
-/// `offset` must be `>= -1` (`-1` = tail) and `size` must be `> 0`; anything
-/// else is a 400. `wait` defaults to [`core::events::DEFAULT_WAIT`].
-fn page_params(query: &str) -> Result<(i64, i64, u64), CoreError> {
+/// Parse the required `offset` + `size` (and optional `wait`, `follow`) for the
+/// page API. `offset` must be `>= -1` (`-1` = tail) and `size` must be `> 0`;
+/// anything else is a 400. `wait` defaults to [`core::events::DEFAULT_WAIT`].
+///
+/// `follow=1` (additive, default off) pins a tail request to the session's
+/// current cursor so it long-polls for *new* events instead of returning the
+/// existing tail immediately. Ignored when `offset >= 0` (already a cursor).
+fn page_params(query: &str) -> Result<(i64, i64, u64, bool), CoreError> {
     let offset = qget(query, "offset").and_then(|s| s.parse::<i64>().ok());
     let size = qget(query, "size").and_then(|s| s.parse::<i64>().ok());
     let wait = qget(query, "wait")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(core::events::DEFAULT_WAIT);
+    let follow = matches!(
+        qget(query, "follow").as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
 
     match (offset, size) {
-        (Some(o), Some(s)) if o >= -1 && s > 0 => Ok((o, s, wait)),
+        (Some(o), Some(s)) if o >= -1 && s > 0 => Ok((o, s, wait, follow)),
         (Some(_), Some(_)) => Err(CoreError::BadRequest(
             "offset must be >= -1 and size must be > 0".into(),
         )),
@@ -228,6 +240,7 @@ fn qget(query: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn routes_resolve() {
@@ -250,11 +263,34 @@ mod tests {
     #[test]
     fn query_parsing() {
         assert_eq!(qget("offset=5&wait=0", "offset"), Some("5".into()));
-        assert_eq!(page_params("offset=7&size=100&wait=10").unwrap(), (7, 100, 10));
+        assert_eq!(
+            page_params("offset=7&size=100&wait=10").unwrap(),
+            (7, 100, 10, false)
+        );
         assert_eq!(
             page_params("offset=-1&size=50").unwrap(),
-            (-1, 50, core::events::DEFAULT_WAIT)
+            (-1, 50, core::events::DEFAULT_WAIT, false)
         );
+    }
+
+    #[test]
+    fn follow_param_parsing() {
+        // Additive and opt-in: absent or falsey → false, so existing callers
+        // keep the immediate-tail behaviour.
+        for q in [
+            "offset=-1&size=5",
+            "offset=-1&size=5&follow=0",
+            "offset=-1&size=5&follow=off",
+        ] {
+            assert!(!page_params(q).unwrap().3, "{q} should not enable follow");
+        }
+        for q in [
+            "offset=-1&size=5&follow=1",
+            "offset=-1&size=5&follow=true",
+            "offset=-1&size=5&follow=yes",
+        ] {
+            assert!(page_params(q).unwrap().3, "{q} should enable follow");
+        }
     }
 
     #[test]
@@ -493,6 +529,187 @@ mod tests {
         assert_eq!(status, 200);
         assert!(b["events"].as_array().unwrap().is_empty());
         assert_eq!(b["next_cursor"], 0);
+    }
+
+    // --- M15 regression tests: cursor semantics + long-poll correctness ---
+
+    async fn append_kind(st: &AppState, sid: &str, kind: &str) -> i64 {
+        crate::events_store::append_event(&st.db, sid, "t", kind, &json!({}))
+            .await
+            .unwrap()
+    }
+
+    /// `/status` and `/wait` must expose the BOUNDARY cursor, not just the tail.
+    /// The tailer routinely flushes a turn's final assistant_message after the
+    /// Stop hook, so the two differ and re-arming with the tail would hang.
+    #[tokio::test]
+    async fn wait_returns_boundary_cursor_distinct_from_tail() {
+        let st = test_state().await;
+        seed(&st, "b1").await;
+        append_kind(&st, "b1", "user_prompt").await; // 1
+        let stop = append_kind(&st, "b1", "stop").await; // 2 — the boundary
+        let tail = append_kind(&st, "b1", "assistant_message").await; // 3 — the tail
+        assert_eq!((stop, tail), (2, 3));
+
+        let (_, s) = body(&dispatch(&st, "GET", "/sessions/b1/status", None).await);
+        assert_eq!(s["cursor"], 3, "cursor is still the tail (compat)");
+        assert_eq!(
+            s["boundary_cursor"], 2,
+            "boundary_cursor is the deciding seq"
+        );
+
+        let (_, w) = body(&dispatch(&st, "GET", "/sessions/b1/wait?since=0&timeout=2", None).await);
+        assert_eq!(w["status"], "idle");
+        assert_eq!(w["cursor"], 3);
+        assert_eq!(w["boundary_cursor"], 2);
+
+        // Re-arming with the boundary cursor is the documented, correct move:
+        // it waits for the NEXT boundary rather than reporting this one again.
+        let (_, w2) =
+            body(&dispatch(&st, "GET", "/sessions/b1/wait?since=2&timeout=1", None).await);
+        assert_eq!(w2["timed_out"], true);
+        assert_eq!(
+            w2["boundary_cursor"], 2,
+            "still reports the last boundary on timeout"
+        );
+    }
+
+    /// A stale stop from a previous turn must not satisfy a wait armed at the
+    /// current boundary (the "false completion" bug).
+    #[tokio::test]
+    async fn stale_stop_does_not_satisfy_wait_armed_at_boundary() {
+        let st = test_state().await;
+        seed(&st, "b2").await;
+        append_kind(&st, "b2", "user_prompt").await; // 1
+        append_kind(&st, "b2", "stop").await; // 2 — previous turn
+
+        let (_, s) = body(&dispatch(&st, "GET", "/sessions/b2/status", None).await);
+        let since = s["boundary_cursor"].as_i64().unwrap();
+        assert_eq!(since, 2);
+
+        // New turn submitted; CC's hook hasn't landed yet.
+        let path = format!("/sessions/b2/wait?since={since}&timeout=1");
+        let (_, w) = body(&dispatch(&st, "GET", &path, None).await);
+        assert_eq!(w["timed_out"], true, "must keep waiting for a NEW boundary");
+
+        // The new turn's stop satisfies it.
+        append_kind(&st, "b2", "user_prompt").await; // 3
+        append_kind(&st, "b2", "stop").await; // 4
+        let path = format!("/sessions/b2/wait?since={since}&timeout=2");
+        let (_, w2) = body(&dispatch(&st, "GET", &path, None).await);
+        assert!(w2.get("timed_out").is_none());
+        assert_eq!(w2["boundary_cursor"], 4);
+    }
+
+    /// `follow=1` turns a cursor-less tail request into a real long-poll: only
+    /// events newer than the call's start, and it blocks for them.
+    #[tokio::test]
+    async fn tail_follow_long_polls_for_new_events_only() {
+        let st = test_state().await;
+        seed(&st, "b3").await;
+        append_kind(&st, "b3", "user_prompt").await; // 1 — pre-existing
+
+        let st2 = st.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            append_kind(&st2, "b3", "stop").await; // 2 — arrives during the poll
+        });
+
+        let (_, b) = body(
+            &dispatch(
+                &st,
+                "GET",
+                "/sessions/b3/events?offset=-1&size=5&wait=5&follow=1",
+                None,
+            )
+            .await,
+        );
+        let kinds: Vec<&str> = b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["stop"],
+            "only the NEW event, and it waited for it"
+        );
+        assert_eq!(b["next_cursor"], 2);
+    }
+
+    /// Plain tail keeps its old semantics: immediate, existing events, no wait.
+    #[tokio::test]
+    async fn tail_without_follow_is_unchanged() {
+        let st = test_state().await;
+        seed(&st, "b4").await;
+        append_kind(&st, "b4", "user_prompt").await;
+        let (_, b) = body(
+            &dispatch(
+                &st,
+                "GET",
+                "/sessions/b4/events?offset=-1&size=5&wait=1",
+                None,
+            )
+            .await,
+        );
+        assert_eq!(b["events"].as_array().unwrap().len(), 1);
+        assert_eq!(b["next_cursor"], 1);
+    }
+
+    /// Lost-wakeup coverage: an event committed *after* the page call has begun
+    /// must wake it. `page()` registers its waiter before the first select, so
+    /// the notification can't slip through the select→subscribe window.
+    #[tokio::test]
+    async fn page_wakes_for_event_committed_after_call_starts() {
+        let st = test_state().await;
+        seed(&st, "b5").await;
+        let st2 = st.clone();
+        // No sleep: the writer races the page's very first select, which is the
+        // window that used to drop the wakeup.
+        let writer = tokio::spawn(async move {
+            append_kind(&st2, "b5", "stop").await;
+            st2.bus.notify("b5").await;
+        });
+        let (_, b) = body(
+            &dispatch(
+                &st,
+                "GET",
+                "/sessions/b5/events?offset=0&size=5&wait=10",
+                None,
+            )
+            .await,
+        );
+        writer.await.unwrap();
+        let kinds: Vec<&str> = b["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["stop"],
+            "the long-poll must not sleep through the commit"
+        );
+    }
+
+    /// `follow` is ignored for an explicit cursor read (offset >= 0).
+    #[tokio::test]
+    async fn follow_is_ignored_for_cursor_reads() {
+        let st = test_state().await;
+        seed(&st, "b6").await;
+        append_n(&st, "b6", 3).await;
+        let (_, b) = body(
+            &dispatch(
+                &st,
+                "GET",
+                "/sessions/b6/events?offset=1&size=5&wait=0&follow=1",
+                None,
+            )
+            .await,
+        );
+        assert_eq!(event_seqs(&b), vec![2, 3]);
     }
 
     #[tokio::test]

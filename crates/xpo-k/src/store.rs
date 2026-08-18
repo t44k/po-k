@@ -39,6 +39,89 @@ CREATE TABLE IF NOT EXISTS xpok_sessions (
     started_at  TEXT NOT NULL,
     ended_at    TEXT
 );
+
+-- M15: durable notification subscriptions. An orchestrator registers interest
+-- in a session once; Xpo-k then matches the session_event / status_update
+-- frames po-k already pushes and queues notifications that survive both the
+-- orchestrator being idle and an Xpo-k restart.
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id          TEXT PRIMARY KEY,
+    subscriber  TEXT NOT NULL,
+    sid         TEXT NOT NULL,
+    kinds       TEXT NOT NULL,          -- JSON array of event kinds
+    statuses    TEXT NOT NULL,          -- JSON array of derived statuses
+    cursor      INTEGER NOT NULL DEFAULT 0,  -- advanced on ACK only
+    created_at  TEXT NOT NULL,
+    ttl_secs    INTEGER NOT NULL,       -- the configured lifetime, reused on refresh
+    expires_at  INTEGER NOT NULL,       -- unix epoch seconds
+    -- M16 webhook push. Only the *name* of the env var / path of the file
+    -- holding the HMAC secret is persisted — never the secret itself.
+    deliver_url         TEXT,
+    deliver_secret_env  TEXT,
+    deliver_secret_file TEXT,
+    -- M17 correlation. `origin` is opaque, validated, size-capped routing
+    -- metadata captured by the orchestrator (which chat/topic/user asked for
+    -- this work). Xpo-k stores and echoes it, never interprets it.
+    origin      TEXT,
+    workflow_id TEXT
+);
+CREATE INDEX IF NOT EXISTS subscriptions_by_sid ON subscriptions (sid);
+CREATE INDEX IF NOT EXISTS subscriptions_by_workflow ON subscriptions (workflow_id);
+
+-- M17: a workflow is one long-running CC task as the orchestrator sees it —
+-- the durable join between a CC session, the chat thread that asked for it, and
+-- the bounded sequence of autonomous Hermes turns that drive it. One row per
+-- (subscriber, CC session); notifications and webhook envelopes carry its id.
+CREATE TABLE IF NOT EXISTS workflows (
+    id           TEXT PRIMARY KEY,
+    subscriber   TEXT NOT NULL,
+    sid          TEXT NOT NULL,          -- the CC session being driven
+    origin       TEXT,                   -- same opaque shape as above
+    state        TEXT NOT NULL,          -- active|waiting_for_human|done|failed|exhausted|expired
+    turns        INTEGER NOT NULL DEFAULT 0,
+    max_turns    INTEGER NOT NULL,
+    deadline_at  INTEGER NOT NULL,       -- unix epoch; hard stop for autonomy
+    -- Single-writer lease. A webhook turn must hold it before prompting the CC
+    -- session, which is what prevents two concurrent pok_prompt calls.
+    lease_owner      TEXT,
+    lease_expires_at INTEGER,
+    last_note    TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS workflows_unique_task
+    ON workflows (subscriber, sid);
+CREATE INDEX IF NOT EXISTS workflows_by_state ON workflows (state);
+CREATE INDEX IF NOT EXISTS subscriptions_by_subscriber ON subscriptions (subscriber);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id          TEXT PRIMARY KEY,
+    sub_id      TEXT NOT NULL,
+    subscriber  TEXT NOT NULL,
+    sid         TEXT NOT NULL,
+    seq         INTEGER NOT NULL,       -- -1 for status-derived notifications
+    kind        TEXT NOT NULL,
+    status      TEXT,
+    payload     TEXT,
+    created_at  TEXT NOT NULL,
+    acked_at    TEXT,
+    -- M16 webhook push. Delivery is independent of ack: a delivered
+    -- notification is still pending until the woken turn acks it, and a failed
+    -- delivery leaves it pollable by the cron fallback.
+    delivery_state      TEXT NOT NULL DEFAULT 'none',  -- none|pending|delivered|failed
+    delivery_attempts   INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     INTEGER,                        -- unix epoch seconds
+    last_delivery_error TEXT,
+    delivered_at        TEXT
+);
+CREATE INDEX IF NOT EXISTS notifications_due
+    ON notifications (delivery_state, next_attempt_at);
+-- Delivery is at-least-once; this makes re-delivery of an already-queued
+-- sequenced event a no-op (replay after reconnect, duplicate push, retry).
+CREATE UNIQUE INDEX IF NOT EXISTS notifications_unique_seq
+    ON notifications (sub_id, seq, kind) WHERE seq >= 0;
+CREATE INDEX IF NOT EXISTS notifications_pending
+    ON notifications (subscriber, acked_at);
 "#;
 
 pub async fn open(path: &Path) -> Result<Db> {
@@ -63,6 +146,15 @@ pub async fn open(path: &Path) -> Result<Db> {
     Ok(pool)
 }
 
+/// Unix epoch seconds. Used for subscription expiry, where comparing integers
+/// beats string-comparing ISO timestamps.
+pub fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub fn now_iso() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -73,7 +165,11 @@ pub fn now_iso() -> String {
     let sod = (secs % 86_400) as i64;
     let (h, mi, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
@@ -244,12 +340,11 @@ pub async fn profile_history(db: &Db, name: &str) -> Result<Vec<Value>> {
 /// Live (not-ended) sessions: `(sid, pok_id, profile_names)`. Used by Phase 4
 /// to find sessions affected by a profile change.
 pub async fn live_sessions(db: &Db) -> Result<Vec<(String, String, Vec<String>)>> {
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT sid, pok_id, profiles FROM xpok_sessions WHERE ended_at IS NULL",
-    )
-    .fetch_all(db)
-    .await
-    .context("SELECT live xpok_sessions")?;
+    let rows: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT sid, pok_id, profiles FROM xpok_sessions WHERE ended_at IS NULL")
+            .fetch_all(db)
+            .await
+            .context("SELECT live xpok_sessions")?;
     Ok(rows
         .into_iter()
         .map(|(sid, pok_id, profiles)| {
@@ -285,7 +380,10 @@ mod tests {
         upsert_profile(&db, &p2).await.unwrap();
         let hist = profile_history(&db, "base").await.unwrap();
         assert_eq!(hist.len(), 2);
-        assert_eq!(get_profile(&db, "base").await.unwrap().unwrap().version, "1.1.0");
+        assert_eq!(
+            get_profile(&db, "base").await.unwrap().unwrap().version,
+            "1.1.0"
+        );
 
         assert!(delete_profile(&db, "base").await.unwrap());
         assert!(get_profile(&db, "base").await.unwrap().is_none());

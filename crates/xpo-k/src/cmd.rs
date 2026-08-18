@@ -52,6 +52,9 @@ pub async fn serve() -> Result<()> {
     tracing::info!(path = %db_path.display(), "profiles.db ready");
 
     let state = XState::new(cfg, token, db);
+    // Webhook push for subscriptions that configured a target (M16). No-op for
+    // poll-only subscriptions.
+    crate::deliver::spawn(state.clone());
     tracing::info!(%addr, version = env!("CARGO_PKG_VERSION"), "xpo-k serve listening");
     crate::serve_on(state, addr).await.context("serve")?;
     Ok(())

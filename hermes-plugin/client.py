@@ -63,6 +63,15 @@ class XpokClient:
         r.raise_for_status()
         return r.json()
 
+    def _post_allow_conflict(self, path: str, body: Optional[Dict] = None,
+                             timeout: int = _DEFAULT_TIMEOUT) -> Dict[str, Any]:
+        """POST where 409 carries a meaningful body (lease refusals)."""
+        url = f"{self.base_url}{path}"
+        r = requests.post(url, headers=self._headers(), json=body, timeout=timeout)
+        if r.status_code != 409:
+            r.raise_for_status()
+        return r.json()
+
     def _delete(self, path: str, timeout: int = _DEFAULT_TIMEOUT) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         r = requests.delete(url, headers=self._headers(), timeout=timeout)
@@ -141,10 +150,15 @@ class XpokClient:
         return self._get(f"/sessions/{sid}/wait", params=params, timeout=_WAIT_TIMEOUT)
 
     def get_events(self, sid: str, offset: int = -1, size: int = 10,
-                   wait: int = 2) -> Dict[str, Any]:
+                   wait: int = 2, follow: bool = False) -> Dict[str, Any]:
         # offset and size are REQUIRED by the server. offset=-1 returns the
         # latest `size` events (tail); offset>=0 returns events with seq > offset.
+        # A plain tail returns immediately and ignores `wait` once the session
+        # has any events — pass follow=True (pins the request to the current
+        # cursor) or an explicit offset to actually long-poll.
         params: Dict[str, Any] = {"offset": offset, "size": size, "wait": wait}
+        if follow:
+            params["follow"] = 1
         return self._get(f"/sessions/{sid}/events", params=params, timeout=wait + 10)
 
     def get_pane(self, sid: str) -> Dict[str, Any]:
@@ -174,6 +188,113 @@ class XpokClient:
 
     def registry(self) -> Any:
         return self._get("/registry")
+
+    # -- Notification subscriptions (M15) --
+
+    def create_subscription(
+        self,
+        sid: str,
+        *,
+        subscriber: str,
+        kinds: Optional[list] = None,
+        statuses: Optional[list] = None,
+        ttl_secs: Optional[int] = None,
+        cursor: Optional[int] = None,
+        deliver: Optional[Dict[str, Any]] = None,
+        origin: Optional[Dict[str, Any]] = None,
+        max_turns: Optional[int] = None,
+        budget_secs: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        # `deliver` is {url, secret_env|secret_file} — a *reference* to the HMAC
+        # secret. Xpo-k refuses an inline secret, so none is ever sent here.
+        body: Dict[str, Any] = {"session_id": sid, "subscriber": subscriber}
+        if kinds:
+            body["kinds"] = kinds
+        if statuses:
+            body["statuses"] = statuses
+        if ttl_secs is not None:
+            body["ttl_secs"] = ttl_secs
+        if cursor is not None:
+            body["cursor"] = cursor
+        if deliver:
+            body["deliver"] = deliver
+        if origin:
+            body["origin"] = origin
+        if max_turns is not None:
+            body["max_turns"] = max_turns
+        if budget_secs is not None:
+            body["budget_secs"] = budget_secs
+        return self._post("/subscriptions", body)
+
+    def set_subscription_delivery(
+        self,
+        subscription_id: str,
+        *,
+        deliver: Optional[Dict[str, Any]] = None,
+        clear: bool = False,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"clear_deliver": True} if clear else {"deliver": deliver or {}}
+        url = f"{self.base_url}/subscriptions/{subscription_id}"
+        r = requests.patch(url, headers=self._headers(), json=body, timeout=_DEFAULT_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+
+    def list_subscriptions(self, *, subscriber: str = "", sid: str = "",
+                           timeout: int = _DEFAULT_TIMEOUT) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if subscriber:
+            params["subscriber"] = subscriber
+        if sid:
+            params["session_id"] = sid
+        return self._get("/subscriptions", params=params or None, timeout=timeout)
+
+    def delete_subscription(self, subscription_id: str) -> Dict[str, Any]:
+        return self._delete(f"/subscriptions/{subscription_id}")
+
+    def poll_notifications(self, *, subscriber: str = "", sid: str = "",
+                           limit: int = 20, wait: int = 0,
+                           timeout: Optional[int] = None) -> Dict[str, Any]:
+        # `timeout` is an explicit override for the in-turn notifier poll, which
+        # must stay well under a second-scale budget rather than the long-poll
+        # default of wait + 15s.
+        params: Dict[str, Any] = {"limit": limit, "wait": wait}
+        if subscriber:
+            params["subscriber"] = subscriber
+        if sid:
+            params["session_id"] = sid
+        return self._get("/notifications", params=params,
+                         timeout=timeout if timeout is not None else wait + 15)
+
+    def ack_notifications(self, ids: list) -> Dict[str, Any]:
+        return self._post("/notifications/ack", {"ids": ids})
+
+    # -- Workflows: correlation + bounded autonomous continuation (M17) --
+
+    def list_workflows(self, **filters: Any) -> Dict[str, Any]:
+        params = {k: v for k, v in filters.items() if v not in (None, "")}
+        return self._get("/workflows", params=params or None)
+
+    def get_workflow(self, workflow_id: str) -> Dict[str, Any]:
+        return self._get(f"/workflows/{workflow_id}")
+
+    def claim_workflow(self, workflow_id: str, owner: str,
+                       lease_secs: Optional[int] = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"owner": owner}
+        if lease_secs is not None:
+            body["lease_secs"] = lease_secs
+        # A 409 is an expected answer ("someone else holds it"), not an error, so
+        # the caller gets the parsed body instead of an exception.
+        return self._post_allow_conflict(f"/workflows/{workflow_id}/claim", body)
+
+    def release_workflow(self, workflow_id: str, owner: str, outcome: str,
+                         note: str = "") -> Dict[str, Any]:
+        body: Dict[str, Any] = {"owner": owner, "outcome": outcome}
+        if note:
+            body["note"] = note
+        return self._post_allow_conflict(f"/workflows/{workflow_id}/release", body)
+
+    def resume_workflow(self, workflow_id: str, note: str = "") -> Dict[str, Any]:
+        return self._post(f"/workflows/{workflow_id}/resume", {"note": note} if note else {})
 
     # -- Profile endpoints --
 

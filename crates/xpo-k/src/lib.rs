@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod cmd;
 pub mod config;
+pub mod deliver;
 pub mod http;
 pub mod live;
 pub mod merge;
@@ -11,6 +12,8 @@ pub mod registry;
 pub mod routed;
 pub mod state;
 pub mod store;
+pub mod subs;
+pub mod workflow;
 pub mod ws;
 
 use anyhow::Result;

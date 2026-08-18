@@ -6,6 +6,8 @@ use crate::auth::Token;
 use crate::config::Config;
 use crate::registry::Registry;
 use crate::store::Db;
+use crate::subs::NotifyHub;
+use tokio::sync::Notify;
 
 #[derive(Clone)]
 pub struct XState {
@@ -13,6 +15,12 @@ pub struct XState {
     pub token: Token,
     pub db: Db,
     pub registry: Registry,
+    /// Per-subscriber wakeups for notification long-polls (M15).
+    pub notify_hub: NotifyHub,
+    /// Wakes the webhook delivery loop the moment a notification is queued
+    /// (M16) — this is what makes the push path feel immediate instead of
+    /// waiting for the idle tick.
+    pub delivery_wake: Arc<Notify>,
 }
 
 impl XState {
@@ -22,6 +30,8 @@ impl XState {
             token,
             db,
             registry: Registry::default(),
+            notify_hub: NotifyHub::default(),
+            delivery_wake: Arc::new(Notify::new()),
         }
     }
 }

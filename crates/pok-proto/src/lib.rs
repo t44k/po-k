@@ -37,11 +37,20 @@ pub struct SessionDecl {
 }
 
 /// A forwarded session event.
+///
+/// `seq`/`ts` are additive (M15): they carry po-k's per-session monotonic
+/// sequence number so Xpo-k can order, deduplicate, and resume from forwarded
+/// events. Both default, so frames from an older po-k still deserialize —
+/// `seq == 0` means "unsequenced" and is treated as non-resumable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub kind: String,
     #[serde(default)]
     pub payload: serde_json::Value,
+    #[serde(default)]
+    pub seq: i64,
+    #[serde(default)]
+    pub ts: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,5 +193,40 @@ mod tests {
         });
         assert_eq!(v["type"], "error");
         assert_eq!(v["code"], "not_found");
+    }
+
+    #[test]
+    fn session_event_carries_seq_and_ts() {
+        let v = roundtrip(&WsMsg::SessionEvent {
+            sid: "s1".into(),
+            event: EventEnvelope {
+                kind: "stop".into(),
+                payload: serde_json::json!({"last_assistant_message": "done"}),
+                seq: 12,
+                ts: "2026-08-03T10:00:00Z".into(),
+            },
+        });
+        assert_eq!(v["type"], "session_event");
+        assert_eq!(v["event"]["seq"], 12);
+        assert_eq!(v["event"]["ts"], "2026-08-03T10:00:00Z");
+    }
+
+    #[test]
+    fn session_event_from_an_older_pok_still_decodes() {
+        // Pre-M15 po-k builds send no seq/ts. Both default, so the frame stays
+        // decodable — Xpo-k treats seq 0 as "unsequenced" (not resumable) rather
+        // than failing the connection.
+        let old = r#"{"type":"session_event","sid":"s1","event":{"kind":"stop"}}"#;
+        let msg: WsMsg = serde_json::from_str(old).unwrap();
+        match msg {
+            WsMsg::SessionEvent { sid, event } => {
+                assert_eq!(sid, "s1");
+                assert_eq!(event.kind, "stop");
+                assert_eq!(event.seq, 0);
+                assert_eq!(event.ts, "");
+                assert!(event.payload.is_null());
+            }
+            other => panic!("expected session_event, got {other:?}"),
+        }
     }
 }

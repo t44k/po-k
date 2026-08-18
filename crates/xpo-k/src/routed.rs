@@ -80,6 +80,37 @@ async fn call_pok(
     }
 }
 
+/// The session's current event cursor, straight from the owning po-k.
+///
+/// Used when a subscription is created so it starts at "now" instead of
+/// replaying history. Returns `None` when the session is unknown, its po-k is
+/// disconnected, or the call fails — the caller decides how to degrade.
+pub async fn session_cursor(st: &XState, sid: &str) -> Option<i64> {
+    let pok_id = st.registry.pok_for_session(sid)?;
+    let r = call_pok(st, &pok_id, "GET", &format!("/sessions/{sid}/status"), None)
+        .await
+        .ok()?;
+    let v: Value = serde_json::from_str(&r.body).ok()?;
+    v.get("cursor").and_then(|c| c.as_i64())
+}
+
+/// Persisted events a po-k still holds after `since_seq`, used to replay
+/// subscription notifications missed while the uplink was down. Reuses the
+/// existing `/events` page API — no extra protocol surface.
+pub async fn replay_events(st: &XState, pok_id: &str, sid: &str, since_seq: i64) -> Vec<Value> {
+    let path = format!(
+        "/sessions/{sid}/events?offset={since_seq}&size={}&wait=0",
+        crate::subs::REPLAY_LIMIT
+    );
+    let Ok(r) = call_pok(st, pok_id, "GET", &path, None).await else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Value>(&r.body)
+        .ok()
+        .and_then(|v| v.get("events").and_then(|e| e.as_array()).cloned())
+        .unwrap_or_default()
+}
+
 fn to_response(r: WsResult) -> Response {
     let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK);
     let body: Value = serde_json::from_str(&r.body).unwrap_or(json!({ "raw": r.body }));
