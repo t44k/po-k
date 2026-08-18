@@ -245,9 +245,11 @@ async fn spawn_for_project(
         } else {
             let hooks_path = session_dir.join("hooks.json");
             let mcp_path = session_dir.join("mcp.json");
+            // This file is legacy mode's `--settings` target, so it carries
+            // po-k's owned settings keys alongside the hooks block.
             std::fs::write(
                 &hooks_path,
-                render_hooks_json(&base_url, &sid, state.token.raw()),
+                render_legacy_settings_json(&base_url, &sid, state.token.raw()),
             )
             .with_context(|| format!("writing {}", hooks_path.display()))?;
             std::fs::write(&mcp_path, render_mcp_json(&sid, &base_url, &token_file))
@@ -388,7 +390,24 @@ pub(crate) async fn append_lifecycle_event(
     Ok(())
 }
 
+/// The plugin-mode `hooks/hooks.json` body: a pure hooks file, no settings keys
+/// (profile mode carries those in its own `settings.json`).
 pub fn render_hooks_json(base_url: &str, sid: &str, token: &str) -> String {
+    serde_json::to_string_pretty(&json!({ "hooks": hooks_block(base_url, sid, token) }))
+        .expect("hooks.json serialize")
+}
+
+/// The legacy (profile-less) `--settings` target, written to `hooks.json`: the
+/// hooks block plus the settings keys po-k owns on every settings file it
+/// generates. Profile mode's equivalent is [`crate::profile::render_settings_json`].
+pub fn render_legacy_settings_json(base_url: &str, sid: &str, token: &str) -> String {
+    let mut settings = serde_json::Map::new();
+    settings.insert("hooks".into(), hooks_block(base_url, sid, token));
+    crate::profile::insert_pok_owned_settings(&mut settings);
+    serde_json::to_string_pretty(&Value::Object(settings)).expect("settings serialize")
+}
+
+fn hooks_block(base_url: &str, sid: &str, token: &str) -> Value {
     let mk = |event: &str| -> Value {
         let url = format!("{base_url}/sessions/{sid}/hooks/{event}");
         // `content-type: application/json` is REQUIRED: the ingest handler uses
@@ -404,17 +423,14 @@ pub fn render_hooks_json(base_url: &str, sid: &str, token: &str) -> String {
             "hooks": [{ "type": "command", "command": command }]
         })
     };
-    let body = json!({
-        "hooks": {
-            "UserPromptSubmit": [mk("UserPromptSubmit")],
-            "Stop":             [mk("Stop")],
-            "SubagentStop":     [mk("SubagentStop")],
-            "PostToolUse":      [mk("PostToolUse")],
-            "Notification":     [mk("Notification")],
-            "SessionEnd":       [mk("SessionEnd")],
-        }
-    });
-    serde_json::to_string_pretty(&body).expect("hooks.json serialize")
+    json!({
+        "UserPromptSubmit": [mk("UserPromptSubmit")],
+        "Stop":             [mk("Stop")],
+        "SubagentStop":     [mk("SubagentStop")],
+        "PostToolUse":      [mk("PostToolUse")],
+        "Notification":     [mk("Notification")],
+        "SessionEnd":       [mk("SessionEnd")],
+    })
 }
 
 pub fn render_mcp_json(sid: &str, base_url: &str, token_file: &std::path::Path) -> String {
@@ -544,6 +560,36 @@ mod tests {
         ] {
             assert!(s.contains(event), "missing event {event}");
         }
+    }
+
+    #[test]
+    fn hooks_json_stays_a_pure_hooks_file() {
+        let body: Value =
+            serde_json::from_str(&render_hooks_json("http://127.0.0.1:7070", "abc-123", "TOK"))
+                .unwrap();
+        // The plugin's hooks.json is not a settings file — settings keys belong
+        // in settings.json only.
+        let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["hooks"]);
+    }
+
+    #[test]
+    fn legacy_settings_json_skips_the_dangerous_mode_prompt() {
+        let body: Value = serde_json::from_str(&render_legacy_settings_json(
+            "http://127.0.0.1:7070",
+            "abc-123",
+            "TOK",
+        ))
+        .unwrap();
+        // Legacy sessions pass this file to `claude --settings`; without the
+        // skip, CC blocks on an interactive confirmation nobody can answer.
+        assert_eq!(body["skipDangerousModePermissionPrompt"], true);
+        // ...and it still carries the hooks CC must install.
+        assert!(body["hooks"]["Stop"].is_array());
+        assert!(body["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("curl"));
     }
 
     #[test]
