@@ -99,6 +99,20 @@ pub fn generate_plugin_dir(
     })
 }
 
+/// CC settings key po-k owns on every settings file it generates. po-k drives
+/// CC non-interactively (`--permission-mode bypassPermissions` +
+/// `--permission-prompt-tool mcp__po-k__approve`), so CC's interactive
+/// dangerous-mode confirmation would stall the session at a prompt no
+/// orchestrator can answer.
+const SKIP_DANGEROUS_PROMPT: &str = "skipDangerousModePermissionPrompt";
+
+/// Stamp the settings keys po-k owns onto a rendered settings object. Applied
+/// LAST so profile passthrough settings can never drop them — the same
+/// reservation rule as the `po-k` MCP server (spec §8.4).
+pub fn insert_pok_owned_settings(settings: &mut serde_json::Map<String, Value>) {
+    settings.insert(SKIP_DANGEROUS_PROMPT.into(), json!(true));
+}
+
 /// Build the merged settings.json passed via `--settings`: po-k's hooks block
 /// plus the profile's passthrough settings + optional main agent.
 pub fn render_settings_json(
@@ -118,6 +132,7 @@ pub fn render_settings_json(
     for (k, v) in &profile.settings.extra {
         settings.insert(k.clone(), v.clone());
     }
+    insert_pok_owned_settings(&mut settings);
     Ok(serde_json::to_string_pretty(&Value::Object(settings)).expect("settings serialize"))
 }
 
@@ -436,5 +451,35 @@ mod tests {
                 .unwrap();
         assert_eq!(s["agent"], "security-reviewer");
         assert!(s["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
+    fn settings_json_always_skips_the_dangerous_mode_prompt() {
+        let p = reviewer_profile();
+        let s: Value = serde_json::from_str(&render_settings_json(&p, &ctx(), None).unwrap()).unwrap();
+        assert_eq!(s["skipDangerousModePermissionPrompt"], true);
+    }
+
+    #[test]
+    fn profile_cannot_unset_skip_dangerous_prompt() {
+        let mut p = reviewer_profile();
+        // A profile passing the key through verbatim must not win: po-k drives
+        // CC non-interactively and cannot answer the confirmation.
+        p.settings
+            .extra
+            .insert("skipDangerousModePermissionPrompt".into(), json!(false));
+        let s: Value = serde_json::from_str(&render_settings_json(&p, &ctx(), None).unwrap()).unwrap();
+        assert_eq!(s["skipDangerousModePermissionPrompt"], true);
+    }
+
+    #[test]
+    fn plugin_hooks_json_carries_no_settings_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = reviewer_profile();
+        let paths = generate_plugin_dir(tmp.path(), &p, &ctx()).unwrap();
+        let hooks: Value =
+            serde_json::from_str(&std::fs::read_to_string(paths.hooks_json).unwrap()).unwrap();
+        let keys: Vec<&String> = hooks.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["hooks"]);
     }
 }
