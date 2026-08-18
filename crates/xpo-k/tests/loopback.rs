@@ -36,40 +36,57 @@ async fn start_server() -> (SocketAddr, XState) {
     (addr, state)
 }
 
+type PokSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Message,
+>;
+type PokStream = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
 /// Connect a fake po-k and register it owning project "demo" + session "s1".
-async fn connect_fake_pok(
+async fn connect_fake_pok(addr: SocketAddr) -> (PokSink, PokStream) {
+    connect_fake_pok_as(
+        addr,
+        "pok-1",
+        "host",
+        "demo",
+        "/demo",
+        vec![SessionDecl {
+            sid: "s1".into(),
+            project: "demo".into(),
+            status: "idle".into(),
+        }],
+    )
+    .await
+}
+
+/// Connect a fake po-k under an explicit identity, owning one project. Lets
+/// tests set up two connected instances that declare a project of the same
+/// name — the scenario that exposed the routing-precedence bug (two Zirzen
+/// clones of the same repo, each with an identically-named project).
+async fn connect_fake_pok_as(
     addr: SocketAddr,
-) -> (
-    futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        Message,
-    >,
-    futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    >,
-) {
+    pok_id: &str,
+    hostname: &str,
+    project_name: &str,
+    project_cwd: &str,
+    sessions: Vec<SessionDecl>,
+) -> (PokSink, PokStream) {
     let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
     req.headers_mut()
         .insert("authorization", "Bearer secret".parse().unwrap());
     let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     let (mut sink, mut stream) = ws.split();
     let reg = WsMsg::Register {
-        pok_id: "pok-1".into(),
-        hostname: "host".into(),
+        pok_id: pok_id.into(),
+        hostname: hostname.into(),
         version: "0".into(),
         projects: vec![ProjectDecl {
-            name: "demo".into(),
-            cwd: "/demo".into(),
+            name: project_name.into(),
+            cwd: project_cwd.into(),
         }],
-        sessions: vec![SessionDecl {
-            sid: "s1".into(),
-            project: "demo".into(),
-            status: "idle".into(),
-        }],
+        sessions,
         caps: Default::default(),
     };
     sink.send(Message::Text(serde_json::to_string(&reg).unwrap()))
@@ -190,6 +207,219 @@ async fn sse_stream_bridge() {
     assert!(body.contains("\"seq\":0"));
     assert!(body.contains("\"seq\":1"));
     responder.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Regression: explicit `host`/`pok_id` targeting on `POST /sessions` must not
+// be silently overridden by project-name lookup. `Registry::project_to_pok`
+// is a single fleet-wide map keyed only by name, so two connected po-k
+// instances that happen to declare an identically-named project (e.g. two
+// clones of the same repo) collapse onto whichever registered last. A caller
+// that disambiguates with an explicit `host`/`pok_id` must still land on the
+// instance it asked for, not on whoever currently "owns" that project name.
+// ---------------------------------------------------------------------------
+
+/// Fake po-k that answers exactly one `POST /sessions` with a session id that
+/// reveals which instance actually handled it.
+fn spawn_create_responder(
+    mut stream: PokStream,
+    mut sink: PokSink,
+    session_id: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let WsMsg::WsRequest {
+            request_id, path, ..
+        } = next_msg(&mut stream).await
+        {
+            assert_eq!(path, "/sessions");
+            let resp = WsMsg::WsResponse {
+                request_id,
+                status: 201,
+                headers: Default::default(),
+                body: format!(r#"{{"session_id":"{session_id}"}}"#),
+            };
+            sink.send(Message::Text(serde_json::to_string(&resp).unwrap()))
+                .await
+                .unwrap();
+        }
+    })
+}
+
+#[tokio::test]
+async fn explicit_host_target_wins_over_ambiguous_project_name() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Two clones of the same repo: identical project name, distinct identity.
+    // pok-b registers second, so the fleet-wide project map now points at it
+    // — the precondition the old bug relied on.
+    let (sink_a, stream_a) =
+        connect_fake_pok_as(addr, "pok-a", "host-a", "shared", "/ws", vec![]).await;
+    let (_sink_b, _stream_b) =
+        connect_fake_pok_as(addr, "pok-b", "host-b", "shared", "/ws", vec![]).await;
+
+    let responder = spawn_create_responder(stream_a, sink_a, "sess-a");
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"project": "shared", "host": "host-a"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        created["session_id"], "sess-a",
+        "explicit host=host-a must win even though pok-b owns 'shared' in the fleet-wide map"
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), responder)
+        .await
+        .expect("pok-a never received the request")
+        .unwrap();
+}
+
+/// The same misroute, but by `pok_id` instead of `host`, and checked against
+/// both instances to rule out "it just happened to hit the right one".
+#[tokio::test]
+async fn explicit_pok_id_target_wins_over_ambiguous_project_name() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let (sink_a, stream_a) =
+        connect_fake_pok_as(addr, "pok-a", "host-a", "shared", "/ws", vec![]).await;
+    let (_sink_b, _stream_b) =
+        connect_fake_pok_as(addr, "pok-b", "host-b", "shared", "/ws", vec![]).await;
+    // pok-b is last-registered and so owns "shared" in the fleet-wide map —
+    // targeting pok-a by id must still reach pok-a, not the project owner.
+
+    let responder = spawn_create_responder(stream_a, sink_a, "sess-a");
+    let created: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"project": "shared", "pok_id": "pok-a"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["session_id"], "sess-a");
+    tokio::time::timeout(Duration::from_secs(3), responder)
+        .await
+        .expect("pok-a never received the request")
+        .unwrap();
+}
+
+/// Sequential repro of the reported symptom: create → delete → create again,
+/// always targeting the same host explicitly. Each attempt must land on the
+/// same instance, even though the fleet-wide project map still points
+/// elsewhere the whole time.
+#[tokio::test]
+async fn sequential_creates_keep_routing_to_the_explicitly_targeted_host() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let (sink_a, stream_a) =
+        connect_fake_pok_as(addr, "pok-a", "host-a", "shared", "/ws", vec![]).await;
+    let (_sink_b, _stream_b) =
+        connect_fake_pok_as(addr, "pok-b", "host-b", "shared", "/ws", vec![]).await;
+
+    let responder1 = spawn_create_responder(stream_a, sink_a, "sess-a-1");
+    let first: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"project": "shared", "host": "host-a"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["session_id"], "sess-a-1");
+    tokio::time::timeout(Duration::from_secs(3), responder1)
+        .await
+        .expect("pok-a never received the first request")
+        .unwrap();
+
+    // "Delete" is a no-op here (no real session state on the fake po-k) —
+    // what matters is that a second, independent create targeting host-a
+    // again reaches pok-a, not pok-b.
+    let (sink_a2, stream_a2) =
+        connect_fake_pok_as(addr, "pok-a", "host-a", "shared", "/ws", vec![]).await;
+    let responder2 = spawn_create_responder(stream_a2, sink_a2, "sess-a-2");
+    let second: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"project": "shared", "host": "host-a"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        second["session_id"], "sess-a-2",
+        "a second, later create targeting host-a must still reach pok-a"
+    );
+    tokio::time::timeout(Duration::from_secs(3), responder2)
+        .await
+        .expect("pok-a never received the second request")
+        .unwrap();
+}
+
+/// Concurrent repro: two creates fire at once, each targeting a different
+/// host explicitly. Neither may cross-route to the other's instance.
+#[tokio::test]
+async fn concurrent_creates_to_distinct_hosts_do_not_cross_route() {
+    let (addr, _state) = start_server().await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let (sink_a, stream_a) =
+        connect_fake_pok_as(addr, "pok-a", "host-a", "shared", "/ws", vec![]).await;
+    let (sink_b, stream_b) =
+        connect_fake_pok_as(addr, "pok-b", "host-b", "shared", "/ws", vec![]).await;
+
+    let responder_a = spawn_create_responder(stream_a, sink_a, "sess-a");
+    let responder_b = spawn_create_responder(stream_b, sink_b, "sess-b");
+
+    let req_a = client
+        .post(format!("{base}/sessions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"project": "shared", "host": "host-a"}))
+        .send();
+    let req_b = client
+        .post(format!("{base}/sessions"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"project": "shared", "host": "host-b"}))
+        .send();
+    let (resp_a, resp_b) = tokio::join!(req_a, req_b);
+
+    let created_a: serde_json::Value = resp_a.unwrap().json().await.unwrap();
+    let created_b: serde_json::Value = resp_b.unwrap().json().await.unwrap();
+    assert_eq!(
+        created_a["session_id"], "sess-a",
+        "host-a must never see pok-b's response"
+    );
+    assert_eq!(
+        created_b["session_id"], "sess-b",
+        "host-b must never see pok-a's response"
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), responder_a)
+        .await
+        .expect("pok-a never received its request")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), responder_b)
+        .await
+        .expect("pok-b never received its request")
+        .unwrap();
 }
 
 #[tokio::test]
