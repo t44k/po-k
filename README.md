@@ -1,574 +1,225 @@
-# po-k & Xpo-k
+# po-k
 
-*po-k* — from the Hungarian **pók** (spider): one process at the centre of a
-web of Claude Code sessions, legs reaching every machine.
+*po-k* — from the Hungarian **pók** (spider): one process on every dev box,
+legs reaching every Claude Code session, one web an agent can pull on.
 
-Drive fleets of Claude Code (CC) instances over zellij, from a single HTTP API,
-across any number of machines.
-
-Two binaries:
-
-- **`po-k`** runs on each dev box/container. It manages CC processes (spawns one
-  per project inside its own zellij session, tails transcripts, derives status,
-  brokers tool-permission prompts). It has **no orchestrator-facing HTTP
-  server** — it is a WebSocket *client* that dials out to Xpo-k, plus a tiny
-  localhost-only listener for CC's own callbacks.
-- **`Xpo-k`** ("cross po-k") runs centrally. It is the **only** HTTP entry
-  point: it stores composable **profiles**, keeps a live registry of connected
-  po-k instances, and routes every orchestrator call to the right po-k over the
-  WebSocket — so po-k boxes need only outbound connectivity (NAT/firewall
-  friendly, no exposed ports).
+Drive fleets of Claude Code (CC) instances over zellij from HTTP, and from an
+agent through MCP.
 
 ```
-   orchestrator (Hermes/Ange/curl)
-        │  HTTP  (the only HTTP in the system)
-        ▼
-     ┌───────┐    profiles (SQLite) · po-k registry · merge engine
-     │ Xpo-k │
-     └───┬───┘
-         │  WebSocket  (po-k dials out; request/response framed over WS)
-   ┌─────┼───────────────┬───────────────┐
-   ▼     ▼               ▼               ▼
- ┌────┐┌────┐         ┌────┐          ┌────┐
- │po-k││po-k│  …      │po-k│   …      │po-k│   (one per machine)
- │ CC ││ CC │         │ CC │          │ CC │
- └────┘└────┘         └────┘          └────┘
+ Hermes (agent) ──stdio MCP──▶ po-k mcp ──HTTP──▶ po-k serve @ange:13658 ──HTTP (one fleet token)──▶ po-k serve @<box>.zrz:13658 ──▶ CC in zellij
+                 ◀── webhook POST (HMAC) ─────────────┘  hub: hosts · proxy · watchers
 ```
+
+One binary, `po-k`, four roles:
+
+| command | where | what |
+|---|---|---|
+| `po-k serve` | every box | the HTTP API for local CC sessions **and** the hub: connect other boxes, proxy their API, watch their sessions and fire webhooks |
+| `po-k mcp` | next to the agent | stdio MCP server; talks only to the local `po-k serve` |
+| `po-k cc-mcp` | launched by CC | per-session permission shim (internal) |
+| `po-k export-profile` | once | v1 Xpo-k profiles → CC plugin directories |
+
+No per-box configuration: a session is fully described by its create request
+(directory, model, plugins, MCP servers, agent, system prompt). The only thing
+a box needs is the fleet bearer token. New directories are marked trusted in
+`~/.claude.json` before CC starts, so any folder works as a session `cwd`.
 
 ## Install
 
 ```sh
-cargo build --release          # builds target/release/{po-k,xpo-k}
-# or per-binary:
-cargo install --path crates/po-k
-cargo install --path crates/xpo-k
+cargo build --release          # target/release/po-k
 ```
 
-`po-k` shells out to `zellij` and `claude`; both must be on `$PATH`. Tested
-against zellij 0.44 + Claude Code (any recent version). Xpo-k has no external
-runtime deps.
+`po-k serve` shells out to `zellij` and `claude`; both must be on `$PATH`.
+zellij must be the MCP fork —
+[t44k/zellij `mcp-direct-ipc-refactor`](https://github.com/t44k/zellij/tree/mcp-direct-ipc-refactor),
+built with `--features mcp_server_capability`, with `mcp { enabled true }` in
+its config. `po-k serve` checks this at startup (`zellij mcp --capabilities`
+plus a probe session that must expose its socket under
+`$XDG_RUNTIME_DIR/zellij/` or `~/.cache/zellij/`) and refuses to start
+otherwise.
 
 ## Quick start
 
-### 1. Start Xpo-k (central)
-
 ```sh
-xpo-k init                              # writes ~/.config/xpo-k/xpo-k.yaml +
-                                        # generates ~/.config/xpo-k/auth.token
-$EDITOR ~/.config/xpo-k/xpo-k.yaml      # set bind, default_profiles, etc.
-xpo-k serve                             # HTTP + WebSocket on 0.0.0.0:8080
+# on every box (once): write the token file (fleet key) — config is optional
+po-k init --token "$FLEET_TOKEN"        # or: POK_TOKEN=... po-k serve
+po-k serve                              # 0.0.0.0:13658
+
+# from anywhere on the box network
+TOK=$(cat ~/.config/po-k/auth.token); H="Authorization: Bearer $TOK"
+B=http://box.zrz:13658
+
+curl -s $B/docs | jq .schemas.create_session     # what a create body looks like
+SID=$(curl -s -H "$H" -d '{
+    "cwd": "/workspace",
+    "model": "fable",
+    "plugins": ["/zirzen/base/plugins/sapi"],
+    "mcp_servers": {"linear": {"command": "node", "args": ["/opt/linear-mcp/index.js"], "env": {"LINEAR_ACCESS_TOKEN": "${LINEAR_ACCESS_TOKEN}"}}}
+  }' $B/sessions | jq -r .session_id)
+CUR=$(curl -s -H "$H" -d '{"text":"Review the auth module."}' $B/sessions/$SID/messages | jq -r .cursor)
+curl -s -H "$H" "$B/sessions/$SID/wait?since=$CUR&timeout=600"          # blocks until the turn ends
+curl -s -H "$H" "$B/sessions/$SID/messages?offset=-1&size=5&wait=2"     # the reply
+curl -s -H "$H" -X DELETE $B/sessions/$SID
 ```
 
-### 2. Start po-k on each machine
+`GET /help` is the full reference; `GET /docs` is its machine-readable twin
+(routes, JSON Schemas for every body, defaults, cursor rules, webhook contract).
+Both are public.
 
-```sh
-po-k init                               # writes ~/.config/po-k/po-k.yaml +
-                                        # generates ~/.config/po-k/auth.token
-$EDITOR ~/.config/po-k/po-k.yaml        # add projects: and the xpok: block
-po-k serve --install-systemd            # or run in the foreground
-```
+## Drive it from Hermes (MCP)
 
-The `xpok:` block points po-k at the central server:
+The po-k on the agent's box is the hub. Hermes runs `po-k mcp` over stdio; every
+tool takes a `host` (a box name, or `local`).
 
 ```yaml
-xpok:
-  url: ws://xpo-k.host:8080/ws
-  token: "<the xpo-k bearer token>"     # from ~/.config/xpo-k/auth.token
-  reconnect_interval: 5s
+# ~/.hermes/config.yaml
+mcp_servers:
+  pok:
+    command: /usr/local/zirzen/current/bin/po-k
+    args: [mcp]
+    env:
+      POK_URL: http://127.0.0.1:13658                       # the local po-k serve
+      POK_TOKEN_FILE: /home/devuser/.config/po-k/auth.token # the fleet key
+      POK_WEBHOOK_URL: http://127.0.0.1:8644/webhooks/pok   # Hermes' webhook adapter
+      POK_WEBHOOK_SECRET_FILE: /home/devuser/.hermes/pok_webhook_secret  # or POK_WEBHOOK_SECRET_ENV (env of *po-k serve*)
+    timeout: 660                                            # `wait` can block for 600 s
+    enabled: true
 ```
 
-On connect, po-k registers its projects + live sessions. Confirm with
-`GET /registry` on Xpo-k. `po-k.yaml` is hot-reloaded — project changes
-propagate to Xpo-k without a restart.
+Tools (`mcp_pok_*` in Hermes): `docs`, `connect`, `hosts`, `host`, `disconnect`,
+`create`, `sessions`, `prompt`, `status`, `wait`, `events`, `pane`, `interrupt`,
+`clear`, `upload`, `cost`, `capabilities`, `permission`, `delete`, `watch`,
+`unwatch`, `watches`.
 
-## Profiles
+Agent flow: `connect(host, meta={chat_id, thread_id})` → `create(host, cwd,
+model, plugins, wake=true)` → `prompt(...)` → do other work → a webhook wakes a
+Hermes turn with `{event: "finished" | "needs_input" | ..., host, session_id,
+boundary_cursor, meta}` → `events(host, session_id, size=10)` → answer or
+`permission(...)`. Without a webhook, `wait(host, session_id)` blocks up to
+10 minutes and returns the status; call it again on `timed_out`.
 
-A **profile** is a JSON blob describing a complete or partial CC configuration:
-`claude_md`, `agents`, `skills`, `mcp_servers`, `hooks`, and `settings`. Profiles
-live on Xpo-k and are **composed** — you pick several, Xpo-k merges them in
-order, and po-k assembles the result into a CC plugin directory on session start.
+## The hub
+
+`POST /hosts {"host": "jamail-c1", "webhook": {"url", "secret_env"}, "meta": {...}}`
+probes the box and remembers it. Then every session route is available as
+`/hosts/{host}/sessions/...` — a transparent proxy with the same bodies and
+status codes. `POST /hosts/{host}/sessions` with `"wake": true` also starts a
+**watch**: the hub long-polls the remote `/wait` and POSTs a signed envelope to
+the webhook on every boundary.
+
+| event | when |
+|---|---|
+| `finished` | the turn ended (status `idle`) |
+| `needs_input` | a `permission_request` or `user_question` is outstanding |
+| `ended` | the session ended; watch done |
+| `connection_lost` / `connection_restored` | the box stopped / resumed answering |
+| `session_lost` | the box no longer knows the session |
+| `auth_failed` | the box rejected the fleet token |
+
+Headers: `x-webhook-signature` (hex HMAC-SHA256 of the exact body under the
+secret named by `secret_env`/`secret_file`), `x-request-id`
+(`<watch_id>:<event>:<boundary>`, dedupe key), `x-pok-event: pok_notification`.
+Bodies carry metadata only, never CC prose; `meta` is echoed verbatim so the
+woken turn knows which conversation asked. Watches are persisted and respawned
+when `po-k serve` restarts.
+
+## Plugins instead of profiles
+
+Everything a session should know or be able to do is a CC plugin directory
+(`CLAUDE.md`, `agents/`, `skills/`, `.mcp.json`, `hooks/`) or a `.zip`/URL, passed
+as `plugins: [...]`. Shared plugins live in the zirzen base layer
+(`/zirzen/base/plugins/<name>` inside every box). The v1 Xpo-k profiles were
+converted once:
 
 ```sh
-TOK=$(cat ~/.config/xpo-k/auth.token); H="Authorization: Bearer $TOK"
-
-# Create a profile.
-curl -sH "$H" -H 'Content-Type: application/json' -d '{
-  "name": "base-coding",
-  "claude_md": "# Coding Standards\n- 2-space indent\n- conventional commits",
-  "skills": { "tdd": { "description": "TDD workflow", "content": "..." } },
-  "settings": { "effort": "high" }
-}' http://xpo-k.host:8080/profiles
-
-# Preview the merged result of several profiles (no session created).
-curl -sH "$H" -H 'Content-Type: application/json' \
-  -d '{"profiles":["base-coding","code-reviewer"]}' \
-  http://xpo-k.host:8080/profiles/merge
+po-k export-profile --db ~/.config/xpo-k/profiles.db --out ~/c/zirzen/defaults/plugins
+# credentials in MCP env/headers become ${NAME}; export them on the box
 ```
 
-**Merge rules** (applied left→right): `claude_md` concatenates with a
-`## From profile: <name>` header per section; `agents`/`skills`/`mcp_servers`/
-`hooks` union by name (later wins on collision); `settings` deep-merge (later
-wins); `tags` deduplicate. Each profile's CLAUDE.md, skills, and agents become
-real files in `~/.cache/po-k/sessions/<sid>/plugin/`, passed to CC via
-`--plugin-dir`. po-k always injects its own permission MCP server + lifecycle
-hooks, which a profile can never override.
-
-**Live updates:** `PUT /profiles/{name}` pushes the re-merged profile to every
-running session that uses it. CLAUDE.md and skills hot-reload automatically (CC
-watches the files); agent/MCP/hook changes trigger a `/reload-plugins` nudge.
-
-## Drive it from an orchestrator
-
-All calls go to **Xpo-k**; it routes to the owning po-k over WebSocket. The
-session API is identical to po-k's old HTTP API, so existing orchestrators just
-re-point at Xpo-k.
-
-```sh
-TOK=$(cat ~/.config/xpo-k/auth.token); H="Authorization: Bearer $TOK"
-X=http://xpo-k.host:8080
-
-# 1. What projects are available across all connected po-k instances?
-curl -sH "$H" $X/projects
-
-# 2. Spawn a session with a composed profile + a chosen main agent.
-SID=$(curl -sH "$H" -H 'Content-Type: application/json' -d '{
-   "project": "acme-api",
-   "profiles": ["base-coding", "code-reviewer"],
-   "agent": "lead-reviewer",
-   "cc_flags": { "model": "opus", "effort": "high" }
- }' $X/sessions | jq -r .session_id)
-
-# 3. Inspect what that session can actually do (agents/skills/MCP it has).
-curl -sH "$H" $X/sessions/$SID/capabilities
-
-# 4. Send a prompt.
-curl -sH "$H" -H 'Content-Type: application/json' \
-   -d '{"text":"Review the auth module for security issues."}' \
-   $X/sessions/$SID/messages
-
-# 5. Stream the response — long-poll or SSE.
-#    offset/size are required; follow=1 turns a cursor-less tail into a
-#    long-poll for NEW events only (see "Cursors" below).
-curl -sH "$H" "$X/sessions/$SID/events?offset=-1&size=10&wait=30&follow=1"
-curl -NsH "$H" "$X/sessions/$SID/events/stream"
-
-# 6. Block until CC reaches a NEW turn boundary. `since` is the BOUNDARY
-#    cursor — the one POST /messages returned, or boundary_cursor from
-#    /status or a previous /wait.
-curl -sH "$H" "$X/sessions/$SID/wait?since=$CURSOR&timeout=120"
-
-# 7. Interrupt / tear down.
-curl -sH "$H" -X POST   $X/sessions/$SID/interrupt
-curl -sH "$H" -X DELETE $X/sessions/$SID
-```
-
-A plain `{"project":"..."}` body (no `profiles`) still works — it spawns CC with
-project-local config only, exactly as before profiles existed.
+Settings (model, effort, permission mode) cannot ride in a plugin — pass them on
+create.
 
 ## Cursors
 
-Three different cursors travel through this API. Mixing them up is the classic
-source of "the orchestrator never noticed the turn finished".
-
-| Cursor | Where it comes from | What it means | Use it for |
-|---|---|---|---|
-| **tail cursor** | `cursor` on `/status` and `/wait`; `next_cursor` on `/events` | highest event `seq` persisted so far | paging forward: `/events?offset=<tail>` |
-| **boundary cursor** | `boundary_cursor` on `/status` and `/wait`; `cursor` from `POST /messages` | `seq` of the *deciding* turn-boundary event (the `stop` / notification / lifecycle event) | `/wait?since=<boundary>` |
-| **subscription cursor** | `cursor` on a subscription; advanced by **ack** only | how far a subscriber has consumed | nothing manual — the server owns it |
-
-Rules:
-
-- **`/wait?since=` takes the boundary cursor, never the tail.** The two differ
-  routinely: the JSONL tailer flushes a turn's final `assistant_message` *after*
-  the Stop hook, so the tail is usually higher than the boundary. Re-arming with
-  the tail blocks until the *next* turn even though the session is already idle.
-- **Never re-arm `/wait` with `next_cursor` from `/events`.** That is a tail
-  cursor.
-- **`since=0` means "any past boundary counts"** — a stop from a previous turn
-  satisfies the wait instantly and looks like a fresh completion. Arm with the
-  cursor `POST /messages` gave you (captured *before* the prompt was written), or
-  with `boundary_cursor`. The `pok_wait` tool resolves the current
-  `boundary_cursor` automatically when you omit `since`.
-- **A plain tail read (`offset=-1`) returns immediately and ignores `wait`** once
-  a session has any events — it is "give me the latest N", not a subscription.
-  To watch for new output, either page forward with `offset=<next_cursor>` or
-  pass `follow=1`, which pins the request to the current cursor and long-polls.
-
-## Background notifications
-
-`/wait` only helps while a call is in flight. An orchestrator that has to handle
-other work (or ends its turn) needs completions to survive the gap, so Xpo-k
-keeps the interest itself:
-
-```sh
-# 1. Subscribe BEFORE prompting. The cursor defaults to the session's current
-#    event seq, so the subscription can neither miss this turn's stop nor fire
-#    on history. (Pass "cursor": 0 to include everything po-k still holds.)
-#    `deliver` makes it a PUSH subscription: Xpo-k POSTs each notification to
-#    Hermes immediately. secret_env names an env var of the *Xpo-k* process —
-#    the secret value never travels through this API.
-SUB=$(curl -sH "$H" -H 'Content-Type: application/json' -d "{
-    \"session_id\": \"$SID\",
-    \"subscriber\": \"ange\",
-    \"deliver\": {
-      \"url\": \"http://127.0.0.1:8644/webhooks/pok\",
-      \"secret_env\": \"POK_WEBHOOK_SECRET\"
-    }
-  }" $X/subscriptions | jq -r .subscription_id)
-
-# Switch an existing subscription between push and poll at any time:
-curl -sH "$H" -X PATCH -H 'Content-Type: application/json' \
-  -d '{"deliver":{"url":"http://127.0.0.1:8644/webhooks/pok","secret_env":"POK_WEBHOOK_SECRET"}}' \
-  $X/subscriptions/$SUB
-curl -sH "$H" -X PATCH -H 'Content-Type: application/json' \
-  -d '{"clear_deliver":true}' $X/subscriptions/$SUB
-
-# 2. Send the long task, then go do something else entirely.
-curl -sH "$H" -H 'Content-Type: application/json' \
-  -d '{"text":"Refactor the payment module and run the suite."}' \
-  $X/sessions/$SID/messages
-
-# 3. Later — or from another process — collect what happened. Reading does not
-#    consume; `wait` long-polls (max 60s) when nothing is queued yet.
-curl -sH "$H" "$X/notifications?subscriber=ange&wait=30"
-
-# 4. Ack what you acted on. Unacked notifications are redelivered, so nothing
-#    is lost if you crash in between. Acking advances the subscription cursor
-#    and refreshes its TTL.
-curl -sH "$H" -H 'Content-Type: application/json' \
-  -d '{"ids":["ntf-…"]}' $X/notifications/ack
-
-curl -sH "$H" "$X/subscriptions?subscriber=ange"      # what am I watching?
-curl -sH "$H" -X DELETE "$X/subscriptions/$SUB"       # stop watching
-```
-
-Contract:
-
-- **Server-owned.** Subscriptions and queued notifications live in Xpo-k's
-  SQLite, so they survive an idle orchestrator, an Xpo-k restart, and a po-k
-  reconnect.
-- **What fires.** Event kinds `stop`, `session_end`, `cc_exited`,
-  `notification`, `user_question`, `permission_request` (override with
-  `kinds`), plus derived-status changes to `idle`, `awaiting_input`, `ended`
-  (override with `statuses`). The status path is a level-triggered safety net:
-  it still fires when the sequenced event that caused the transition never
-  reached Xpo-k.
-- **At-least-once, deduplicated.** Sequenced events are unique per
-  `(subscription, seq, kind)`, so a duplicate push or a reconnect replay cannot
-  double-deliver. A status notification is suppressed while an unacked one for
-  the same status is already queued.
-- **Reconnect replay.** When a po-k registers, Xpo-k replays the events it
-  persisted while the uplink was down (via the existing `/events` page API,
-  from each subscription's cursor) — bounded to the most recent 200 events per
-  session.
-- **Expiry.** Subscriptions default to a 24 h TTL (max 7 days), refreshed on
-  every ack; expired ones and their queued rows are swept automatically.
-- **Push is primary, the queue is the backstop.** With `deliver` configured,
-  Xpo-k POSTs a *metadata-only* envelope the moment the notification is queued —
-  `{event_type, notification_id, subscription_id, subscriber, session_id, seq,
-  kind, status, created_at}` and nothing else. No CC prose is ever pushed; the
-  woken turn fetches session content itself with `pok_events`.
-- **Signed and idempotent.** The body is serialised once, HMAC-SHA256'd with the
-  route secret, and sent as `X-Webhook-Signature` over exactly those bytes.
-  `X-Request-ID` is the notification id, which Hermes' webhook adapter uses to
-  collapse duplicate deliveries into a single turn.
-- **Delivery ≠ ack.** A delivered notification is still pending until the woken
-  turn acks it. Every failure (timeout, 5xx, missing secret, rejected route)
-  leaves it unacked and pollable, which is precisely what lets the hourly cron
-  fallback recover it. Retries back off 30 s → 1 m → 2 m → 4 m → 8 m → 15 m for
-  8 attempts, then park as `delivery_failed`; permanent rejections (400/401/403/
-  404/405/410/422) and a missing secret park immediately instead of hammering.
-  `GET /subscriptions` reports `delivery: {delivery_pending, delivered,
-  delivery_failed, unacked}` for triage, and never the secret.
-
-### Hermes integration
-
-Three layers. Push is the primary path; the other two are safety nets.
-
-**1. Webhook push → a fresh Hermes turn (primary).** Xpo-k POSTs the notification
-metadata to Hermes' existing generic webhook adapter, which validates the HMAC,
-collapses duplicates on `X-Request-ID`, and starts an agent turn in its **own
-session** (`webhook:<route>:<delivery_id>`). That isolation is the point: the
-notification turn never injects into, interrupts, or pollutes the conversation
-the user is having. No Hermes source changes are needed — only config.
-
-Copy `hermes-plugin/config/webhook-route.reference.yaml` into the gateway's
-`config.yaml` under `platforms.webhook.extra.routes` — it contains the route, the
-reply-routing template, and the full handler prompt. The essentials:
-
-```yaml
-routes:
-  pok:
-    secret: "${POK_WEBHOOK_SECRET}"      # same value as the subscription's secret_env
-    events: ["pok_notification"]
-    deliver: zulip                       # NOT `origin` — see below
-    deliver_extra:
-      chat_id: "{origin.chat_id}"        # the stream that asked
-      thread_id: "{origin.thread_id}"    # the topic that asked
-    prompt: |
-      ...  # see the reference file
-```
-
-Then, on the Xpo-k host, export that secret for the `xpo-k` process and
-reference it by **name** when subscribing (see the `deliver` block above):
-`POK_WEBHOOK_SECRET=<hmac-secret>` — e.g. in the xpo-k systemd unit.
-
-> `deliver: origin` does **not** work for a webhook route. The adapter resolves
-> `deliver` to a real platform (built-ins plus plugin-registered ones like
-> `zulip`); `origin` is a *cron* concept and would be logged as
-> `Unknown deliver type: origin` with the reply dropped. Use `deliver: zulip`
-> with the templated `deliver_extra` above. Xpo-k always emits every
-> `origin.*` key (empty string when unknown), so the template can never render
-> literally — an empty `chat_id` makes the adapter fall back to the Zulip home
-> channel configured in the gateway, and `POK_FALLBACK_CHAT_ID` on the Hermes
-> host gives subscriptions created outside a chat an explicit destination.
-
-The gateway must be running (`hermes gateway run`) with the `webhook` platform
-enabled. Bind it to loopback (or a private interface) unless it genuinely needs
-external reach.
-
-**2. Hourly cron wake-gate (backup).** Recovers anything push never delivered —
-gateway down, wrong secret, route removed, or a poll-only subscription. The
-shipped script polls the durable queue and prints `{"wakeAgent": false}` when
-nothing is pending, which makes Hermes **skip the agent entirely**: an empty tick
-costs one HTTP request and zero tokens.
-
-```sh
-cp hermes-plugin/scripts/pok_notify_gate.py ~/.hermes/scripts/
-hermes cron create 1h "Handle the queued po-k notifications listed above: for \
-each, inspect the session with pok_events, handle it, then ack it with \
-pok_notifications(action='ack', ids=[...]). Ack nothing you did not handle." \
-  --script pok_notify_gate.py --name pok-notifications-fallback
-```
-
-The script needs `XPOK_URL` plus `XPOK_TOKEN_FILE` (or `XPOK_TOKEN`) in the
-scheduler's environment, and honours `POK_SUBSCRIBER`, `POK_GATE_LIMIT` (10) and
-`POK_GATE_TIMEOUT` (10 s). It prints metadata only — never CC output — and fails
-closed: any error means "don't wake the agent", reported on stderr. Because it
-exits 0 even on failure, an Xpo-k outage costs nothing rather than burning a turn
-per tick.
-
-**3. Per-turn surfacing (opportunistic).** The plugin also registers Hermes'
-`pre_llm_call` hook, so if a turn happens to run for any other reason, pending
-notifications are named in that turn's context. Never acks, rate-limited,
-`POK_NOTIFY_SURFACE=0` to disable. See the table below.
-
-| Variable | Where | Default | Meaning |
-|---|---|---|---|
-| `POK_WEBHOOK_SECRET` | Xpo-k host | — | HMAC secret value; referenced by name from a subscription, never sent over the API |
-| `POK_WEBHOOK_URL` | Hermes host | — | default `webhook_url` for `pok_subscribe` |
-| `POK_WEBHOOK_SECRET_ENV` | Hermes host | `POK_WEBHOOK_SECRET` | which env-var name `pok_subscribe` references |
-| `POK_SUBSCRIBER` | both | `hermes-<hostname>` | subscriber identity (stable across restarts) |
-| `POK_FALLBACK_CHAT_ID` | Hermes host | — | origin for subscriptions created outside a chat (e.g. from a cron turn) |
-| `POK_FALLBACK_THREAD_ID` / `POK_FALLBACK_PLATFORM` | Hermes host | — | topic/platform for that fallback |
-| `POK_NOTIFY_SURFACE` | Hermes host | `1` | `0` disables the `pre_llm_call` hook |
-| `POK_NOTIFY_POLL_SECS` | Hermes host | `30` | min seconds between in-turn polls |
-| `POK_NOTIFY_RESURFACE_SECS` | Hermes host | `600` | re-mention an unacked notification after this long |
-| `POK_NOTIFY_TIMEOUT` / `POK_NOTIFY_PROBE_SECS` / `POK_NOTIFY_LIMIT` | Hermes host | `3` / `300` / `5` | in-turn poll timeout, subscription-probe cache, max per turn |
-| `POK_GATE_LIMIT` / `POK_GATE_TIMEOUT` | Hermes host | `10` / `10` | cron gate batch size and HTTP timeout |
-
-**Why no duplicate turns.** Three independent guards: Xpo-k queues each
-sequenced event once per subscription (`UNIQUE(sub_id, seq, kind)`); a delivered
-row is never re-pushed; and the webhook adapter's idempotency cache drops a
-repeat `X-Request-ID` with `200 {"status":"duplicate"}` — which Xpo-k treats as
-success. If the cron fallback and a push race, both paths converge on the same
-queue row: whichever turn acks first wins, the other sees `already_acked`.
-
-**Security.** The HMAC secret is referenced by env-var name or file path and is
-never stored in the database, echoed by any endpoint, or logged. Unsigned targets
-are refused (`deliver` requires `secret_env` or `secret_file`) and non-http(s)
-URLs are rejected. Push bodies carry no CC output, so untrusted model text cannot
-reach a prompt template; the woken turn pulls session content deliberately and
-the prompt tells it to treat that content as data. Scope the woken turn to the
-`pok` toolset (`cronjob` tool's `enabled_toolsets`, or the webhook route's
-`skills`) — cron and webhook turns auto-approve tool calls.
-
-### Workflows: correlation and bounded autonomy
-
-A webhook turn is fresh and isolated — that is what keeps it from interrupting
-the user — so the state it needs lives in a **workflow**: one row per
-`(subscriber, CC session)` that ties the CC task to the chat thread that asked
-for it and bounds how far it may drive itself.
-
-`pok_subscribe` creates or finds it and returns its id. When called from a chat
-turn, the plugin's `pre_gateway_dispatch` hook has already recorded that
-conversation's routing metadata (platform, stream/`chat_id`, topic/`thread_id`,
-parent/message id, user id+name, session key) and attaches it as the
-subscription's `origin`. Only those allow-listed scalar fields are captured —
-never message text, never CC output, never credentials — and Xpo-k re-validates
-the same allow-list with a 2 KB cap. CLI-origin subscriptions simply have no
-origin; pass `no_origin: true` to suppress capture deliberately.
-
-| | |
-|---|---|
-| **States** | `active` → `waiting_for_human` (a question is outstanding) → `active`; terminal: `done`, `failed`, `exhausted` (turn budget), `expired` (wall-clock) |
-| **Bounds** | `max_turns` (default 8, max 100) and `budget_secs` (default 6 h, max 7 d), set at subscribe time. Only an accepted follow-up prompt (`outcome: continued`) consumes a turn |
-| **Single writer** | A turn must `pok_workflow(action='claim', owner=<notification_id>)` before any `pok_prompt` to that session. A concurrent turn gets `409 busy` and must not prompt — this is what prevents two prompts racing into one CC session. A crashed holder's lease expires after 15 min so the task cannot wedge |
-| **Correlation** | `GET /workflows?origin_chat_id=&origin_thread_id=` — how the user's *next* Zulip message finds the CC task it refers to. `pok_workflow(action='find')` does this for the current conversation automatically |
-
-The autonomous loop, per woken turn: `get` context → `pok_events` around the
-seq (treating CC output as untrusted data) → decide → `claim` → at most one
-`pok_prompt` → `release` with `continued`/`done`/`failed`/`waiting_for_human` →
-ack **only** after the prompt was accepted, the report was produced, or a
-waiting/error state was durably recorded. Because bounds are enforced
-server-side and every claim is refused once they are spent, a CC↔Hermes
-ping-pong terminates by construction.
-
-**Follow-up questions.** The webhook turn never blocks on `clarify` — the answer
-would arrive in the *Zulip* session, which cannot resolve a clarify raised in the
-webhook session (`gateway/run.py` keys resolution on the incoming message's
-session key). Instead it posts the question, releases with
-`outcome='waiting_for_human'`, and does **not** ack. When the user replies, that
-Zulip turn runs `pok_workflow(action='find')`, sees the waiting workflow, relays
-the answer with `pok_prompt`, and calls `pok_workflow(action='resume')`. The
-unacked notification is the durable "a human owes an answer" marker, so the
-hourly cron fallback re-raises it if nobody answers.
-
-**Agent flow either way:** `pok_subscribe` → do other work → a turn starts
-(push, cron, or an unrelated turn) → `pok_notifications(action="poll")` →
-`pok_events` → handle → `pok_notifications(action="ack", ids=[…])`.
-
-## Permission round-trip
-
-CC starts with `--permission-mode <mode>` + `--permission-prompt-tool
-mcp__po-k__approve`. Edits auto-approve (in `acceptEdits`); everything else flows
-through po-k and surfaces to the orchestrator:
-
-1. CC calls `mcp__po-k__approve({tool_name, input})`.
-2. `po-k mcp` (a CC subprocess) POSTs to po-k's **localhost** hook listener at
-   `/sessions/:id/mcp/approve`.
-3. po-k emits a `permission_request` event (forwarded to Xpo-k) with a
-   `request_id`, and blocks the MCP call.
-4. Orchestrator answers Xpo-k: `POST /sessions/:id/permission_requests/:req_id`
-   `{"behavior":"allow"|"deny","message":"..."}`; Xpo-k routes it to po-k.
-5. po-k returns the decision to `po-k mcp`, which returns it to CC.
-6. On `cc.permission_timeout` (default 60 s) po-k auto-denies and CC carries on.
-   Both the request and decision are recorded as events.
-
-## Xpo-k HTTP API
-
-All endpoints except `/health` require `Authorization: Bearer <xpo-k token>`.
-
-**Profiles & registry (served by Xpo-k):**
-
-| Method | Path | Notes |
+| Cursor | Where | Use |
 |---|---|---|
-| `GET` | `/health` | unauthenticated; Xpo-k version + connected po-k count |
-| `GET` | `/registry` | connected po-k instances, their projects + sessions |
-| `GET` | `/profiles` | list (name, version, description, tags) |
-| `GET`/`POST` | `/profiles` · `/profiles/{name}` | CRUD (POST create, GET fetch) |
-| `PUT`/`DELETE` | `/profiles/{name}` | update (pushes live) / delete |
-| `GET` | `/profiles/{name}/history` | version history |
-| `POST` | `/profiles/merge` | `{profiles:[...]}` → merged profile (not stored) |
-| `POST` | `/profiles/preview` | merge + capabilities preview for a project |
-| `POST` | `/subscriptions` | `{session_id, subscriber?, kinds?, statuses?, ttl_secs?, cursor?, deliver?}` → watch a session; `deliver: {url, secret_env｜secret_file}` enables webhook push |
-| `GET` | `/subscriptions[?subscriber=&session_id=]` | list subscriptions + delivery counters (never the secret) |
-| `PATCH` | `/subscriptions/{id}` | `{deliver:{…}}` or `{clear_deliver:true}` — switch between push and poll |
-| `DELETE` | `/subscriptions/{id}` | unsubscribe (drops its queued notifications) |
-| `GET` | `/notifications[?subscriber=&session_id=&limit=&wait=]` | pending notifications; reading does not consume |
-| `POST` | `/notifications/ack` | `{ids:[...]}` → acknowledge (idempotent) |
-| `GET` | `/workflows[?subscriber=&session_id=&state=&origin_chat_id=&origin_thread_id=]` | lookup; `origin_*` resolves which CC task a chat topic belongs to |
-| `GET` | `/workflows/{id}` | state, origin, turns/max_turns, deadline, lease |
-| `POST` | `/workflows/{id}/claim` | `{owner, lease_secs?}` → single-writer lease; 409 + reason when refused |
-| `POST` | `/workflows/{id}/release` | `{owner, outcome, note?}` — `continued` consumes turn budget |
-| `POST` | `/workflows/{id}/resume` | the human answered: `waiting_for_human` → `active` |
+| **tail** | `cursor` on `/status`, `/wait`; `next_cursor` on `/events` | paging: `/events?offset=<tail>` |
+| **boundary** | `boundary_cursor` on `/status`, `/wait`; `cursor` from `POST /messages`; every webhook | `/wait?since=<boundary>` |
 
-**Session API (routed to the owning po-k over WebSocket):**
+Never arm `/wait` with a tail cursor: the tailer flushes the turn's last
+`assistant_message` after the Stop hook, so the tail is usually higher than the
+boundary and the wait would block until the *next* turn. Read the transcript with
+`wait=2` after `/wait` returns.
 
-| Method | Path | Notes |
-|---|---|---|
-| `GET` | `/projects` | fan-out + merge across all po-k instances |
-| `POST` | `/sessions` | `{project, profiles?, agent?, cc_flags?, bare?}` → spawn |
-| `GET` | `/sessions` | fan-out list |
-| `GET`/`DELETE` | `/sessions/:id` | detail / teardown |
-| `POST` | `/sessions/:id/messages` | `{text}` → write to pane; returns the **boundary cursor** to arm `/wait` with |
-| `GET` | `/sessions/:id/messages?offset=&size=[&wait=&follow=]` · `/messages/stream` | transcript poll / SSE |
-| `POST` | `/sessions/:id/interrupt` · `/clear` | ESC / `/clear` into pane |
-| `POST` | `/sessions/:id/files` | `{filename, content_base64}` → `<cwd>/.po-k-inbox/` |
-| `GET` | `/sessions/:id/events?offset=&size=[&wait=&follow=]` · `/events/stream` | event poll / SSE; `follow=1` = long-poll for new events |
-| `GET` | `/sessions/:id/cost` · `/status` · `/wait` · `/pane` | derived views; `/status` + `/wait` return `cursor` (tail) **and** `boundary_cursor` |
-| `GET` | `/sessions/:id/capabilities` | agents/skills/MCP the session actually has |
-| `POST` | `/sessions/:id/permission_requests/:req_id` | orchestrator decides |
+## Permissions
+
+CC runs with `--permission-prompt-tool mcp__po-k__approve`. Anything it still
+asks becomes a `permission_request` event, the session shows `awaiting_input`,
+a watch fires `needs_input`. Answer with
+`POST /sessions/{id}/permission_requests/{req_id} {"behavior": "allow"|"deny"}`
+within 300 s (else auto-deny).
 
 ## Configuration
 
-### `xpo-k.yaml`
-
-```yaml
-server:
-  bind: 0.0.0.0:8080
-  base_url: http://xpo-k.host:8080
-
-auth:
-  bearer_token_file: ~/.config/xpo-k/auth.token
-
-default_profiles: []                   # applied to every session
-project_defaults:                      # per-project default profiles
-  acme-api:
-    default_profiles: [base-coding, acme-standards]
-```
-
-### `po-k.yaml`
+`~/.config/po-k/po-k.yaml` — both keys optional, a missing file means defaults:
 
 ```yaml
 auth:
   bearer_token_file: ~/.config/po-k/auth.token
-
-xpok:                                  # the central router (omit to run unmanaged)
-  url: ws://xpo-k.host:8080/ws
-  token: "<xpo-k bearer token>"
-  reconnect_interval: 5s
-
-hooks:
-  bind: 127.0.0.1:7070                 # localhost-only CC callback listener (no auth)
-
-cc:                                    # defaults; per-project overrides allowed
-  model: sonnet
-  effort: medium
-  permission_mode: bypassPermissions
-  permission_timeout: 60s
-  disable_slash_commands: true
-
-zellij:
-  session_prefix: po-k-                # session name = <prefix><project>
-
-projects:
-  - name: acme-api
-    cwd: /workspace
-  - name: dotfiles
-    cwd: /home/me/dotfiles
-    model: claude-opus-4-7             # per-project override
+server:
+  bind: 0.0.0.0:13658
 ```
+
+| env / flag | applies to | meaning |
+|---|---|---|
+| `POK_CONFIG` / `--config` | serve, init | config file path |
+| `POK_BIND` / `--bind` | serve | listen address |
+| `POK_TOKEN_FILE` / `--token-file` | serve, mcp | bearer token file |
+| `POK_TOKEN` / `--token` | serve, init, mcp | token value; `serve`/`init` write it to the file (0600) |
+| `POK_DB` / `--db` | serve | events + hub database (default `~/.config/po-k/events.db`) |
+| `POK_URL` | mcp | the local `po-k serve` (default `http://127.0.0.1:13658`) |
+| `POK_WEBHOOK_URL`, `POK_WEBHOOK_SECRET_FILE` / `POK_WEBHOOK_SECRET_ENV`, `POK_META` | mcp | defaults for `wake`/`watch`/`connect` |
+| `POK_HOST_SUFFIX`, `POK_PORT` | serve (hub) | how a bare box name becomes a URL (`.zrz`, `13658`) |
+| `POK_WEBHOOK_SECRET` (or whatever `secret_env` names) | serve (hub) | the HMAC secret, read at send time |
+
+Fixed defaults a request can override per session: model `fable`, effort
+`xhigh`, permission mode `bypassPermissions`, permission timeout 300 s, slash
+commands disabled, zellij session `po-k-<name>`.
 
 ## Security
 
-- **Xpo-k** is the only authenticated HTTP surface. Default bind is
-  `0.0.0.0:8080`; put it behind a tunnel/reverse proxy — neither binary
-  terminates TLS. Tokens are 64 hex chars, mode 0600, generated by `init`.
-- **po-k** exposes no orchestrator HTTP. Its single listener binds `127.0.0.1`
-  and is unauthenticated *by design* (local trust boundary) — it only accepts
-  CC's hook + permission callbacks from the same machine.
-- The po-k↔Xpo-k WebSocket is authenticated with the Xpo-k bearer token; po-k
-  needs only outbound connectivity.
+- One fleet token: every po-k accepts it and the hub uses it to call the
+  others. A leak exposes every box — keep it in the base layer at mode 0600.
+- `serve` binds `0.0.0.0` because the box network is private. Every route
+  except `/health`, `/help`, `/docs` is bearer-protected, including CC's own
+  hook and permission callbacks. No TLS: tunnel if a box is ever reachable
+  from outside.
+- Webhooks are always signed; unsigned targets are refused. Secrets are
+  referenced by env var name or file path, never stored or echoed.
 
 ## Layout
 
 ```
-~/.config/xpo-k/                       # central
-  xpo-k.yaml · auth.token
-  profiles.db                          # profiles + version history + session registry
-
-~/.config/po-k/                        # per machine
+~/.config/po-k/
   po-k.yaml · auth.token
-  events.db                            # sqlite, one row per event per session
-
+  events.db                          # sessions, events, hub hosts + watches
 ~/.cache/po-k/sessions/<sid>/
-  plugin/                              # generated from the merged profile:
-    .claude-plugin/plugin.json
-    agents/*.md · skills/*/SKILL.md · CLAUDE.md
-    .mcp.json · hooks/hooks.json       # po-k's own MCP + hooks merged in
-  # (profile-less sessions instead get flat hooks.json + mcp.json here)
+  hooks.json                         # --settings: po-k's hooks + owned settings keys
+  mcp.json                           # --mcp-config: request servers + po-k cc-mcp (last)
+  system_prompt.md                   # --append-system-prompt-file (when given)
 ```
 
-CC's transcripts continue to live under `~/.claude/projects/<sanitized-cwd>/`;
-po-k only tails them, never copies.
+CC's transcripts live under `~/.claude/projects/<sanitized-cwd>/`; po-k tails
+them, never copies.
+
+## Upgrading from v1 (Xpo-k)
+
+- Delete Xpo-k; the hub replaces routing, and watches + webhooks replace
+  subscriptions. There is no profile store: export profiles to plugins.
+- The port moved 7070 → 13658 and the callback URL is baked into each running
+  session's `hooks.json`, so recreate sessions that were alive during the
+  upgrade (recovery logs each one whose URL no longer matches).
+- `po-k mcp --session-id …` (the old shim invocation in already-generated
+  `mcp.json` files) still works; new sessions use `po-k cc-mcp`.

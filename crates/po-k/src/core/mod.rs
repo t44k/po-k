@@ -1,11 +1,9 @@
 //! Transport-agnostic business logic (M14).
 //!
 //! Every operation po-k exposes lives here as a plain async function taking
-//! `&AppState` plus typed parameters and returning [`CoreResult`]. The Axum
-//! handlers in `http/` and (from Phase 2) the WebSocket dispatcher are both
-//! thin adapters over these functions — neither owns any business logic, so
-//! the two transports can never drift and the logic is unit-testable without a
-//! server stack.
+//! `&AppState` plus typed parameters and returning [`CoreResult`]. The axum
+//! handlers in `http/` are thin adapters over these functions, so the logic is
+//! unit-testable without a server stack.
 
 use serde_json::{json, Value};
 
@@ -15,7 +13,6 @@ pub mod events;
 pub mod hooks;
 pub mod messages;
 pub mod perms;
-pub mod projects;
 pub mod sessions;
 
 /// A successful operation result: an HTTP-ish status plus a JSON body. The

@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "HTTP service for driving Claude Code instances inside dedicated zellij sessions."
+description = "Drive Claude Code sessions inside zellij over HTTP, with a hub + MCP front-end for agents."
 
 [[bin]]
 name = "po-k"
@@ -18,27 +18,21 @@ async-stream = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
-dashmap = { workspace = true }
 futures = { workspace = true }
-futures-util = { workspace = true }
-hostname = { workspace = true }
+hmac = { workspace = true }
 indexmap = { workspace = true }
-matchit = { workspace = true }
-notify = { workspace = true }
-pok-proto = { workspace = true }
-serde_urlencoded = { workspace = true }
-tokio-tungstenite = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
@@ -46,3 +40,4 @@ uuid = { workspace = true }
 [dev-dependencies]
 http-body-util = { workspace = true }
 tempfile = { workspace = true }
+tower = { workspace = true }

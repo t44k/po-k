@@ -3,10 +3,14 @@
 //! input/output/control goes through the MCP socket. The MCP server only runs
 //! *inside* an existing session.
 //!
-//! Socket path: `~/.cache/zellij/{session_name}.mcp.sock`. Wire format: NDJSON,
+//! Socket path mirrors the fork's `get_mcp_socket_path`:
+//! `$XDG_RUNTIME_DIR/zellij/{session}.mcp.sock`, else
+//! `$XDG_CACHE_HOME/zellij/…`, else `~/.cache/zellij/…`. Wire format: NDJSON,
 //! one `{"operation":"...","args":{...}}` per line.
 //!
-//! Requires `mcp { enabled true }` in `~/.config/zellij/config.kdl`.
+//! Requires the fork (`zellij mcp --capabilities` works) with
+//! `mcp { enabled true }` in its config; [`preflight`] checks both at
+//! `po-k serve` startup and refuses to start otherwise.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -178,8 +182,69 @@ pub async fn kill_session(name: &str) -> Result<()> {
 // MCP transport
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Where the fork puts a session's MCP socket (`dirs::runtime_dir()` falling
+/// back to `dirs::cache_dir()`).
+pub fn mcp_socket_dir() -> PathBuf {
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(rt).join("zellij");
+    }
+    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(cache).join("zellij");
+    }
+    crate::config::expand_path("~/.cache/zellij")
+}
+
 fn mcp_socket_path(session: &str) -> PathBuf {
-    crate::config::expand_path(format!("~/.cache/zellij/{session}.mcp.sock"))
+    mcp_socket_dir().join(format!("{session}.mcp.sock"))
+}
+
+pub const FORK_URL: &str = "https://github.com/t44k/zellij/tree/mcp-direct-ipc-refactor";
+
+/// Startup check: the `zellij` on `PATH` must be the MCP fork *and* actually
+/// expose a working MCP socket for a fresh session. Any failure is fatal for
+/// `po-k serve` — without the socket no session can be driven.
+pub async fn preflight() -> Result<()> {
+    let version = Command::new("zellij")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("`zellij` not found on PATH — install the MCP fork from {FORK_URL}"))?;
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+
+    // 1. Build check: stock zellij has no `mcp` subcommand.
+    let caps = Command::new("zellij")
+        .args(["mcp", "--capabilities"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("running `zellij mcp --capabilities`")?;
+    let caps_ok = caps.status.success()
+        && serde_json::from_slice::<Value>(&caps.stdout)
+            .ok()
+            .and_then(|v| v.get("capabilities").and_then(|c| c.get("tools")).cloned())
+            .is_some();
+    if !caps_ok {
+        anyhow::bail!(
+            "{version} is not the MCP-capable zellij: `zellij mcp --capabilities` failed ({}).              Install the fork from {FORK_URL} (built with --features mcp_server_capability).",
+            String::from_utf8_lossy(&caps.stderr).trim()
+        );
+    }
+
+    // 2. Functional check: a fresh background session must expose its socket.
+    let probe = format!("po-k-preflight-{}", std::process::id());
+    let result = ensure_session(&probe).await;
+    let _ = kill_session(&probe).await;
+    match result {
+        Ok(_) => {
+            tracing::info!(%version, socket_dir = %mcp_socket_dir().display(), "zellij preflight ok");
+            Ok(())
+        }
+        Err(e) => anyhow::bail!(
+            "{version} does not expose an MCP socket in {} for a new session: {e:#}.              Enable it with `mcp {{ enabled true }}` in the zellij config, or install the fork from {FORK_URL}.",
+            mcp_socket_dir().display()
+        ),
+    }
 }
 
 async fn mcp_call(session: &str, operation: &str, args: Value) -> Result<Value> {
@@ -313,7 +378,17 @@ pub async fn read_focused_pane(session: &str) -> Result<String> {
 /// prompt in our setup (`exec claude` replaces a bash/fish shell) emits that
 /// glyph at the start of a line, so its presence is a reliable "CC has booted
 /// and is ready to accept input" signal.
+/// Pane text that means a modal menu is open rather than the input prompt.
+/// The first-run trust dialog also uses `❯` as its selection arrow, and typing
+/// a prompt into it would pick "No, exit".
+const MENU_MARKERS: &[&str] = &["Enter to confirm", "Esc to cancel", "trust this folder"];
+
+/// The input prompt is a line starting with `❯` (CC may show a placeholder
+/// hint after it), as long as no modal menu is on screen.
 pub(crate) fn shows_cc_prompt(content: &str) -> bool {
+    if MENU_MARKERS.iter().any(|m| content.contains(m)) {
+        return false;
+    }
     content.lines().any(|l| l.trim_start().starts_with('❯'))
 }
 
@@ -339,6 +414,18 @@ pub async fn wait_for_cc_prompt(session: &str, total: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_dir_prefers_runtime_dir_then_cache() {
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/42");
+        assert_eq!(mcp_socket_path("s"), PathBuf::from("/run/user/42/zellij/s.mcp.sock"));
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        std::env::set_var("XDG_CACHE_HOME", "/c");
+        assert_eq!(mcp_socket_path("s"), PathBuf::from("/c/zellij/s.mcp.sock"));
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::set_var("HOME", "/home/x");
+        assert_eq!(mcp_socket_path("s"), PathBuf::from("/home/x/.cache/zellij/s.mcp.sock"));
+    }
 
     #[test]
     fn parses_short_listing() {
@@ -372,5 +459,9 @@ mod tests {
         assert!(!shows_cc_prompt("the ❯ readiness signal explained"));
         assert!(!shows_cc_prompt("me@host /workspace > cd /x && exec claude"));
         assert!(!shows_cc_prompt(""));
+        // A selection menu is not the input prompt.
+        assert!(!shows_cc_prompt(" Security guide\n\n ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel"));
+        // The real prompt may carry a placeholder hint.
+        assert!(shows_cc_prompt("────\n❯\u{a0}Try \"write a test for <filepath>\"   \n────\n  ⏵⏵ bypass permissions on"));
     }
 }

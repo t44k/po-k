@@ -122,7 +122,7 @@ async fn pump(
                 if !trimmed.is_empty() {
                     if let Some((kind, payload)) = project_event(trimmed) {
                         let ts = events_store::now_iso();
-                        if let Ok(seq) = events_store::append_jsonl_event(
+                        if let Ok(_seq) = events_store::append_jsonl_event(
                             db,
                             sid,
                             &ts,
@@ -133,10 +133,6 @@ async fn pump(
                         .await
                         {
                             state.bus.notify(sid).await;
-                            // Forward to Xpo-k (the atomic offset bump can't go
-                            // through `record`, so forward explicitly).
-                            crate::core::events::forward(state, sid, &kind, &payload, seq, &ts)
-                                .await;
                         }
                     } else {
                         // Unprojectable line: still advance the offset so we
@@ -330,19 +326,14 @@ mod tests {
     async fn test_state_with_session(sid: &str) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::events_store::open(&dir.path().join("e.db")).await.unwrap();
-        let state = AppState::new(
-            Token::__test_new("t".into()),
-            Config::default(),
-            std::path::PathBuf::from("/dev/null"),
-            db,
-        );
+        let state = AppState::new(Token::__test_new("t".into()), Config::default(), db);
         // Seed the session row (append_jsonl_event UPDATEs it) and register it
         // (so the EOF loop doesn't exit before we feed the rest of the line).
         crate::events_store::insert_session(
             &state.db,
             &crate::events_store::SessionRow {
                 sid: sid.into(),
-                project: "p".into(),
+                name: "p".into(),
                 cwd: "/x".into(),
                 zellij_session: "z".into(),
                 model: None,
@@ -351,8 +342,11 @@ mod tests {
                 ended_at: None,
                 pid: None,
                 last_event_seq: 0,
-                profiles: None,
                 plugin_dir: None,
+                plugins: None,
+                mcp_servers: None,
+                permission_mode: None,
+                agent: None,
             },
         )
         .await
@@ -361,17 +355,19 @@ mod tests {
             .sessions
             .insert(crate::session::RunningSession {
                 sid: sid.into(),
-                project: "p".into(),
+                name: "p".into(),
                 cwd: "/x".into(),
                 zellij_session: "z".into(),
                 model: "m".into(),
                 effort: "e".into(),
+                permission_mode: "bypassPermissions".into(),
+                agent: None,
+                plugins: vec![],
+                mcp_servers: vec![],
                 started_at: "now".into(),
                 hooks_path: "/h".into(),
                 mcp_path: "/m".into(),
                 pid: None,
-                profiles: vec![],
-                plugin_dir: None,
             })
             .await;
         (state, dir)
@@ -413,7 +409,7 @@ mod tests {
 
         // Let the pump pick it up, then end the session so it exits.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        state.sessions.remove_for_test("s1").await;
+        state.sessions.remove("s1").await;
         let _ = tokio::time::timeout(Duration::from_secs(2), pump_task).await;
 
         let events = crate::events_store::select_events_since(&state.db, "s1", 0, 100)

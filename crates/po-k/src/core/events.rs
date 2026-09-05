@@ -1,6 +1,5 @@
 //! Event querying: long-poll pages, cost aggregation, and the row stream that
-//! backs both the SSE endpoint (Phase 1) and the WebSocket stream bridge
-//! (Phase 2).
+//! backs the SSE endpoints.
 
 use futures::stream::Stream;
 use serde_json::{json, Value};
@@ -143,11 +142,9 @@ pub async fn cost(state: &AppState, sid: &str) -> CoreResult<CoreResponse> {
     })))
 }
 
-/// The single choke point for emitting an event: append to the DB, wake local
-/// long-poll/SSE waiters, and forward to Xpo-k (`session_event` + a
-/// `status_update` when the derived status changed). Every former
-/// `append_event` + `bus.notify` pair routes through here so forwarding can
-/// never be forgotten.
+/// The single choke point for emitting an event: append to the DB and wake
+/// local long-poll/SSE waiters. Every former `append_event` + `bus.notify`
+/// pair routes through here.
 pub async fn record(
     state: &AppState,
     sid: &str,
@@ -157,65 +154,7 @@ pub async fn record(
     let ts = events_store::now_iso();
     let seq = events_store::append_event(&state.db, sid, &ts, kind, payload).await?;
     state.bus.notify(sid).await;
-    forward(state, sid, kind, payload, seq, &ts).await;
     Ok(seq)
-}
-
-/// Forward an already-persisted event to Xpo-k and emit a status_update when
-/// the derived status changed. Call this after `append_jsonl_event` (whose
-/// atomic offset bump can't go through `record`).
-///
-/// `seq`/`ts` are the values the row was persisted with. Xpo-k needs the seq to
-/// order, deduplicate and resume subscription deliveries — never forward 0 for
-/// a persisted event.
-pub async fn forward(
-    state: &AppState,
-    sid: &str,
-    kind: &str,
-    payload: &serde_json::Value,
-    seq: i64,
-    ts: &str,
-) {
-    state
-        .uplink_send(pok_proto::WsMsg::SessionEvent {
-            sid: sid.to_string(),
-            event: pok_proto::EventEnvelope {
-                kind: kind.to_string(),
-                payload: payload.clone(),
-                seq,
-                ts: ts.to_string(),
-            },
-        })
-        .await;
-    push_status_if_changed(state, sid).await;
-}
-
-async fn push_status_if_changed(state: &AppState, sid: &str) {
-    let ended_at = events_store::get_session(&state.db, sid)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|s| s.ended_at);
-    let latest = match events_store::latest_status_seqs(&state.db, sid).await {
-        Ok(l) => l,
-        Err(_) => return,
-    };
-    let (st, _) = crate::status::derive_status(&latest, ended_at.as_deref());
-    let st = st.as_str().to_string();
-    let changed = state
-        .last_status
-        .get(sid)
-        .map(|v| *v != st)
-        .unwrap_or(true);
-    if changed {
-        state.last_status.insert(sid.to_string(), st.clone());
-        state
-            .uplink_send(pok_proto::WsMsg::StatusUpdate {
-                sid: sid.to_string(),
-                status: st,
-            })
-            .await;
-    }
 }
 
 /// Infinite row stream from `since`, alternating DB drains and bus parks.
@@ -274,7 +213,7 @@ pub fn render_row(r: &EventRow) -> Value {
 }
 
 /// SSE wire framing for one row: `event: <kind>\ndata: <json>\nid: <seq>\n\n`.
-/// Used by the WebSocket stream bridge (Phase 2) which forwards these verbatim.
+#[allow(dead_code)]
 pub fn sse_frame(r: &EventRow) -> String {
     let data = serde_json::to_string(&render_row(r)).unwrap_or_else(|_| "{}".into());
     format!("event: {}\ndata: {}\nid: {}\n\n", r.kind, data, r.seq)

@@ -1,37 +1,42 @@
-//! Bare `po-k` — one-line status.
-//!
-//! For M11.1 this just prints config + token state and a hint. Once `po-k serve`
-//! exposes /health it'll probe the bind address for liveness.
+//! Bare `po-k` — one-line status: config, token, bind, and whether a server
+//! answers on the callback URL.
 
 use anyhow::Result;
+use std::time::Duration;
 
 use crate::config;
 
 pub async fn run() -> Result<()> {
     let cfg_path = config::default_config_path();
-    if !cfg_path.exists() {
-        println!("po-k: no config at {}.", cfg_path.display());
-        println!("Run `po-k init` to generate one.");
-        return Ok(());
-    }
-
     let cfg = config::load_from(&cfg_path)?;
     let token_path = config::expand_path(&cfg.auth.bearer_token_file);
     let token_state = if token_path.exists() { "ok" } else { "MISSING" };
+    let config_state = if cfg_path.exists() { cfg_path.display().to_string() } else { "defaults".to_string() };
 
-    let xpok = cfg
-        .xpok
-        .as_ref()
-        .map(|x| x.url.clone())
-        .unwrap_or_else(|| "<none>".into());
+    let url = format!("{}/health", cfg.server.callback_base_url());
+    let live = match reqwest::Client::builder().timeout(Duration::from_secs(1)).build() {
+        Ok(c) => match c.get(&url).send().await {
+            Ok(r) if r.status().is_success() => {
+                let v: serde_json::Value = r.json().await.unwrap_or_default();
+                format!(
+                    "serving v{} · {} sessions · {} hosts · {} watches",
+                    v["version"].as_str().unwrap_or("?"),
+                    v["sessions"],
+                    v["hosts"],
+                    v["watches"]
+                )
+            }
+            _ => "not running".to_string(),
+        },
+        Err(_) => "not running".to_string(),
+    };
     println!(
-        "po-k {} · config {} · token {} · {} projects · hook-bind {} · xpok {}",
+        "po-k {} · config {} · token {} · bind {} · {}",
         env!("CARGO_PKG_VERSION"),
-        cfg_path.display(),
+        config_state,
         token_state,
-        cfg.projects.len(),
-        cfg.hooks.bind,
-        xpok,
+        cfg.server.bind,
+        live
     );
     Ok(())
 }

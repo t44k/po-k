@@ -1,4 +1,4 @@
-//! Permission round-trip: the blocking `approve` call (from the `po-k mcp`
+//! Permission round-trip: the blocking `approve` call (from the `po-k cc-mcp`
 //! subprocess) and the orchestrator's `resolve`.
 
 use serde_json::{json, Value};
@@ -25,15 +25,7 @@ pub async fn approve(
         return Err(CoreError::not_found(sid));
     }
 
-    let timeout_ms: u64 = state
-        .config
-        .read()
-        .await
-        .cc
-        .permission_timeout
-        .0
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64;
+    let timeout_ms: u64 = crate::defaults::PERMISSION_TIMEOUT.as_millis() as u64;
     let request_id = format!("req-{}", Uuid::new_v4().simple());
     let rx = state.perms.register(request_id.clone()).await;
 

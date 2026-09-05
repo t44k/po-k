@@ -1,17 +1,24 @@
-//! YAML config loader for `po-k.yaml`.
+//! `po-k.yaml` — two optional keys:
 //!
-//! Layout (M14 Phase 2):
-//!   auth:   { bearer_token_file }
-//!   xpok:   { url, token, reconnect_interval }   # optional Xpo-k connection
-//!   hooks:  { bind }                             # localhost CC-callback listener
-//!   cc:     { model, effort, permission_mode, permission_timeout, disable_slash_commands }
-//!   zellij: { session_prefix }
-//!   projects: [ { name, cwd, model?, effort?, add_dirs?, zellij_session? } ]
+//! ```yaml
+//! auth:
+//!   bearer_token_file: ~/.config/po-k/auth.token
+//! server:
+//!   bind: 0.0.0.0:13658
+//! ```
+//!
+//! A missing or empty file means defaults. Unknown keys are tolerated so an
+//! old v1 file (`xpok:`, `cc:`, `projects:` …) still loads. Everything about a
+//! *session* comes from the create request; fixed fallbacks live in
+//! [`crate::defaults`].
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::str::FromStr;
+
+use crate::defaults;
 
 pub const DEFAULT_CONFIG_PATH: &str = "~/.config/po-k/po-k.yaml";
 
@@ -19,56 +26,7 @@ pub const DEFAULT_CONFIG_PATH: &str = "~/.config/po-k/po-k.yaml";
 #[serde(default)]
 pub struct Config {
     pub auth: Auth,
-    /// Xpo-k connection (M14 Phase 2). Optional; once set, po-k connects to
-    /// Xpo-k as a WebSocket client (its only orchestrator interface).
-    pub xpok: Option<Xpok>,
-    /// Localhost-only listener that receives CC's hook/permission callbacks.
-    pub hooks: Hooks,
-    pub cc: CcDefaults,
-    pub zellij: Zellij,
-    pub projects: Vec<Project>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Xpok {
-    /// WebSocket URL of the Xpo-k server, e.g. `ws://xpo-k.host:8080/ws`.
-    pub url: String,
-    /// Shared secret / bearer presented on connect.
-    #[serde(default)]
-    pub token: String,
-    #[serde(default = "default_reconnect")]
-    pub reconnect_interval: HumanDuration,
-    /// Override the hostname advertised to Xpo-k. If unset, uses the OS
-    /// hostname. Must be unique across all connected po-k instances — Xpo-k
-    /// rejects duplicate hostnames.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-}
-
-fn default_reconnect() -> HumanDuration {
-    HumanDuration(Duration::from_secs(5))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Hooks {
-    /// Local-only bind for the hook/permission callback listener.
-    pub bind: String,
-}
-
-impl Default for Hooks {
-    fn default() -> Self {
-        Self {
-            bind: "127.0.0.1:7070".to_string(),
-        }
-    }
-}
-
-impl Hooks {
-    /// Base URL CC's hook curls + the mcp subprocess post back to.
-    pub fn base_url(&self) -> String {
-        format!("http://{}", self.bind)
-    }
+    pub server: Server,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,162 +38,88 @@ pub struct Auth {
 impl Default for Auth {
     fn default() -> Self {
         Self {
-            bearer_token_file: "~/.config/po-k/auth.token".to_string(),
+            bearer_token_file: defaults::TOKEN_FILE.to_string(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct CcDefaults {
-    pub model: String,
-    pub effort: String,
-    pub permission_mode: String,
-    /// Wall-clock budget the MCP `approve` tool waits for the orchestrator's
-    /// decision. Times out → deny.
-    pub permission_timeout: HumanDuration,
-    pub disable_slash_commands: bool,
-    /// When true, allow sessions in arbitrary directories (no pre-configured
-    /// project required). Advertised to Xpo-k as a capability flag.
-    pub ad_hoc: bool,
+pub struct Server {
+    /// Address the HTTP API listens on. `0.0.0.0` inside a dev box: the box
+    /// network is private and every mutating route is bearer-protected.
+    pub bind: String,
 }
 
-impl Default for CcDefaults {
+impl Default for Server {
     fn default() -> Self {
         Self {
-            model: "sonnet".to_string(),
-            effort: "medium".to_string(),
-            permission_mode: "bypassPermissions".to_string(),
-            permission_timeout: HumanDuration(Duration::from_secs(60)),
-            disable_slash_commands: true,
-            ad_hoc: false,
+            bind: defaults::BIND.to_string(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Zellij {
-    pub session_prefix: String,
+impl Server {
+    pub fn socket_addr(&self) -> Result<SocketAddr> {
+        SocketAddr::from_str(&self.bind).with_context(|| format!("parsing server.bind {:?}", self.bind))
+    }
+
+    /// The URL CC's hook curls and the `cc-mcp` shim call back on. Always the
+    /// loopback form of the bind so it works regardless of which interface we
+    /// listen on. Baked into each session's hooks.json / mcp.json at spawn.
+    pub fn callback_base_url(&self) -> String {
+        callback_base_url_for(&self.bind)
+    }
 }
 
-impl Default for Zellij {
-    fn default() -> Self {
-        Self {
-            session_prefix: "po-k-".to_string(),
+pub fn callback_base_url_for(bind: &str) -> String {
+    match SocketAddr::from_str(bind) {
+        Ok(addr) => {
+            let host = match addr.ip() {
+                ip if ip.is_unspecified() => match ip {
+                    IpAddr::V4(_) => "127.0.0.1".to_string(),
+                    IpAddr::V6(_) => "[::1]".to_string(),
+                },
+                IpAddr::V4(v4) => v4.to_string(),
+                IpAddr::V6(v6) => format!("[{v6}]"),
+            };
+            format!("http://{host}:{}", addr.port())
         }
+        Err(_) => format!("http://{bind}"),
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Project {
-    pub name: String,
-    pub cwd: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub add_dirs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub zellij_session: Option<String>,
-}
-
-impl Project {
-    pub fn zellij_session_name(&self, defaults: &Zellij) -> String {
-        self.zellij_session
-            .clone()
-            .unwrap_or_else(|| format!("{}{}", defaults.session_prefix, self.name))
-    }
-
-    pub fn model<'a>(&'a self, defaults: &'a CcDefaults) -> &'a str {
-        self.model.as_deref().unwrap_or(&defaults.model)
-    }
-
-    pub fn effort<'a>(&'a self, defaults: &'a CcDefaults) -> &'a str {
-        self.effort.as_deref().unwrap_or(&defaults.effort)
-    }
-}
-
-/// `"30s"`, `"5m"`, `"2h"` — defaults to seconds if unitless.
-#[derive(Debug, Clone, Copy)]
-pub struct HumanDuration(pub Duration);
-
-impl Default for HumanDuration {
-    fn default() -> Self {
-        Self(Duration::from_secs(60))
-    }
-}
-
-impl Serialize for HumanDuration {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{}s", self.0.as_secs()))
-    }
-}
-
-impl<'de> Deserialize<'de> for HumanDuration {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        parse_duration(&s)
-            .map(HumanDuration)
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty duration".into());
-    }
-    let (num, unit_secs) = if let Some(n) = s.strip_suffix("ms") {
-        (n, 0u64)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1)
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, 60)
-    } else if let Some(n) = s.strip_suffix('h') {
-        (n, 3600)
-    } else {
-        (s, 1)
-    };
-    let n: u64 = num.trim().parse().map_err(|e| format!("bad number {num:?}: {e}"))?;
-    if unit_secs == 0 {
-        Ok(Duration::from_millis(n))
-    } else {
-        Ok(Duration::from_secs(n.saturating_mul(unit_secs)))
-    }
-}
-
-/// Expand a leading `~/` to `$HOME/`. Other paths pass through.
-pub fn expand_path(p: impl AsRef<str>) -> PathBuf {
-    let raw = p.as_ref();
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    if raw == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
-    }
-    PathBuf::from(raw)
-}
-
-pub fn default_config_path() -> PathBuf {
-    expand_path(DEFAULT_CONFIG_PATH)
-}
-
+/// Load a config file. Missing or blank → defaults.
 pub fn load_from(path: &Path) -> Result<Config> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config = serde_yaml::from_str(&raw)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(cfg)
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(Config::default());
+    }
+    serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
 pub fn load_default() -> Result<Config> {
     load_from(&default_config_path())
+}
+
+pub fn default_config_path() -> PathBuf {
+    std::env::var("POK_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| expand_path(DEFAULT_CONFIG_PATH))
+}
+
+/// Expand a leading `~/` using `$HOME`.
+pub fn expand_path(p: impl AsRef<str>) -> PathBuf {
+    let p = p.as_ref();
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(p)
 }
 
 pub fn skeleton_yaml() -> &'static str {
@@ -249,48 +133,43 @@ mod tests {
     #[test]
     fn parses_skeleton() {
         let cfg: Config = serde_yaml::from_str(skeleton_yaml()).unwrap();
-        assert_eq!(cfg.hooks.bind, "127.0.0.1:7070");
-        assert_eq!(cfg.cc.permission_mode, "bypassPermissions");
-        assert_eq!(cfg.cc.permission_timeout.0, Duration::from_secs(60));
-        assert!(cfg.projects.iter().any(|p| p.name == "po-k"));
+        assert_eq!(cfg.server.bind, "0.0.0.0:13658");
+        assert_eq!(cfg.auth.bearer_token_file, "~/.config/po-k/auth.token");
     }
 
     #[test]
-    fn parses_durations() {
-        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
-        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
-        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
-        assert_eq!(parse_duration("42").unwrap(), Duration::from_secs(42));
+    fn missing_or_blank_file_is_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.yaml");
+        let cfg = load_from(&missing).unwrap();
+        assert_eq!(cfg.server.bind, defaults::BIND);
+        let blank = dir.path().join("blank.yaml");
+        std::fs::write(&blank, "\n  \n").unwrap();
+        assert_eq!(load_from(&blank).unwrap().server.bind, defaults::BIND);
     }
 
     #[test]
-    fn project_session_name_uses_prefix() {
-        let zellij = Zellij {
-            session_prefix: "po-k-".into(),
-        };
-        let p = Project {
-            name: "po-k".into(),
-            cwd: "/workspace".into(),
-            model: None,
-            effort: None,
-            add_dirs: vec![],
-            zellij_session: None,
-        };
-        assert_eq!(p.zellij_session_name(&zellij), "po-k-po-k");
+    fn tolerates_v1_keys() {
+        let cfg: Config = serde_yaml::from_str(
+            "auth:\n  bearer_token_file: /t\nxpok:\n  url: ws://x\ncc:\n  model: fable\nprojects: []\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.auth.bearer_token_file, "/t");
+        assert_eq!(cfg.server.bind, defaults::BIND);
     }
 
     #[test]
-    fn project_session_name_honors_override() {
-        let zellij = Zellij::default();
-        let p = Project {
-            name: "foo".into(),
-            cwd: "/x".into(),
-            model: None,
-            effort: None,
-            add_dirs: vec![],
-            zellij_session: Some("custom".into()),
-        };
-        assert_eq!(p.zellij_session_name(&zellij), "custom");
+    fn callback_base_url_maps_unspecified_to_loopback() {
+        assert_eq!(callback_base_url_for("0.0.0.0:13658"), "http://127.0.0.1:13658");
+        assert_eq!(callback_base_url_for("10.0.0.5:8000"), "http://10.0.0.5:8000");
+        assert_eq!(callback_base_url_for("[::]:13658"), "http://[::1]:13658");
+        assert_eq!(callback_base_url_for("127.0.0.1:7071"), "http://127.0.0.1:7071");
+    }
+
+    #[test]
+    fn expand_tilde() {
+        std::env::set_var("HOME", "/home/x");
+        assert_eq!(expand_path("~/a/b"), PathBuf::from("/home/x/a/b"));
+        assert_eq!(expand_path("/abs"), PathBuf::from("/abs"));
     }
 }

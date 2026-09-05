@@ -1,10 +1,10 @@
-//! `po-k init` — write skeleton `~/.config/po-k/po-k.yaml` + generate a
-//! bearer token file with mode 0600. Idempotent: leaves existing files alone.
+//! `po-k init` — write the two-key `po-k.yaml` and a bearer token file
+//! (mode 0600). Idempotent: existing files are left alone unless `--force`.
+//! `--token <hex>` installs a fleet-wide key instead of generating one.
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 
 use crate::auth;
 use crate::config;
@@ -14,46 +14,42 @@ pub struct Args {
     /// Overwrite the config file even if it already exists.
     #[arg(long)]
     pub force: bool,
+    /// Use this token (e.g. the fleet key) instead of generating one. Replaces an existing token file.
+    #[arg(long, env = "POK_TOKEN", hide_env_values = true)]
+    pub token: Option<String>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
     let cfg_path = config::default_config_path();
     if let Some(parent) = cfg_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-
     if cfg_path.exists() && !args.force {
         tracing::info!(path = %cfg_path.display(), "config already exists — leaving it alone (use --force to overwrite)");
     } else {
-        fs::write(&cfg_path, config::skeleton_yaml())
-            .with_context(|| format!("writing {}", cfg_path.display()))?;
-        tracing::info!(path = %cfg_path.display(), "wrote config skeleton");
+        fs::write(&cfg_path, config::skeleton_yaml()).with_context(|| format!("writing {}", cfg_path.display()))?;
+        tracing::info!(path = %cfg_path.display(), "wrote config");
     }
 
-    // Load whatever's on disk to derive the token-file path.
     let cfg = config::load_from(&cfg_path)?;
     let token_path = config::expand_path(&cfg.auth.bearer_token_file);
-    if let Some(parent) = token_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-
-    if token_path.exists() {
-        tracing::info!(path = %token_path.display(), "auth token already exists — leaving it alone");
-    } else {
-        let token = auth::generate_hex_token();
-        fs::write(&token_path, &token)
-            .with_context(|| format!("writing {}", token_path.display()))?;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&token_path, perms)
-            .with_context(|| format!("chmod 0600 {}", token_path.display()))?;
-        tracing::info!(path = %token_path.display(), "generated 32-byte hex bearer token (chmod 0600)");
+    match args.token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => {
+            auth::write_token_file(&token_path, t)?;
+            tracing::info!(path = %token_path.display(), "installed the provided token (chmod 0600)");
+        }
+        None if token_path.exists() => {
+            tracing::info!(path = %token_path.display(), "auth token already exists — leaving it alone");
+        }
+        None => {
+            auth::write_token_file(&token_path, &auth::generate_hex_token())?;
+            tracing::info!(path = %token_path.display(), "generated 32-byte hex bearer token (chmod 0600)");
+        }
     }
 
     println!("po-k init complete.");
     println!("  config: {}", cfg_path.display());
     println!("  token:  {}", token_path.display());
-    println!("Next: edit `projects:` in the config, then run `po-k serve`.");
+    println!("Next: `po-k serve`, then `curl http://127.0.0.1:{}/docs`.", cfg.server.socket_addr().map(|a| a.port()).unwrap_or(13658));
     Ok(())
 }

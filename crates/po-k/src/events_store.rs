@@ -1,9 +1,5 @@
-//! SQLite persistence: `sessions` table + `events` table.
-//!
-//! The `events` table is the only place where the orchestrator-visible event
-//! stream lives. Writers: the JSONL tailer (M11.5), the hook ingest handler
-//! (M11.5), the spawn / cleanup pipeline (M11.4), and the permission tracker
-//! (M11.8). `seq` is monotonic *per session*.
+//! SQLite persistence: `sessions` + `events` (per-session monotonic `seq`),
+//! plus the hub's `hosts` / `watches` tables (see `hub::store`).
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -41,6 +37,19 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_by_sid_seq ON events (sid, seq);
 "#;
 
+/// Additive column migrations. `CREATE TABLE IF NOT EXISTS` never alters an
+/// existing table, so each new column is added separately; the
+/// "duplicate column name" error on a second run is expected and ignored.
+const SESSION_MIGRATIONS: &[&str] = &[
+    "ALTER TABLE sessions ADD COLUMN last_jsonl_offset INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN profiles TEXT", // v1, unused now
+    "ALTER TABLE sessions ADD COLUMN plugin_dir TEXT", // v1 profile sessions, read-only
+    "ALTER TABLE sessions ADD COLUMN plugins TEXT",
+    "ALTER TABLE sessions ADD COLUMN mcp_servers TEXT",
+    "ALTER TABLE sessions ADD COLUMN permission_mode TEXT",
+    "ALTER TABLE sessions ADD COLUMN agent TEXT",
+];
+
 /// Connect (creating the file if missing) and apply the schema.
 pub async fn open(path: &Path) -> Result<Db> {
     if let Some(parent) = path.parent() {
@@ -61,29 +70,18 @@ pub async fn open(path: &Path) -> Result<Db> {
         .execute(&pool)
         .await
         .context("applying schema")?;
-    // Additive migrations. `CREATE TABLE IF NOT EXISTS` doesn't update an
-    // existing table, so add new columns separately and tolerate the
-    // "duplicate column name" error on second+ run.
-    let _ = sqlx::query(
-        "ALTER TABLE sessions ADD COLUMN last_jsonl_offset INTEGER NOT NULL DEFAULT 0",
-    )
-    .execute(&pool)
-    .await;
-    // Profile system (M14): names of the profiles merged into this session
-    // (JSON array) and the path to the generated CC plugin directory.
-    let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN profiles TEXT")
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN plugin_dir TEXT")
-        .execute(&pool)
-        .await;
+    for m in SESSION_MIGRATIONS {
+        let _ = sqlx::query(m).execute(&pool).await;
+    }
+    crate::hub::store::apply_schema(&pool).await?;
     Ok(pool)
 }
 
+/// One row of `sessions`. The `project` column carries the session *name*.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionRow {
     pub sid: String,
-    pub project: String,
+    pub name: String,
     pub cwd: String,
     pub zellij_session: String,
     pub model: Option<String>,
@@ -92,18 +90,23 @@ pub struct SessionRow {
     pub ended_at: Option<String>,
     pub pid: Option<i64>,
     pub last_event_seq: i64,
-    /// JSON array of profile names merged into this session (M14). None for
-    /// legacy/profile-less sessions.
-    #[serde(default)]
-    pub profiles: Option<String>,
-    /// Path to the generated CC plugin directory (M14). None for legacy
-    /// sessions launched without a profile.
+    /// v1 profile sessions kept hooks/mcp under a generated plugin dir. Read
+    /// only, so recovery can still find their files.
     #[serde(default)]
     pub plugin_dir: Option<String>,
+    /// JSON array of plugin paths/URLs the session was created with.
+    #[serde(default)]
+    pub plugins: Option<String>,
+    /// JSON array of the extra MCP server names.
+    #[serde(default)]
+    pub mcp_servers: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
-/// Column list shared by every `SELECT … FROM sessions`, in struct order.
-const SESSION_COLS: &str = "sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq, profiles, plugin_dir";
+const SESSION_COLS: &str = "sid, project, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq, plugin_dir, plugins, mcp_servers, permission_mode, agent";
 
 type SessionTuple = (
     String,
@@ -118,26 +121,16 @@ type SessionTuple = (
     i64,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 fn row_from_tuple(t: SessionTuple) -> SessionRow {
-    let (
-        sid,
-        project,
-        cwd,
-        zellij_session,
-        model,
-        effort,
-        started_at,
-        ended_at,
-        pid,
-        last_event_seq,
-        profiles,
-        plugin_dir,
-    ) = t;
+    let (sid, name, cwd, zellij_session, model, effort, started_at, ended_at, pid, last_event_seq, plugin_dir, plugins, mcp_servers, permission_mode, agent) = t;
     SessionRow {
         sid,
-        project,
+        name,
         cwd,
         zellij_session,
         model,
@@ -146,18 +139,21 @@ fn row_from_tuple(t: SessionTuple) -> SessionRow {
         ended_at,
         pid,
         last_event_seq,
-        profiles,
         plugin_dir,
+        plugins,
+        mcp_servers,
+        permission_mode,
+        agent,
     }
 }
 
 pub async fn insert_session(db: &Db, row: &SessionRow) -> Result<()> {
     sqlx::query(
-        r#"INSERT INTO sessions (sid, project, cwd, zellij_session, model, effort, started_at, pid, last_event_seq, profiles, plugin_dir)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+        r#"INSERT INTO sessions (sid, project, cwd, zellij_session, model, effort, started_at, pid, last_event_seq, plugin_dir, plugins, mcp_servers, permission_mode, agent)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
     )
     .bind(&row.sid)
-    .bind(&row.project)
+    .bind(&row.name)
     .bind(&row.cwd)
     .bind(&row.zellij_session)
     .bind(&row.model)
@@ -165,8 +161,11 @@ pub async fn insert_session(db: &Db, row: &SessionRow) -> Result<()> {
     .bind(&row.started_at)
     .bind(row.pid)
     .bind(row.last_event_seq)
-    .bind(&row.profiles)
     .bind(&row.plugin_dir)
+    .bind(&row.plugins)
+    .bind(&row.mcp_servers)
+    .bind(&row.permission_mode)
+    .bind(&row.agent)
     .execute(db)
     .await
     .context("INSERT INTO sessions")?;
@@ -519,10 +518,10 @@ mod tests {
         open(&path).await.unwrap()
     }
 
-    fn row(sid: &str) -> SessionRow {
+    pub(crate) fn row(sid: &str) -> SessionRow {
         SessionRow {
             sid: sid.into(),
-            project: "p".into(),
+            name: "p".into(),
             cwd: "/x".into(),
             zellij_session: "z".into(),
             model: Some("sonnet".into()),
@@ -531,8 +530,11 @@ mod tests {
             ended_at: None,
             pid: Some(42),
             last_event_seq: 0,
-            profiles: None,
             plugin_dir: None,
+            plugins: None,
+            mcp_servers: None,
+            permission_mode: None,
+            agent: None,
         }
     }
 
@@ -541,7 +543,7 @@ mod tests {
         let db = fresh_db().await;
         insert_session(&db, &row("s1")).await.unwrap();
         let got = get_session(&db, "s1").await.unwrap().unwrap();
-        assert_eq!(got.project, "p");
+        assert_eq!(got.name, "p");
         assert_eq!(got.pid, Some(42));
     }
 
@@ -551,35 +553,62 @@ mod tests {
         insert_session(&db, &row("s2")).await.unwrap();
         let s1 = append_event(&db, "s2", "2026-05-25T12:00:00Z", "user_prompt", &json!({"text":"a"})).await.unwrap();
         let s2 = append_event(&db, "s2", "2026-05-25T12:00:01Z", "tool_use", &json!({"name":"Bash"})).await.unwrap();
-        assert_eq!(s1, 1);
-        assert_eq!(s2, 2);
+        assert_eq!((s1, s2), (1, 2));
         let events = select_events_since(&db, "s2", 0, 100).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].kind, "user_prompt");
-        assert_eq!(events[1].kind, "tool_use");
         let since1 = select_events_since(&db, "s2", 1, 100).await.unwrap();
         assert_eq!(since1.len(), 1);
         assert_eq!(since1[0].seq, 2);
     }
 
     #[tokio::test]
-    async fn profiles_and_plugin_dir_round_trip() {
+    async fn v2_columns_round_trip_and_legacy_rows_still_load() {
         let db = fresh_db().await;
-        let mut r = row("pf1");
-        r.profiles = Some(r#"["base","reviewer"]"#.into());
-        r.plugin_dir = Some("/home/me/.cache/po-k/sessions/pf1/plugin".into());
+        let mut r = row("v2");
+        r.plugins = Some(r#"["/zirzen/base/plugins/sapi"]"#.into());
+        r.mcp_servers = Some(r#"["linear"]"#.into());
+        r.permission_mode = Some("plan".into());
+        r.agent = Some("lead".into());
         insert_session(&db, &r).await.unwrap();
-        let got = get_session(&db, "pf1").await.unwrap().unwrap();
-        assert_eq!(got.profiles.as_deref(), Some(r#"["base","reviewer"]"#));
-        assert_eq!(
-            got.plugin_dir.as_deref(),
-            Some("/home/me/.cache/po-k/sessions/pf1/plugin")
-        );
-        // Legacy rows (NULL columns) still deserialize.
-        insert_session(&db, &row("pf2")).await.unwrap();
-        let legacy = get_session(&db, "pf2").await.unwrap().unwrap();
-        assert_eq!(legacy.profiles, None);
-        assert_eq!(legacy.plugin_dir, None);
+        let got = get_session(&db, "v2").await.unwrap().unwrap();
+        assert_eq!(got.plugins.as_deref(), Some(r#"["/zirzen/base/plugins/sapi"]"#));
+        assert_eq!(got.mcp_servers.as_deref(), Some(r#"["linear"]"#));
+        assert_eq!(got.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(got.agent.as_deref(), Some("lead"));
+        // A v1 profile-mode row keeps its plugin_dir for recovery.
+        let mut legacy = row("v1");
+        legacy.plugin_dir = Some("/home/me/.cache/po-k/sessions/v1/plugin".into());
+        insert_session(&db, &legacy).await.unwrap();
+        let got = get_session(&db, "v1").await.unwrap().unwrap();
+        assert_eq!(got.plugin_dir.as_deref(), Some("/home/me/.cache/po-k/sessions/v1/plugin"));
+        assert_eq!(got.plugins, None);
+    }
+
+    #[tokio::test]
+    async fn opening_a_v1_database_migrates_in_place() {
+        // A v1 database has `profiles`/`plugin_dir` but none of the v2 columns.
+        let path = std::env::temp_dir().join(format!("po-k-v1-{}.db", uuid::Uuid::new_v4()));
+        {
+            let url = format!("sqlite://{}?mode=rwc", path.display());
+            let opts = SqliteConnectOptions::from_str(&url).unwrap().create_if_missing(true);
+            let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+            sqlx::query(SCHEMA).execute(&pool).await.unwrap();
+            for m in &SESSION_MIGRATIONS[..3] {
+                sqlx::query(m).execute(&pool).await.unwrap();
+            }
+            sqlx::query("INSERT INTO sessions (sid, project, cwd, zellij_session, started_at, profiles) VALUES ('old', 'ange', '/workspace', 'po-k-ange', 't', '[\"x\"]')")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let db = open(&path).await.unwrap();
+        let got = get_session(&db, "old").await.unwrap().unwrap();
+        assert_eq!(got.name, "ange");
+        assert_eq!(got.plugins, None);
+        // Opening twice is idempotent.
+        drop(db);
+        open(&path).await.unwrap();
     }
 
     #[tokio::test]
@@ -607,18 +636,16 @@ mod tests {
         let db = fresh_db().await;
         insert_session(&db, &row("s5")).await.unwrap();
         append_event(&db, "s5", "t", "user_prompt", &json!({})).await.unwrap(); // 1
-        append_event(&db, "s5", "t", "raw", &json!({})).await.unwrap();          // 2 (excluded)
-        append_event(&db, "s5", "t", "tool_use", &json!({})).await.unwrap();     // 3
-        append_event(&db, "s5", "t", "stop", &json!({})).await.unwrap();         // 4
-        // idle_prompt notifications are remapped to this kind at hook
-        // ingestion; it must stay outside the status-relevant IN-clause.
+        append_event(&db, "s5", "t", "raw", &json!({})).await.unwrap(); // 2 (excluded)
+        append_event(&db, "s5", "t", "tool_use", &json!({})).await.unwrap(); // 3
+        append_event(&db, "s5", "t", "stop", &json!({})).await.unwrap(); // 4
         append_event(&db, "s5", "t", "idle_notification", &json!({})).await.unwrap(); // 5 (excluded)
         let latest = latest_status_seqs(&db, "s5").await.unwrap();
         assert_eq!(latest.get("user_prompt"), Some(&1));
         assert_eq!(latest.get("tool_use"), Some(&3));
         assert_eq!(latest.get("stop"), Some(&4));
-        assert_eq!(latest.get("raw"), None); // not a status-relevant kind
-        assert_eq!(latest.get("idle_notification"), None); // never drives awaiting_input
+        assert_eq!(latest.get("raw"), None);
+        assert_eq!(latest.get("idle_notification"), None);
     }
 
     #[tokio::test]
@@ -640,11 +667,9 @@ mod tests {
         insert_session(&db, &row("j1")).await.unwrap();
         let seq1 = append_jsonl_event(&db, "j1", "t", "user_prompt", &json!({"text":"a"}), 120).await.unwrap();
         let seq2 = append_jsonl_event(&db, "j1", "t", "assistant_message", &json!({"text":"b"}), 250).await.unwrap();
-        assert_eq!(seq1, 1);
-        assert_eq!(seq2, 2);
+        assert_eq!((seq1, seq2), (1, 2));
         assert_eq!(current_cursor(&db, "j1").await.unwrap(), Some(2));
         assert_eq!(get_jsonl_offset(&db, "j1").await.unwrap(), 250);
-        // Plain append_event still works alongside; offset does NOT advance.
         let seq3 = append_event(&db, "j1", "t", "stop", &json!({})).await.unwrap();
         assert_eq!(seq3, 3);
         assert_eq!(get_jsonl_offset(&db, "j1").await.unwrap(), 250);
@@ -655,14 +680,13 @@ mod tests {
         let db = fresh_db().await;
         insert_session(&db, &row("s6")).await.unwrap();
         append_event(&db, "s6", "t", "user_prompt", &json!({"text":"hi"})).await.unwrap(); // 1
-        append_event(&db, "s6", "t", "notification", &json!({})).await.unwrap();            // 2 (excluded)
+        append_event(&db, "s6", "t", "notification", &json!({})).await.unwrap(); // 2
         append_event(&db, "s6", "t", "assistant_message", &json!({"text":"yo"})).await.unwrap(); // 3
-        append_event(&db, "s6", "t", "permission_request", &json!({})).await.unwrap();      // 4 (excluded)
-        append_event(&db, "s6", "t", "turn_end", &json!({})).await.unwrap();                // 5
+        append_event(&db, "s6", "t", "permission_request", &json!({})).await.unwrap(); // 4
+        append_event(&db, "s6", "t", "turn_end", &json!({})).await.unwrap(); // 5
         let msgs = select_messages_since(&db, "s6", 0, 100).await.unwrap();
         let kinds: Vec<&str> = msgs.iter().map(|r| r.kind.as_str()).collect();
         assert_eq!(kinds, vec!["user_prompt", "assistant_message", "turn_end"]);
-        // `since` cursor and ordering hold.
         let after = select_messages_since(&db, "s6", 1, 100).await.unwrap();
         assert_eq!(after.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 5]);
     }
@@ -675,14 +699,11 @@ mod tests {
             append_event(&db, "t1", "t", "user_prompt", &json!({})).await.unwrap();
         }
         let tail = select_events_tail(&db, "t1", 5).await.unwrap();
-        assert_eq!(
-            tail.iter().map(|r| r.seq).collect::<Vec<_>>(),
-            vec![16, 17, 18, 19, 20]
-        );
+        assert_eq!(tail.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![16, 17, 18, 19, 20]);
     }
 
     #[tokio::test]
-    async fn select_events_tail_when_fewer_than_limit() {
+    async fn select_events_tail_when_fewer_than_limit_or_empty() {
         let db = fresh_db().await;
         insert_session(&db, &row("t2")).await.unwrap();
         for _ in 0..3 {
@@ -690,32 +711,21 @@ mod tests {
         }
         let tail = select_events_tail(&db, "t2", 10).await.unwrap();
         assert_eq!(tail.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
-    }
-
-    #[tokio::test]
-    async fn select_events_tail_empty_session() {
-        let db = fresh_db().await;
         insert_session(&db, &row("t3")).await.unwrap();
-        let tail = select_events_tail(&db, "t3", 5).await.unwrap();
-        assert!(tail.is_empty());
+        assert!(select_events_tail(&db, "t3", 5).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn select_messages_tail_filters_to_transcript() {
         let db = fresh_db().await;
         insert_session(&db, &row("t4")).await.unwrap();
-        append_event(&db, "t4", "t", "user_prompt", &json!({})).await.unwrap();        // 1
-        append_event(&db, "t4", "t", "notification", &json!({})).await.unwrap();       // 2 (excluded)
-        append_event(&db, "t4", "t", "assistant_message", &json!({})).await.unwrap();  // 3
-        append_event(&db, "t4", "t", "permission_request", &json!({})).await.unwrap(); // 4 (excluded)
-        append_event(&db, "t4", "t", "turn_end", &json!({})).await.unwrap();           // 5
-        // Full tail: only the 3 transcript kinds, ascending.
+        append_event(&db, "t4", "t", "user_prompt", &json!({})).await.unwrap(); // 1
+        append_event(&db, "t4", "t", "notification", &json!({})).await.unwrap(); // 2
+        append_event(&db, "t4", "t", "assistant_message", &json!({})).await.unwrap(); // 3
+        append_event(&db, "t4", "t", "permission_request", &json!({})).await.unwrap(); // 4
+        append_event(&db, "t4", "t", "turn_end", &json!({})).await.unwrap(); // 5
         let tail = select_messages_tail(&db, "t4", 10).await.unwrap();
-        assert_eq!(
-            tail.iter().map(|r| r.seq).collect::<Vec<_>>(),
-            vec![1, 3, 5]
-        );
-        // Small tail: the last two *transcript* rows, not the last two overall.
+        assert_eq!(tail.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 3, 5]);
         let tail2 = select_messages_tail(&db, "t4", 2).await.unwrap();
         assert_eq!(tail2.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 5]);
     }

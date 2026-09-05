@@ -1,75 +1,86 @@
-//! `GET /sessions/{id}/capabilities` (spec §6.2): introspect what a running CC
-//! session can do by reading the plugin directory po-k generated for it. The
-//! plugin dir on disk is the source of truth — it's exactly what CC sees.
+//! `GET /sessions/{id}/capabilities`: what a session can do, read from the
+//! plugin directories it was created with (exactly what CC sees) plus the
+//! MCP servers po-k wrote into its `mcp.json`.
 
 use serde_json::{json, Value};
 use std::path::Path;
 
 use super::{internal, CoreError, CoreResponse, CoreResult};
+use crate::defaults;
 use crate::state::AppState;
 
 pub async fn get(state: &AppState, sid: &str) -> CoreResult<CoreResponse> {
-    // Resolve plugin_dir + profiles from the live registry, falling back to the
-    // DB for ended sessions.
-    let (plugin_dir, profiles, project): (Option<String>, Vec<String>, String) =
+    // Live registry first, DB fallback for ended sessions.
+    let (name, plugins, mcp_names, model, effort, permission_mode, agent) =
         if let Some(s) = state.sessions.get(sid).await {
-            (s.plugin_dir, s.profiles, s.project)
-        } else if let Some(row) = crate::events_store::get_session(&state.db, sid)
-            .await
-            .map_err(internal)?
-        {
-            let profiles = row
-                .profiles
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-            (row.plugin_dir, profiles, row.project)
+            (s.name, s.plugins, s.mcp_servers, s.model, s.effort, s.permission_mode, s.agent)
+        } else if let Some(row) = crate::events_store::get_session(&state.db, sid).await.map_err(internal)? {
+            let parse = |s: Option<&str>| -> Vec<String> {
+                s.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default()
+            };
+            (
+                row.name,
+                parse(row.plugins.as_deref()),
+                parse(row.mcp_servers.as_deref()),
+                row.model.unwrap_or_else(|| defaults::MODEL.into()),
+                row.effort.unwrap_or_else(|| defaults::EFFORT.into()),
+                row.permission_mode.unwrap_or_else(|| defaults::PERMISSION_MODE.into()),
+                row.agent,
+            )
         } else {
             return Err(CoreError::not_found(sid));
         };
 
-    let disable_slash = state.config.read().await.cc.disable_slash_commands;
-
-    let mut agents = Vec::new();
-    let mut skills = Vec::new();
-    let mut mcp_servers = Vec::new();
-    let mut settings = json!({});
-    let mut claude_md_summary = String::new();
-
-    if let Some(dir) = plugin_dir.as_deref() {
-        let dir = Path::new(dir);
-        agents = read_agents(dir);
-        skills = read_skills(dir);
-        mcp_servers = read_mcp(dir);
-        settings = read_settings(dir);
-        claude_md_summary = read_claude_summary(dir);
-    }
-    // po-k's permission server is always configured, even in legacy sessions.
-    if !mcp_servers.iter().any(|m| m["name"] == "po-k") {
-        mcp_servers.push(json!({ "name": "po-k", "command": "po-k", "status": "configured" }));
-    }
+    let plugin_views: Vec<Value> = plugins.iter().map(|p| inspect_plugin(p)).collect();
+    let mut mcp_servers: Vec<Value> = mcp_names
+        .iter()
+        .map(|n| json!({ "name": n, "source": "request", "status": "configured" }))
+        .collect();
+    mcp_servers.push(json!({ "name": "po-k", "source": "po-k", "status": "configured" }));
+    let collisions: Vec<&Value> = plugin_views
+        .iter()
+        .flat_map(|p| p["mcp_servers"].as_array().into_iter().flatten())
+        .filter(|m| m["name"] == "po-k")
+        .collect();
 
     Ok(CoreResponse::ok(json!({
         "session_id": sid,
-        "project": project,
-        "profiles_applied": profiles,
+        "name": name,
+        "plugins": plugin_views,
         "capabilities": {
-            "agents": agents,
-            "skills": skills,
             "mcp_servers": mcp_servers,
-            "settings": settings,
-            "claude_md_summary": claude_md_summary,
+            "settings": { "model": model, "effort": effort, "permission_mode": permission_mode, "agent": agent },
             "cc_built_in": {
-                "modes": ["plan", "autoEdit", "fullAuto"],
-                "slash_commands_enabled": !disable_slash,
+                "slash_commands_enabled": !defaults::DISABLE_SLASH_COMMANDS,
                 "task_tool_available": true,
             }
-        }
+        },
+        "warnings": if collisions.is_empty() {
+            Vec::<String>::new()
+        } else {
+            vec!["a plugin defines an MCP server named \"po-k\", which collides with po-k's permission server".to_string()]
+        },
     })))
 }
 
-/// Extract and parse the YAML frontmatter block (between the leading `---` and
-/// the next `---`) into a JSON object.
+/// Read what a plugin directory exposes. URLs and `.zip` archives are listed
+/// but not opened.
+pub fn inspect_plugin(source: &str) -> Value {
+    let path = Path::new(source);
+    if source.starts_with("http://") || source.starts_with("https://") || !path.is_dir() {
+        return json!({ "source": source, "inspected": false });
+    }
+    json!({
+        "source": source,
+        "inspected": true,
+        "agents": read_agents(path),
+        "skills": read_skills(path),
+        "mcp_servers": read_mcp(path),
+        "claude_md_summary": read_claude_summary(path),
+    })
+}
+
+/// Extract and parse the YAML frontmatter block into a JSON object.
 fn parse_frontmatter(content: &str) -> Value {
     let trimmed = content.trim_start();
     let Some(rest) = trimmed.strip_prefix("---") else {
@@ -78,8 +89,7 @@ fn parse_frontmatter(content: &str) -> Value {
     let Some(end) = rest.find("\n---") else {
         return json!({});
     };
-    let yaml = &rest[..end];
-    serde_yaml::from_str::<Value>(yaml).unwrap_or_else(|_| json!({}))
+    serde_yaml::from_str::<Value>(&rest[..end]).unwrap_or_else(|_| json!({}))
 }
 
 fn read_agents(dir: &Path) -> Vec<Value> {
@@ -112,8 +122,7 @@ fn read_skills(dir: &Path) -> Vec<Value> {
         return out;
     };
     for entry in rd.flatten() {
-        let skill_md = entry.path().join("SKILL.md");
-        let Ok(content) = std::fs::read_to_string(&skill_md) else {
+        let Ok(content) = std::fs::read_to_string(entry.path().join("SKILL.md")) else {
             continue;
         };
         let fm = parse_frontmatter(&content);
@@ -140,22 +149,12 @@ fn read_mcp(dir: &Path) -> Vec<Value> {
             json!({
                 "name": name,
                 "command": cfg.get("command").cloned().unwrap_or(Value::Null),
+                "url": cfg.get("url").cloned().unwrap_or(Value::Null),
+                "source": "plugin",
                 "status": "configured",
             })
         })
         .collect()
-}
-
-fn read_settings(dir: &Path) -> Value {
-    let Ok(content) = std::fs::read_to_string(dir.join("settings.json")) else {
-        return json!({});
-    };
-    let parsed: Value = serde_json::from_str(&content).unwrap_or(json!({}));
-    json!({
-        "model": parsed.get("model").cloned().unwrap_or(Value::Null),
-        "effort": parsed.get("effortLevel").or_else(|| parsed.get("effort")).cloned().unwrap_or(Value::Null),
-        "permission_mode": parsed.get("permissionMode").cloned().unwrap_or(Value::Null),
-    })
 }
 
 fn read_claude_summary(dir: &Path) -> String {
@@ -177,40 +176,26 @@ mod tests {
     }
 
     #[test]
-    fn reads_back_generated_plugin_dir() {
-        use crate::profile::{Profile, PokHookContext};
+    fn inspects_a_plugin_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let p = Profile::from_json(&json!({
-            "name": "rev",
-            "claude_md": "# Hello",
-            "agents": { "sec": { "description": "d", "model": "opus", "background": true, "prompt": "x" } },
-            "skills": { "chk": { "description": "s", "user_invocable": true, "content": "c" } },
-            "mcp_servers": { "db": { "command": "npx" } }
-        }))
-        .unwrap();
-        let pok = PokHookContext {
-            base_url: "http://127.0.0.1:7070",
-            token: "T",
-            token_file: Path::new("/t"),
-            sid: "s",
-        };
-        let paths = crate::profile::generate_plugin_dir(tmp.path(), &p, &pok).unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        std::fs::write(dir.join("agents/sec.md"), "---\nname: sec\ndescription: d\nmodel: opus\nbackground: true\n---\nx").unwrap();
+        std::fs::create_dir_all(dir.join("skills/chk")).unwrap();
+        std::fs::write(dir.join("skills/chk/SKILL.md"), "---\nname: chk\ndescription: s\nuser-invocable: true\n---\nc").unwrap();
+        std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{"db":{"command":"npx"},"po-k":{"command":"evil"}}}"#).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "# Hello").unwrap();
 
-        let agents = read_agents(&paths.dir);
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0]["name"], "sec");
-        assert_eq!(agents[0]["background"], true);
+        let v = inspect_plugin(&dir.to_string_lossy());
+        assert_eq!(v["inspected"], true);
+        assert_eq!(v["agents"][0]["name"], "sec");
+        assert_eq!(v["agents"][0]["background"], true);
+        assert_eq!(v["skills"][0]["name"], "chk");
+        let names: Vec<&str> = v["mcp_servers"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"db") && names.contains(&"po-k"));
+        assert_eq!(v["claude_md_summary"], "# Hello");
 
-        let skills = read_skills(&paths.dir);
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0]["name"], "chk");
-        assert_eq!(skills[0]["user_invocable"], true);
-
-        let mcp = read_mcp(&paths.dir);
-        // profile's "db" + reserved "po-k"
-        assert!(mcp.iter().any(|m| m["name"] == "db"));
-        assert!(mcp.iter().any(|m| m["name"] == "po-k"));
-
-        assert_eq!(read_claude_summary(&paths.dir), "# Hello");
+        let url = inspect_plugin("https://example.com/p.zip");
+        assert_eq!(url["inspected"], false);
     }
 }
