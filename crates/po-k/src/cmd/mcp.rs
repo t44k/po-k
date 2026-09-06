@@ -94,21 +94,18 @@ fn tool(name: &str, description: &str, schema: Value) -> Value {
 }
 
 impl AgentTools {
+    /// One HTTP call to the local `po-k serve`. Every failure becomes a tool
+    /// result with `isError: true` and a message that says what to do, so the
+    /// model always sees why a call failed.
     async fn http(&self, method: reqwest::Method, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value, ToolError> {
         let url = format!("{}{}", self.base, path);
-        let mut req = self.http.request(method.clone(), &url).bearer_auth(&self.token).timeout(timeout);
+        let mut req = crate::version::tag(self.http.request(method.clone(), &url)).bearer_auth(&self.token).timeout(timeout);
         if let Some(b) = body {
             req = req.json(&b);
         }
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) => {
-                return Ok(text_result(
-                    format!("cannot reach the local po-k at {}: {e}. Is `po-k serve` running on this box?", self.base),
-                    true,
-                    None,
-                ))
-            }
+            Err(e) => return Ok(text_result(transport_error_message(&e, &self.base, method.as_str(), path, timeout), true, None)),
         };
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
@@ -117,11 +114,7 @@ impl AgentTools {
             let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_default();
             Ok(text_result(pretty, false, Some(parsed)))
         } else {
-            Ok(text_result(
-                format!("HTTP {status} from {} {path}: {}", method.as_str(), serde_json::to_string(&parsed).unwrap_or_default()),
-                true,
-                Some(parsed),
-            ))
+            Ok(text_result(http_error_message(status, method.as_str(), path, &parsed), true, Some(parsed)))
         }
     }
 
@@ -165,6 +158,48 @@ impl AgentTools {
 }
 
 const WAIT_TOOL_TIMEOUT: u64 = 660;
+
+/// Human-readable reason for a request that never got an HTTP answer.
+fn transport_error_message(e: &reqwest::Error, base: &str, method: &str, path: &str, timeout: Duration) -> String {
+    if e.is_timeout() {
+        format!(
+            "{method} {path} timed out after {}s waiting for the local po-k at {base}. The server may be blocked or overloaded; retry, or use `status` instead of a long `wait`.",
+            timeout.as_secs()
+        )
+    } else if e.is_connect() {
+        format!("cannot connect to the local po-k at {base} ({e}). Is `po-k serve` running on this box? Check POK_URL.")
+    } else {
+        format!("request {method} {path} to the local po-k at {base} failed: {e}")
+    }
+}
+
+/// Human-readable reason for a non-2xx answer, leading with the server's own
+/// `error` text when it has one.
+fn http_error_message(status: u16, method: &str, path: &str, body: &Value) -> String {
+    let detail = body.get("error").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
+        body.get("raw")
+            .and_then(Value::as_str)
+            .map(|r| r.chars().take(300).collect())
+            .unwrap_or_else(|| serde_json::to_string(body).unwrap_or_default())
+    });
+    let hint = match status {
+        401 => " — the bearer token differs from the local po-k's auth.token (check POK_TOKEN_FILE)",
+        404 if path.starts_with("/hosts/") && detail.contains("not connected") => " — call `connect` for that host first",
+        404 => " — check the session_id (use `sessions`) and the host",
+        409 if detail.contains("version mismatch") => " — the two po-k builds differ; deploy the same build everywhere",
+        409 => "",
+        502 => " — the remote box is unreachable from the hub; check `host` for its last error",
+        _ => "",
+    };
+    let mut extra = Vec::new();
+    for key in ["session_id", "watch_id", "host", "base_url", "local_version", "remote_version"] {
+        if let Some(v) = body.get(key).filter(|v| !v.is_null()) {
+            extra.push(format!("{key}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())));
+        }
+    }
+    let extra = if extra.is_empty() { String::new() } else { format!(" ({})", extra.join(", ")) };
+    format!("{method} {path} failed with HTTP {status}: {detail}{hint}{extra}")
+}
 
 impl McpTools for AgentTools {
     fn server_name(&self) -> &str {
@@ -424,9 +459,25 @@ mod tests {
     async fn unreachable_local_serve_is_a_tool_error_not_a_crash() {
         let out = tools().call("hosts", json!({})).await.unwrap();
         assert_eq!(out["isError"], true);
-        assert!(out["content"][0]["text"].as_str().unwrap().contains("po-k serve"));
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("cannot connect") && text.contains("po-k serve"), "{text}");
         let missing = tools().call("status", json!({ "host": "x" })).await;
         assert!(matches!(missing, Err(ToolError::InvalidParams(m)) if m.contains("session_id")));
         assert!(matches!(tools().call("nope", json!({})).await, Err(ToolError::UnknownTool(_))));
+    }
+
+    #[test]
+    fn http_error_messages_lead_with_the_server_error_and_a_hint() {
+        let m = http_error_message(404, "GET", "/hosts/box/sessions", &json!({ "error": "host \"box\" is not connected — POST /hosts first" }));
+        assert!(m.starts_with("GET /hosts/box/sessions failed with HTTP 404: host"), "{m}");
+        assert!(m.contains("call `connect`"), "{m}");
+        let m = http_error_message(409, "POST", "/hosts", &json!({ "error": "version mismatch: this po-k is 0.12.0, host x runs 0.11.0", "local_version": "0.12.0", "remote_version": "0.11.0" }));
+        assert!(m.contains("deploy the same build") && m.contains("remote_version=0.11.0"), "{m}");
+        let m = http_error_message(409, "POST", "/hosts/b/sessions", &json!({ "error": "a session named \"api\" is already running", "session_id": "s-1" }));
+        assert!(m.contains("session_id=s-1") && !m.contains("deploy"), "{m}");
+        let m = http_error_message(502, "GET", "/hosts/b/sessions", &json!({ "error": "cannot reach host b (http://b:13658): connection refused", "host": "b", "base_url": "http://b:13658" }));
+        assert!(m.contains("unreachable from the hub") && m.contains("base_url=http://b:13658"), "{m}");
+        let m = http_error_message(500, "GET", "/x", &json!({ "raw": "<html>boom</html>" }));
+        assert!(m.contains("<html>boom</html>"), "{m}");
     }
 }

@@ -64,7 +64,9 @@ pub async fn handle<T: McpTools>(tools: &T, req: &Value) -> Option<String> {
             match tools.call(name, args).await {
                 Ok(result) => jsonrpc_ok(id, result),
                 Err(ToolError::UnknownTool(n)) => jsonrpc_error(id, -32601, &format!("tool not found: {n}")),
-                Err(ToolError::InvalidParams(m)) => jsonrpc_error(id, -32602, &m),
+                // Reported as a tool result, not a protocol error: the model
+                // reads it and fixes the call.
+                Err(ToolError::InvalidParams(m)) => jsonrpc_ok(id, text_result(format!("invalid parameters for `{name}`: {m}"), true, None)),
             }
         }
         other => jsonrpc_error(id, -32601, &format!("method not found: {other}")),
@@ -119,6 +121,7 @@ mod tests {
         async fn call(&self, name: &str, args: Value) -> Result<Value, ToolError> {
             match name {
                 "echo" => Ok(text_result(args.to_string(), false, Some(args))),
+                "needs" => Err(ToolError::InvalidParams("missing x".into())),
                 other => Err(ToolError::UnknownTool(other.into())),
             }
         }
@@ -146,5 +149,9 @@ mod tests {
         let bad = handle(&Fake, &json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "nope" } })).await.unwrap();
         let v: Value = serde_json::from_str(&bad).unwrap();
         assert_eq!(v["error"]["code"], -32601);
+        let invalid = handle(&Fake, &json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": { "name": "needs", "arguments": {} } })).await.unwrap();
+        let v: Value = serde_json::from_str(&invalid).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("invalid parameters for `needs`: missing x"));
     }
 }

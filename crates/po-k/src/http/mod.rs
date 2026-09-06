@@ -70,7 +70,11 @@ pub fn router(state: AppState) -> Router {
         }
     }
     let protected = protected.route_layer(middleware::from_fn_with_state(state.token.clone(), require_bearer));
-    public.merge(protected).fallback(not_found).with_state(state)
+    public
+        .merge(protected)
+        .fallback(not_found)
+        .layer(middleware::from_fn(crate::version::enforce))
+        .with_state(state)
 }
 
 /// JSON 404 for unmatched routes (axum's default is an empty body, which is
@@ -263,6 +267,49 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
         assert_eq!(v["seq"], 1);
+    }
+
+    #[tokio::test]
+    async fn version_header_is_enforced_and_echoed() {
+        let app = router(test_state().await);
+        // No header (a human with curl) → fine, and we announce our version.
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-pok-version").unwrap(), crate::version::VERSION);
+        // Same version → fine, even on protected routes.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header("x-pok-version", crate::version::VERSION)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Different version → 409 before auth even runs, naming both versions.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .header("x-pok-version", "0.11.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let v = body_json(resp).await;
+        assert!(v["error"].as_str().unwrap().contains("version mismatch"), "{v}");
+        assert_eq!(v["client_version"], "0.11.0");
+        assert_eq!(v["server_version"], crate::version::VERSION);
     }
 
     #[tokio::test]

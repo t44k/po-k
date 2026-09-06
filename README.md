@@ -117,6 +117,7 @@ the webhook on every boundary.
 | `connection_lost` / `connection_restored` | the box stopped / resumed answering |
 | `session_lost` | the box no longer knows the session |
 | `auth_failed` | the box rejected the fleet token |
+| `version_mismatch` | the box runs a different po-k build |
 
 Headers: `x-webhook-signature` (hex HMAC-SHA256 of the exact body under the
 secret named by `secret_env`/`secret_file`), `x-request-id`
@@ -187,6 +188,13 @@ server:
 Fixed defaults a request can override per session: model `fable`, effort
 `xhigh`, permission mode `bypassPermissions`, permission timeout 300 s, slash
 commands disabled, zellij session `po-k-<name>`.
+
+## Version handshake
+
+Every po-k → po-k request (hub → box, `po-k mcp` → local serve) carries
+`x-pok-version`; a different build is refused with a 409 naming both versions,
+and `POST /hosts` also compares the remote `/health` version. Deploy the same
+build everywhere before connecting boxes.
 
 ## Security
 

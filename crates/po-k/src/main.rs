@@ -32,6 +32,7 @@ mod session;
 mod state;
 mod status;
 mod systemd_install;
+mod version;
 mod zellij;
 
 /// po-k — drive Claude Code over zellij via HTTP; hub + MCP for agents.

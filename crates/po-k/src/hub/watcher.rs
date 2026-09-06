@@ -10,6 +10,7 @@
 //!   `connection_restored` — the box answered again
 //!   `session_lost`        — the box no longer knows the session (404); done
 //!   `auth_failed`         — the box rejected the fleet token; watch failed
+//!   `version_mismatch`    — the box runs a different po-k build; watch failed
 //!
 //! EXTENSION POINT: deliveries are best-effort with in-task retries. A durable
 //! outbox would slot in around `deliver()` if at-least-once across restarts
@@ -152,10 +153,7 @@ async fn run(state: AppState, watch: WatchRow) {
             "{}/sessions/{}/wait?since={since}&timeout={WAIT_TIMEOUT_SECS}",
             host.base_url, watch.session_id
         );
-        let res = state
-            .hub
-            .client
-            .get(&url)
+        let res = crate::version::tag(state.hub.client.get(&url))
             .bearer_auth(state.token.raw())
             .timeout(Duration::from_secs(WAIT_TIMEOUT_SECS + 60))
             .send()
@@ -185,6 +183,16 @@ async fn run(state: AppState, watch: WatchRow) {
             404 => {
                 deliver(&state, &watch, &target, "session_lost", None, since, &Value::Null, Some("the box no longer knows this session")).await;
                 let _ = store::set_state(&state.db, &watch.id, "done", Some("session_lost"), None).await;
+                return;
+            }
+            409 if crate::version::is_mismatch_body(status_code, &body) => {
+                let msg = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| format!("HTTP 409 from {}: {}", host.base_url, body.chars().take(160).collect::<String>()));
+                deliver(&state, &watch, &target, "version_mismatch", None, since, &Value::Null, Some(&msg)).await;
+                let _ = store::set_state(&state.db, &watch.id, "failed", Some("version_mismatch"), Some(&msg)).await;
+                let _ = store::touch_host(&state.db, &watch.host, Some(&msg)).await;
                 return;
             }
             401 | 403 => {

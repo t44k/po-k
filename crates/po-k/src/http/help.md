@@ -14,6 +14,11 @@ this page (routes, JSON Schemas, defaults).
   (`~/.config/po-k/auth.token`); the hub uses the same token to call other boxes.
 - **Bodies** — JSON. `Content-Type` is not required. Bad or unknown fields give a
   JSON `400 {"error": "..."}` naming the field.
+- **Version handshake** — every po-k → po-k request (hub → box, `po-k mcp` →
+  local serve) carries `x-pok-version`. A different build is refused with
+  `409 {"error": "version mismatch: ...", "server_version", "client_version"}`
+  before anything else runs; every response carries the server's version in
+  the same header. `POST /hosts` also compares the remote `/health` version.
 - **Sessions vs zellij sessions** — a po-k *session* is one CC instance with a
   UUID; it runs inside a zellij session named `po-k-<name>`. Only one live
   session per name (`409` otherwise).
@@ -204,7 +209,8 @@ the shared fleet token. Host keys are what you passed to connect: a bare name
  "meta": {"platform": "zulip", "chat_id": "stream:eng", "thread_id": "deploy"}}
 ```
 Probes `/health` and `/sessions` on the box (502 with the resolved `base_url`
-if unreachable or the token is rejected), stores it, and returns
+if unreachable or the token is rejected; 409 with `local_version` /
+`remote_version` if the box runs a different po-k build), stores it, and returns
 `{"host", "base_url", "version", "sessions": [...], "webhook", "meta"}`. The
 webhook and meta become the defaults for watches on this host; `meta` (≤ 2 KB
 object) is echoed verbatim in every webhook so the orchestrator can route the
@@ -246,6 +252,7 @@ The hub long-polls the remote `/wait` and POSTs one signed JSON body per event:
 | `connection_restored` | it answers again |
 | `session_lost` | the box no longer knows the session (404); done |
 | `auth_failed` | the box rejected the fleet token; watch failed |
+| `version_mismatch` | the box runs a different po-k build; watch failed |
 
 ```json
 {"event_type": "pok_notification", "event": "finished", "host": "jamail-c1",

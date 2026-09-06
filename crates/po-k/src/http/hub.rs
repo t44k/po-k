@@ -17,6 +17,7 @@ use crate::defaults;
 use crate::hub::store::{self, HostRow, WebhookTarget};
 use crate::hub::{hosts, watcher, webhook};
 use crate::state::AppState;
+use crate::version;
 
 type Resp = (StatusCode, Json<Value>);
 
@@ -120,32 +121,57 @@ async fn host_row(state: &AppState, host: &str) -> Result<HostRow, Resp> {
     }
 }
 
-/// Reach a po-k: `/health` unauthenticated, then `/sessions` with the fleet token.
-async fn probe(state: &AppState, base_url: &str) -> Result<Value, String> {
-    let health = state
-        .hub
-        .client
-        .get(format!("{base_url}/health"))
+/// Why a probe failed; `Mismatch` is reported as 409, the rest as 502.
+#[derive(Debug)]
+enum ProbeError {
+    Unreachable(String),
+    Mismatch { message: String, remote_version: String },
+}
+
+impl ProbeError {
+    fn message(&self) -> &str {
+        match self {
+            ProbeError::Unreachable(m) | ProbeError::Mismatch { message: m, .. } => m,
+        }
+    }
+}
+
+/// Reach a po-k: `/health` (unauthenticated; its `version` must equal ours),
+/// then `/sessions` with the fleet token and our version header.
+async fn probe(state: &AppState, base_url: &str) -> Result<Value, ProbeError> {
+    let health = version::tag(state.hub.client.get(format!("{base_url}/health")))
         .timeout(Duration::from_secs(5))
         .send()
         .await
-        .map_err(|e| format!("cannot reach {base_url}: {e}"))?;
-    if !health.status().is_success() {
-        return Err(format!("{base_url}/health returned HTTP {}", health.status().as_u16()));
+        .map_err(|e| ProbeError::Unreachable(format!("cannot reach {base_url}: {e}")))?;
+    let health_status = health.status().as_u16();
+    let health_text = health.text().await.unwrap_or_default();
+    if !(200..300).contains(&health_status) {
+        return Err(ProbeError::Unreachable(format!(
+            "{base_url}/health returned HTTP {health_status}: {}",
+            health_text.chars().take(160).collect::<String>()
+        )));
     }
-    let hv: Value = health.json().await.unwrap_or(Value::Null);
-    let sessions = state
-        .hub
-        .client
-        .get(format!("{base_url}/sessions"))
+    let hv: Value = serde_json::from_str(&health_text).unwrap_or(Value::Null);
+    let remote_version = hv.get("version").and_then(Value::as_str).unwrap_or("").to_string();
+    version::check(&remote_version, &format!("host {base_url}")).map_err(|message| ProbeError::Mismatch {
+        message,
+        remote_version: remote_version.clone(),
+    })?;
+    let sessions = version::tag(state.hub.client.get(format!("{base_url}/sessions")))
         .bearer_auth(state.token.raw())
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| format!("cannot reach {base_url}: {e}"))?;
-    match sessions.status().as_u16() {
-        401 | 403 => return Err(format!("{base_url} rejected the fleet token (HTTP {}) — both po-ks must share one auth.token", sessions.status().as_u16())),
-        s if !(200..300).contains(&s) => return Err(format!("{base_url}/sessions returned HTTP {s}")),
+        .map_err(|e| ProbeError::Unreachable(format!("cannot reach {base_url}: {e}")))?;
+    let status = sessions.status().as_u16();
+    match status {
+        401 | 403 => return Err(ProbeError::Unreachable(format!("{base_url} rejected the fleet token (HTTP {status}) — both po-ks must share one auth.token"))),
+        409 => {
+            let text = sessions.text().await.unwrap_or_default();
+            return Err(ProbeError::Mismatch { message: format!("{base_url}: {text}"), remote_version });
+        }
+        s if !(200..300).contains(&s) => return Err(ProbeError::Unreachable(format!("{base_url}/sessions returned HTTP {s}"))),
         _ => {}
     }
     let list: Value = sessions.json().await.unwrap_or(json!([]));
@@ -166,10 +192,22 @@ pub async fn connect(State(state): State<AppState>, PokJson(body): PokJson<Conne
     }
     let probe = match probe(&state, &resolved.base_url).await {
         Ok(p) => p,
+        Err(ProbeError::Mismatch { message, remote_version }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": message,
+                    "host": resolved.key,
+                    "base_url": resolved.base_url,
+                    "local_version": version::VERSION,
+                    "remote_version": remote_version,
+                })),
+            )
+        }
         Err(e) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": e, "host": resolved.key, "base_url": resolved.base_url })),
+                Json(json!({ "error": e.message(), "host": resolved.key, "base_url": resolved.base_url })),
             )
         }
     };
@@ -218,8 +256,8 @@ pub async fn get_host(State(state): State<AppState>, Path(host): Path<String>) -
             json!({ "ok": true, "version": p["version"], "sessions": p["sessions"] })
         }
         Err(e) => {
-            let _ = store::touch_host(&state.db, &row.host, Some(&e)).await;
-            json!({ "ok": false, "error": e })
+            let _ = store::touch_host(&state.db, &row.host, Some(e.message())).await;
+            json!({ "ok": false, "error": e.message(), "version_mismatch": matches!(e, ProbeError::Mismatch { .. }) })
         }
     };
     let mut v = serde_json::to_value(&row).unwrap_or(json!({}));
@@ -334,7 +372,7 @@ pub async fn proxy(
         None
     };
 
-    let mut req = state.hub.client.request(method.clone(), &url).bearer_auth(state.token.raw());
+    let mut req = version::tag(state.hub.client.request(method.clone(), &url)).bearer_auth(state.token.raw());
     for name in [header::CONTENT_TYPE, header::ACCEPT] {
         if let Some(v) = headers.get(&name) {
             req = req.header(name, v.clone());
@@ -427,9 +465,13 @@ pub async fn create_watch(State(state): State<AppState>, PokJson(body): PokJson<
     }
     // Start at the session's current boundary so a stale stop does not fire.
     let url = format!("{}/sessions/{}/status", row.base_url, body.session_id);
-    let since = match state.hub.client.get(&url).bearer_auth(state.token.raw()).timeout(Duration::from_secs(10)).send().await {
+    let since = match version::tag(state.hub.client.get(&url)).bearer_auth(state.token.raw()).timeout(Duration::from_secs(10)).send().await {
         Err(e) => return err(StatusCode::BAD_GATEWAY, format!("cannot reach host {} ({}): {e}", row.host, row.base_url)),
         Ok(r) if r.status().as_u16() == 404 => return err(StatusCode::NOT_FOUND, format!("session {} not found on host {}", body.session_id, row.host)),
+        Ok(r) if r.status().as_u16() == 409 => {
+            let text = r.text().await.unwrap_or_default();
+            return err(StatusCode::CONFLICT, format!("host {}: {}", row.host, serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string)).unwrap_or(text)));
+        }
         Ok(r) if !r.status().is_success() => return err(StatusCode::BAD_GATEWAY, format!("host {} returned HTTP {} for /status", row.host, r.status().as_u16())),
         Ok(r) => r.json::<Value>().await.ok().and_then(|v| v.get("boundary_cursor").and_then(Value::as_i64)).unwrap_or(0),
     };

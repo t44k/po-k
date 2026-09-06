@@ -44,6 +44,10 @@ pub fn build(state: &AppState) -> Value {
             "public_routes": ["/health", "/help", "/docs"],
             "note": "one fleet-wide token; the same token is accepted by every po-k and used by the hub to call remote ones",
         },
+        "version_handshake": {
+            "header": crate::version::HEADER,
+            "rule": "every po-k → po-k request carries this header; a different version is refused with 409 {error, server_version, client_version}. POST /hosts also compares the remote /health version and answers 409 on mismatch.",
+        },
         "defaults": {
             "model": defaults::MODEL,
             "effort": defaults::EFFORT,
@@ -79,7 +83,7 @@ pub fn build(state: &AppState) -> Value {
             "read the final transcript with wait>=2 after /wait returns: the Stop hook lands before the tailer flushes the last assistant_message",
         ],
         "webhook": {
-            "events": ["finished", "needs_input", "ended", "connection_lost", "connection_restored", "session_lost", "auth_failed"],
+            "events": ["finished", "needs_input", "ended", "connection_lost", "connection_restored", "session_lost", "auth_failed", "version_mismatch"],
             "headers": { "x-webhook-signature": "hex HMAC-SHA256 of the exact body under the secret", "x-request-id": "<watch_id>:<event>:<boundary_cursor> (idempotency key)", "x-pok-event": "pok_notification" },
             "body_is_metadata_only": true,
             "secret": "referenced by env var name (`secret_env`, read from the `po-k serve` environment) or file path (`secret_file`); never stored or echoed",
@@ -101,7 +105,7 @@ fn webhook_event_schema() -> Value {
         "description": "POSTed by the hub to the watch's webhook URL on every turn boundary and connectivity change. Metadata only — fetch content with GET .../events.",
         "properties": {
             "event_type": { "const": "pok_notification" },
-            "event": { "enum": ["finished", "needs_input", "ended", "connection_lost", "connection_restored", "session_lost", "auth_failed"] },
+            "event": { "enum": ["finished", "needs_input", "ended", "connection_lost", "connection_restored", "session_lost", "auth_failed", "version_mismatch"] },
             "host": { "type": "string" },
             "session_id": { "type": "string" },
             "watch_id": { "type": "string" },
