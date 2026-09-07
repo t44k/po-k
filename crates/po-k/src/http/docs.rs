@@ -67,12 +67,14 @@ pub fn build(state: &AppState) -> Value {
             "permission_decision": schema::<super::perms::ResolveBody>(),
             "connect_host": schema::<super::hub::ConnectBody>(),
             "create_watch": schema::<super::hub::WatchBody>(),
+            "send_keys": schema::<super::messages::KeysBody>(),
             "webhook_event": webhook_event_schema(),
+            "notification": notification_schema(),
         },
         "session_status_values": ["working", "awaiting_input", "idle", "ended"],
         "event_kinds": {
             "lifecycle": ["cc_started", "cc_exited", "cc_recovered", "cc_lost"],
-            "hooks": ["user_prompt", "stop", "subagent_stop", "tool_result", "notification", "idle_notification", "session_end"],
+            "hooks": ["user_prompt", "stop", "subagent_stop", "tool_result", "notification", "idle_notification", "permission_prompt", "session_end"],
             "transcript": ["user_prompt", "assistant_message", "tool_use", "tool_result", "user_question", "turn_end", "raw_<type>"],
             "permissions": ["permission_request", "permission_decision"],
         },
@@ -82,18 +84,36 @@ pub fn build(state: &AppState) -> Value {
             "never re-arm /wait with next_cursor from /events — the tail is usually higher than the boundary and the wait would block until the NEXT turn",
             "read the final transcript with wait>=2 after /wait returns: the Stop hook lands before the tailer flushes the last assistant_message",
         ],
+        "input_recipes": {
+            "permission_request": "POST /sessions/{id}/permission_requests/{req_id} {behavior}",
+            "permission_prompt": "CC's native TUI picker (deciding_event.payload has `pane` and `options`): POST /sessions/{id}/keys {\"keys\": [\"<option index>\", \"enter\"]}",
+            "user_question": "POST /sessions/{id}/messages {text} — or /keys when the question is a picker",
+        },
+        "routing_meta": {
+            "rule": "a watch (wake / webhook / POST /watches) needs routing metadata: platform, chat_id, thread_id (non-empty strings) in meta, or inherited from the host's meta (explicit keys overlay the host's); otherwise 400",
+            "zulip": { "platform": "zulip", "chat_id": "stream:<stream>", "thread_id": "<topic>" },
+            "escape_hatch": { "unrouted": true },
+            "max_bytes": defaults::META_MAX_BYTES,
+        },
         "webhook": {
             "events": ["finished", "needs_input", "ended", "connection_lost", "connection_restored", "session_lost", "auth_failed", "version_mismatch"],
-            "headers": { "x-webhook-signature": "hex HMAC-SHA256 of the exact body under the secret", "x-request-id": "<watch_id>:<event>:<boundary_cursor> (idempotency key)", "x-pok-event": "pok_notification" },
+            "headers": { "x-webhook-signature": "hex HMAC-SHA256 of the exact body under the secret", "x-request-id": "<notification_id>:<attempt> (fresh per attempt, so a replay is not deduped away)", "x-pok-event": "pok_notification" },
             "body_is_metadata_only": true,
             "secret": "referenced by env var name (`secret_env`, read from the `po-k serve` environment) or file path (`secret_file`); never stored or echoed",
+            "loop": "boundary → notification row (exactly one per watch/event/boundary_cursor) → POST → receiver acts → POST /notifications/{id}/ack",
+            "ack_rule": "finished, needs_input, ended, session_lost require an ack (`requires_ack: true`); ack AFTER acting on it (reply posted / follow-up prompt sent / permission answered). Connectivity events auto-ack on 2xx.",
+            "replay": format!("an unacked notification is POSTed again after ack_timeout_secs (default {}, per watch), then with doubling intervals up to {} s, at most {} attempts, then state=failed; `attempt` in the body increases, `notification_id` stays", defaults::ACK_TIMEOUT.as_secs(), defaults::REPLAY_MAX_INTERVAL.as_secs(), defaults::REPLAY_MAX_ATTEMPTS),
+            "transport_failure": "connection refused / 5xx / 429 → retried with backoff 30 s → 15 m (state stays pending); other 4xx → state=failed with last_error (fix the route or secret)",
+            "on_receipt": "if first_delivered_at is set (a replay), GET /notifications/{id} first and stop if already acked; the body lists `unacked_previous` (older notifications of the same watch still owed an ack)",
+            "restart": "pending and overdue rows are delivered after `po-k serve` restarts; DELETE /watches/{id} and DELETE /hosts/{host} cancel outstanding rows",
         },
         "quickstart": [
             "POST /hosts {\"host\": \"<box>\", \"webhook\": {\"url\": \"http://127.0.0.1:8644/webhooks/pok\", \"secret_env\": \"POK_WEBHOOK_SECRET\"}}",
             "POST /hosts/<box>/sessions {\"cwd\": \"/workspace\", \"model\": \"fable\", \"plugins\": [\"/zirzen/base/plugins/sapi\"], \"wake\": true}  → 201 {session_id, watch}",
             "POST /hosts/<box>/sessions/<sid>/messages {\"text\": \"...\"}  → {cursor}",
-            "either wait for the webhook, or GET /hosts/<box>/sessions/<sid>/wait?since=<cursor>&timeout=600",
-            "GET /hosts/<box>/sessions/<sid>/messages?offset=-1&size=10&wait=2",
+            "the webhook fires with {notification_id, event, boundary_cursor, origin}; GET /hosts/<box>/sessions/<sid>/messages?offset=-1&size=10&wait=2 to read the reply",
+            "act on it, then POST /notifications/<notification_id>/ack (otherwise it is re-sent after ack_timeout_secs)",
+            "short tasks only: GET /hosts/<box>/sessions/<sid>/wait?since=<cursor>&timeout=120",
             "DELETE /hosts/<box>/sessions/<sid>",
         ],
     })
@@ -102,22 +122,55 @@ pub fn build(state: &AppState) -> Value {
 fn webhook_event_schema() -> Value {
     json!({
         "type": "object",
-        "description": "POSTed by the hub to the watch's webhook URL on every turn boundary and connectivity change. Metadata only — fetch content with GET .../events.",
+        "description": "POSTed by the hub to the watch's webhook URL on every turn boundary and connectivity change, and again while unacknowledged. Metadata only — fetch content with GET .../events.",
         "properties": {
             "event_type": { "const": "pok_notification" },
+            "notification_id": { "type": "string", "description": "stable across replays; POST /notifications/{id}/ack when handled" },
+            "attempt": { "type": "integer", "description": "POST attempts so far including this one; when first_delivered_at is set this is a replay of a still-unacked notification — check GET /notifications/{id} before acting" },
+            "first_delivered_at": { "type": ["string", "null"] },
+            "requires_ack": { "type": "boolean" },
+            "unacked_previous": { "type": "array", "items": { "type": "string" }, "description": "older notifications of the same watch still owed an ack" },
             "event": { "enum": ["finished", "needs_input", "ended", "connection_lost", "connection_restored", "session_lost", "auth_failed", "version_mismatch"] },
             "host": { "type": "string" },
             "session_id": { "type": "string" },
             "watch_id": { "type": "string" },
             "status": { "type": ["string", "null"], "enum": ["working", "awaiting_input", "idle", "ended", null] },
             "boundary_cursor": { "type": "integer", "description": "arm the next /wait with this" },
-            "deciding_event": { "type": ["object", "null"], "properties": { "kind": {}, "seq": {}, "ts": {}, "payload": { "description": "present for user_question / permission_request" } } },
+            "deciding_event": { "type": ["object", "null"], "properties": { "kind": {}, "seq": {}, "ts": {}, "payload": { "description": "present for user_question / permission_request / permission_prompt (pane + options)" } } },
             "message": { "type": ["string", "null"], "description": "human-readable detail for connection/auth events" },
-            "meta": { "description": "whatever was attached to the host/watch (e.g. chat routing ids)" },
-            "origin": { "type": "object", "description": "templating-safe projection of meta: platform, chat_id, chat_name, thread_id, user_id, user_name, session_key, hint — always present, empty string when unknown" },
+            "origin": { "type": "object", "description": "templating-safe projection of the watch's meta: platform, chat_id, chat_name, thread_id, user_id, user_name, session_key, hint — always present, empty string when unknown" },
             "ts": { "type": "string" }
         },
-        "required": ["event_type", "event", "host", "session_id", "watch_id", "boundary_cursor", "ts"]
+        "required": ["event_type", "notification_id", "attempt", "event", "host", "session_id", "watch_id", "boundary_cursor", "requires_ack", "ts"]
+    })
+}
+
+fn notification_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A row of the hub's notification log (GET /notifications). One per watch/event/boundary_cursor.",
+        "properties": {
+            "id": { "type": "string" },
+            "watch_id": { "type": "string" },
+            "host": { "type": "string" },
+            "session_id": { "type": "string" },
+            "event": { "type": "string" },
+            "boundary_cursor": { "type": "integer" },
+            "status": { "type": ["string", "null"] },
+            "deciding_event": { "type": ["object", "null"] },
+            "message": { "type": ["string", "null"] },
+            "origin": { "type": ["object", "null"] },
+            "requires_ack": { "type": "boolean" },
+            "state": { "enum": ["pending", "delivered", "acked", "failed", "cancelled"], "description": "pending = not yet accepted by the receiver; delivered = accepted, ack outstanding (replayed after ack_timeout); acked = done; failed = gave up (4xx or too many replays); cancelled = watch stopped" },
+            "attempts": { "type": "integer" },
+            "next_attempt_at": { "type": ["string", "null"] },
+            "first_delivered_at": { "type": ["string", "null"] },
+            "delivered_at": { "type": ["string", "null"] },
+            "acked_at": { "type": ["string", "null"] },
+            "last_error": { "type": ["string", "null"] },
+            "created_at": { "type": "string" },
+            "updated_at": { "type": "string" }
+        }
     })
 }
 
@@ -134,7 +187,7 @@ mod tests {
         assert!(paths.contains(&"POST /sessions".to_string()));
         assert!(paths.contains(&"ANY /hosts/{host}/sessions/{*rest}".to_string()));
         let schemas = v["schemas"].as_object().unwrap();
-        for key in ["create_session", "send_message", "upload_file", "permission_decision", "connect_host", "create_watch", "webhook_event"] {
+        for key in ["create_session", "send_message", "upload_file", "permission_decision", "connect_host", "create_watch", "send_keys", "webhook_event", "notification"] {
             assert!(schemas.contains_key(key), "missing schema {key}");
         }
         assert_eq!(v["schemas"]["create_session"]["required"], serde_json::json!(["cwd"]));

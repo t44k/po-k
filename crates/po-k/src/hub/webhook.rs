@@ -5,8 +5,10 @@
 //!   event — never CC prose. The woken turn fetches session content itself.
 //! * **The signature covers the exact bytes sent.** Serialise once, HMAC it,
 //!   send that buffer.
-//! * **Idempotency is the receiver's job, keyed on ours.** `x-request-id` is
-//!   `<watch_id>:<event>:<boundary>`, so a retried delivery collapses.
+//! * **One request id per attempt.** `x-request-id` is `<notification_id>:<attempt>`:
+//!   a transport retry of the same attempt collapses on the receiver, while a
+//!   deliberate replay (unacknowledged for `ack_timeout`) gets a new id so the
+//!   receiver's duplicate cache does not swallow it.
 //! * **Secrets are referenced, never stored.** Only an env var name or file
 //!   path lives in the database; the value is read at send time.
 
@@ -19,11 +21,9 @@ use super::store::WebhookTarget;
 
 pub const EVENT_TYPE: &str = "pok_notification";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Attempts before a delivery is parked as failed.
-pub const MAX_ATTEMPTS: u32 = 6;
 
-/// 30s, 60s, 2m, 4m, 8m, then a 15m ceiling.
-pub fn backoff_secs(attempt: u32) -> u64 {
+/// Transport/5xx backoff: 30s, 60s, 2m, 4m, 8m, then a 15m ceiling.
+pub fn backoff_secs(attempt: i64) -> i64 {
     match attempt {
         0 | 1 => 30,
         2 => 60,
@@ -120,27 +120,6 @@ pub async fn post_once(client: &reqwest::Client, target: &WebhookTarget, request
     }
 }
 
-/// Deliver with retries. Returns `Err` with the final reason when parked.
-pub async fn deliver(client: &reqwest::Client, target: &WebhookTarget, request_id: &str, envelope: &Value) -> Result<Outcome, String> {
-    let secret = resolve_secret(target)?;
-    let body = serde_json::to_vec(envelope).map_err(|e| format!("cannot serialise envelope: {e}"))?;
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match post_once(client, target, request_id, &body, &secret).await {
-            o @ (Outcome::Delivered | Outcome::Duplicate) => return Ok(o),
-            Outcome::Fatal(e) => return Err(format!("webhook rejected permanently: {e}")),
-            Outcome::Retry(e) => {
-                if attempt >= MAX_ATTEMPTS {
-                    return Err(format!("giving up after {attempt} attempts: {e}"));
-                }
-                tracing::warn!(url = %target.url, request_id, attempt, error = %e, "webhook delivery failed; retrying");
-                tokio::time::sleep(Duration::from_secs(backoff_secs(attempt))).await;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,7 +134,7 @@ mod tests {
 
     #[test]
     fn backoff_is_monotonic_and_capped() {
-        let seq: Vec<u64> = (1..=8).map(backoff_secs).collect();
+        let seq: Vec<i64> = (1..=8).map(backoff_secs).collect();
         assert_eq!(seq, vec![30, 60, 120, 240, 480, 900, 900, 900]);
     }
 

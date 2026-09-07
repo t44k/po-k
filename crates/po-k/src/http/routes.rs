@@ -39,6 +39,12 @@ const WAIT_QUERY: &[ParamDoc] = &[
     ParamDoc { name: "since", kind: "integer", required: false, doc: "the BOUNDARY cursor to wait past: `cursor` from POST /messages or `boundary_cursor` from /status. Default 0 = any past boundary satisfies" },
     ParamDoc { name: "timeout", kind: "integer", required: false, doc: "seconds (default 60, max 600); on expiry returns 200 with timed_out=true" },
 ];
+const NOTIF_QUERY: &[ParamDoc] = &[
+    ParamDoc { name: "state", kind: "string", required: false, doc: "unacked (default) | pending | delivered | acked | failed | cancelled | all" },
+    ParamDoc { name: "host", kind: "string", required: false, doc: "filter by host key" },
+    ParamDoc { name: "session_id", kind: "string", required: false, doc: "filter by session" },
+    ParamDoc { name: "limit", kind: "integer", required: false, doc: "max rows (default 50, max 500)" },
+];
 const WATCH_QUERY: &[ParamDoc] = &[
     ParamDoc { name: "host", kind: "string", required: false, doc: "filter by host key" },
     ParamDoc { name: "state", kind: "string", required: false, doc: "active | done | failed | stopped" },
@@ -67,6 +73,7 @@ pub static ROUTES: &[RouteDoc] = &[
     RouteDoc { method: "GET", path: "/sessions/{id}/wait", auth: true, summary: "block until CC reaches a turn boundary newer than `since`", query: WAIT_QUERY, body: None, response: "{session_id, status, cursor, boundary_cursor, deciding_event, timed_out?}", mount: || get(control::wait) },
     RouteDoc { method: "GET", path: "/sessions/{id}/pane", auth: true, summary: "raw zellij pane content (ground truth)", query: &[], body: None, response: "{session_id, zellij_session, shows_prompt, content}", mount: || get(control::pane) },
     RouteDoc { method: "GET", path: "/sessions/{id}/capabilities", auth: true, summary: "what the session has: plugins (agents, skills, MCP), settings", query: &[], body: None, response: "{session_id, name, plugins[], capabilities{}, warnings[]}", mount: || get(sessions::capabilities) },
+    RouteDoc { method: "POST", path: "/sessions/{id}/keys", auth: true, summary: "send raw keys to the CC pane (answer a native TUI picker: digits, enter, esc, arrows)", query: &[], body: Some("send_keys"), response: "{ok, keys}", mount: || post(messages::keys) },
     RouteDoc { method: "POST", path: "/sessions/{id}/permission_requests/{req_id}", auth: true, summary: "answer a permission_request event", query: &[], body: Some("permission_decision"), response: "{ok, request_id} | 404", mount: || post(perms::resolve) },
     RouteDoc { method: "POST", path: "/sessions/{id}/hooks/{event}", auth: true, summary: "internal: CC hook callback (curl from hooks.json)", query: &[], body: None, response: "{ok, seq}", mount: || post(hooks_in::ingest) },
     RouteDoc { method: "POST", path: "/sessions/{id}/mcp/approve", auth: true, summary: "internal: blocking permission decision for `po-k cc-mcp`", query: &[], body: None, response: "{behavior, message?}", mount: || post(perms::approve) },
@@ -80,7 +87,10 @@ pub static ROUTES: &[RouteDoc] = &[
     RouteDoc { method: "POST", path: "/watches", auth: true, summary: "watch a remote session: webhook on finished / needs_input / ended / connection_lost", query: &[], body: Some("create_watch"), response: "201 watch | 409 {error, watch_id}", mount: || post(hub::create_watch) },
     RouteDoc { method: "GET", path: "/watches", auth: true, summary: "list watches", query: WATCH_QUERY, body: None, response: "[watch]", mount: || get(hub::list_watches) },
     RouteDoc { method: "GET", path: "/watches/{id}", auth: true, summary: "one watch", query: &[], body: None, response: "watch | 404", mount: || get(hub::get_watch) },
-    RouteDoc { method: "DELETE", path: "/watches/{id}", auth: true, summary: "stop a watch", query: &[], body: None, response: "{ok, watch_id}", mount: || delete(hub::delete_watch) },
+    RouteDoc { method: "DELETE", path: "/watches/{id}", auth: true, summary: "stop a watch and cancel its outstanding notifications", query: &[], body: None, response: "{ok, watch_id, notifications_cancelled}", mount: || delete(hub::delete_watch) },
+    RouteDoc { method: "GET", path: "/notifications", auth: true, summary: "notification log: what was recorded, delivered, acknowledged; `unacked` = still owed an ack", query: NOTIF_QUERY, body: None, response: "[notification]", mount: || get(hub::list_notifications) },
+    RouteDoc { method: "GET", path: "/notifications/{id}", auth: true, summary: "one notification with its delivery state", query: &[], body: None, response: "notification | 404", mount: || get(hub::get_notification) },
+    RouteDoc { method: "POST", path: "/notifications/{id}/ack", auth: true, summary: "acknowledge: the orchestrator handled it; replays stop", query: &[], body: None, response: "{ok, notification_id, already_acked}", mount: || post(hub::ack_notification) },
 ];
 
 #[cfg(test)]

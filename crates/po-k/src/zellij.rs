@@ -343,6 +343,24 @@ pub async fn submit_text(session: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Send raw key events to the focused terminal pane (fork operation
+/// `send_keys`: named keys, `ctrl+x`, single characters, `literal:<text>`).
+pub async fn send_keys(session: &str, keys: &[String]) -> Result<()> {
+    let (tab_index, pane_id) = focused_terminal_pane(session).await?;
+    mcp_call(
+        session,
+        "send_keys",
+        json!({
+            "tab_index": tab_index,
+            "pane_id": pane_id,
+            "keys": keys,
+            "inter_key_delay_ms": 40,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn send_escape(session: &str) -> Result<()> {
     let (tab_index, pane_id) = focused_terminal_pane(session).await?;
     mcp_call(

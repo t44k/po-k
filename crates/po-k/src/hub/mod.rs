@@ -6,15 +6,21 @@
 //! (3) watch remote sessions and call a webhook on the local Hermes when a
 //! turn finishes, needs input, ends, or the remote box stops answering.
 //!
-//! State lives in the local events.db (`hub_hosts`, `hub_watches`); watcher
-//! tasks are respawned from it at startup.
+//! State lives in the local events.db (`hub_hosts`, `hub_watches`,
+//! `hub_notifications`); watcher tasks are respawned from it at startup and
+//! the deliverer drains whatever is pending or overdue.
+//!
+//! Notification loop: watcher persists a boundary (exactly once per watch and
+//! boundary) → deliverer POSTs it to the webhook → the woken Hermes turn acks
+//! it → until then the deliverer replays it after `ack_timeout`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::AbortHandle;
 
+pub mod deliver;
 pub mod hosts;
 pub mod store;
 pub mod watcher;
@@ -24,6 +30,8 @@ pub mod webhook;
 pub struct Hub {
     /// Shared client for remote po-k calls and webhook POSTs.
     pub client: reqwest::Client,
+    /// Wakes the deliverer as soon as a notification is enqueued.
+    pub delivery_wake: Arc<Notify>,
     tasks: Arc<Mutex<HashMap<String, AbortHandle>>>,
 }
 
@@ -43,6 +51,7 @@ impl Hub {
             .expect("reqwest client");
         Self {
             client,
+            delivery_wake: Arc::new(Notify::new()),
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }

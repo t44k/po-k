@@ -44,6 +44,18 @@ pub const HOST_SUFFIX: &str = ".zrz";
 pub const TOKEN_FILE: &str = "~/.config/po-k/auth.token";
 /// Upper bound on `meta` JSON attached to hosts / watches (bytes).
 pub const META_MAX_BYTES: usize = 2048;
+/// A delivered notification that Hermes has not acknowledged within this time
+/// is sent again (per-watch override: `ack_timeout_secs`).
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(900);
+/// Replay interval doubles per attempt up to this cap.
+pub const REPLAY_MAX_INTERVAL: Duration = Duration::from_secs(3600);
+/// Deliveries + replays before a notification is parked as `failed`.
+pub const REPLAY_MAX_ATTEMPTS: i64 = 24;
+/// How often the deliverer looks for due work when nothing wakes it.
+pub const DELIVERY_TICK: Duration = Duration::from_secs(15);
+/// Bounds for a per-watch `ack_timeout_secs`.
+pub const ACK_TIMEOUT_MIN_SECS: i64 = 30;
+pub const ACK_TIMEOUT_MAX_SECS: i64 = 86_400;
 
 pub fn session_dir(sid: &str) -> PathBuf {
     crate::config::expand_path(format!("{SESSIONS_DIR}/{sid}"))

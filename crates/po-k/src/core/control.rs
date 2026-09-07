@@ -144,7 +144,7 @@ async fn deciding_event(db: &Db, sid: &str, seq: Option<i64>) -> Value {
             .filter(|r| r.seq == seq)
             .map(|r| {
                 let mut ev = json!({ "kind": r.kind, "seq": r.seq, "ts": r.ts });
-                if r.kind == "user_question" || r.kind == "permission_request" {
+                if matches!(r.kind.as_str(), "user_question" | "permission_request" | "permission_prompt") {
                     ev["payload"] = r.payload.clone();
                 }
                 ev

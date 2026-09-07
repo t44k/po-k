@@ -355,7 +355,7 @@ pub async fn latest_status_seqs(db: &Db, sid: &str) -> Result<HashMap<String, i6
                'user_prompt','assistant_message','tool_use','tool_result',
                'stop','subagent_stop','notification',
                'session_end','cc_exited','permission_request','permission_decision',
-               'user_question'
+               'user_question','permission_prompt'
              )
            GROUP BY kind"#,
     )
@@ -456,12 +456,22 @@ pub async fn append_jsonl_event(
 
 /// UTC ISO-8601 with second precision; matches what we emit in events.
 pub fn now_iso() -> String {
+    chrono_lite::iso(now_epoch())
+}
+
+pub fn now_epoch() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    chrono_lite::iso(secs)
+        .unwrap_or(0)
+}
+
+/// ISO-8601 timestamp `secs` seconds from now (lexicographically comparable
+/// with every other timestamp this crate writes).
+pub fn iso_in(secs: i64) -> String {
+    let t = (now_epoch() as i64 + secs).max(0) as u64;
+    chrono_lite::iso(t)
 }
 
 mod chrono_lite {

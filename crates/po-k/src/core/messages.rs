@@ -56,6 +56,20 @@ pub async fn clear(state: &AppState, sid: &str) -> CoreResult<CoreResponse> {
     Ok(CoreResponse::ok(json!({ "ok": true })))
 }
 
+/// Send raw keys to CC's pane — the only way to answer a native TUI picker
+/// (a typed prompt would land in the picker as text).
+pub async fn keys(state: &AppState, sid: &str, keys: &[String]) -> CoreResult<CoreResponse> {
+    if keys.is_empty() || keys.len() > 20 {
+        return Err(CoreError::BadRequest("keys must contain 1..=20 entries".into()));
+    }
+    if let Some(bad) = keys.iter().find(|k| k.is_empty() || k.len() > 64 || k.chars().any(char::is_control)) {
+        return Err(CoreError::BadRequest(format!("invalid key entry {bad:?}")));
+    }
+    let zs = require_session(state, sid).await?.zellij_session;
+    zellij::send_keys(&zs, keys).await.map_err(internal)?;
+    Ok(CoreResponse::ok(json!({ "ok": true, "keys": keys })))
+}
+
 pub async fn upload_file(
     state: &AppState,
     sid: &str,

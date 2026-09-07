@@ -42,6 +42,24 @@ pub struct FileBody {
     pub content_base64: String,
 }
 
+/// `POST /sessions/{id}/keys`
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct KeysBody {
+    /// Key sequence for the CC pane, e.g. `["2", "enter"]` or `["esc"]`. Named
+    /// keys: enter, esc, tab, backspace, space, up, down, left, right, home,
+    /// end, pageup, pagedown, delete; modifiers like `ctrl+c`; single
+    /// characters; `literal:<text>`.
+    pub keys: Vec<String>,
+}
+
+pub async fn keys(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+    PokJson(body): PokJson<KeysBody>,
+) -> (StatusCode, Json<Value>) {
+    super::adapt(crate::core::messages::keys(&state, &sid, &body.keys).await)
+}
+
 pub async fn upload_file(
     State(state): State<AppState>,
     Path(sid): Path<String>,

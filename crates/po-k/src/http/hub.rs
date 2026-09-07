@@ -1,5 +1,5 @@
 //! Hub endpoints: connect/list/forget remote hosts, proxy the session API to
-//! a host, and manage watches.
+//! a host, manage watches, and read/acknowledge notifications.
 
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, Query, State};
@@ -69,9 +69,14 @@ pub struct WatchBody {
     /// Overrides the host's default webhook.
     #[serde(default)]
     pub webhook: Option<WebhookSpec>,
-    /// Overrides the host's default meta.
+    /// Routing metadata overlaid on the host's: `platform`, `chat_id`, `thread_id`
+    /// (for Zulip: `{"platform":"zulip","chat_id":"stream:<stream>","thread_id":"<topic>"}`).
     #[serde(default)]
     pub meta: Value,
+    /// Replay a delivered-but-unacknowledged notification after this many
+    /// seconds (default 900, range 30..86400).
+    #[serde(default)]
+    pub ack_timeout_secs: Option<i64>,
 }
 
 fn check_meta(meta: &Value) -> Result<(), Resp> {
@@ -86,6 +91,59 @@ fn check_meta(meta: &Value) -> Result<(), Resp> {
         return Err(err(StatusCode::BAD_REQUEST, format!("meta is {len} bytes; max {}", defaults::META_MAX_BYTES)));
     }
     Ok(())
+}
+
+/// Host meta overlaid with the explicit meta (explicit keys win).
+fn merge_meta(base: &Value, over: &Value) -> Value {
+    match (base, over) {
+        (Value::Object(b), Value::Object(o)) => {
+            let mut m = b.clone();
+            for (k, v) in o {
+                m.insert(k.clone(), v.clone());
+            }
+            Value::Object(m)
+        }
+        (_, Value::Object(_)) => over.clone(),
+        (Value::Object(_), _) => base.clone(),
+        _ => Value::Null,
+    }
+}
+
+pub const ROUTING_KEYS: &[&str] = &["platform", "chat_id", "thread_id"];
+
+/// A watch's meta must say where the wake-up goes. Every wake-up lands in a
+/// fresh Hermes turn that only knows what the envelope tells it; without
+/// routing the report falls back to the platform's home channel.
+fn require_routing(meta: &Value) -> Result<(), Resp> {
+    if meta.get("unrouted").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let missing: Vec<&str> = ROUTING_KEYS
+        .iter()
+        .copied()
+        .filter(|k| !meta.get(*k).and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(err(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "wake requested but routing metadata is missing ({}): pass meta {{\"platform\":\"zulip\",\"chat_id\":\"stream:<stream>\",\"thread_id\":\"<topic>\"}} (from your Current Session Context) or connect the host with it; use meta {{\"unrouted\":true}} to deliberately deliver to the home channel",
+            missing.join(", ")
+        ),
+    ))
+}
+
+fn ack_timeout(explicit: Option<i64>) -> Result<i64, Resp> {
+    match explicit {
+        None => Ok(defaults::ACK_TIMEOUT.as_secs() as i64),
+        Some(v) if (defaults::ACK_TIMEOUT_MIN_SECS..=defaults::ACK_TIMEOUT_MAX_SECS).contains(&v) => Ok(v),
+        Some(v) => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("ack_timeout_secs {v} is outside {}..={}", defaults::ACK_TIMEOUT_MIN_SECS, defaults::ACK_TIMEOUT_MAX_SECS),
+        )),
+    }
 }
 
 fn validate_webhook(spec: Option<WebhookSpec>) -> Result<Option<WebhookTarget>, Resp> {
@@ -270,6 +328,7 @@ pub async fn delete_host(State(state): State<AppState>, Path(host): Path<String>
     for w in &active {
         state.hub.abort_task(&w.id).await;
         let _ = store::set_state(&state.db, &w.id, "stopped", None, Some("host disconnected")).await;
+        let _ = store::cancel_for_watch(&state.db, &w.id).await;
     }
     match store::delete_host(&state.db, &host).await {
         Ok(true) => (StatusCode::OK, Json(json!({ "ok": true, "host": host, "watches_stopped": active.len() }))),
@@ -290,11 +349,12 @@ fn proxy_timeout(method: &Method, path: &str) -> Duration {
     }
 }
 
-/// `wake` / `webhook` / `meta` stripped from a create body, when the caller
-/// asked for a watch.
+/// `wake` / `webhook` / `meta` / `ack_timeout_secs` stripped from a create
+/// body, when the caller asked for a watch.
 struct WakeRequest {
     target: WebhookTarget,
     meta: Value,
+    ack_timeout_secs: i64,
 }
 
 fn extract_wake(body: &mut Bytes, host: &HostRow) -> Result<Option<WakeRequest>, Resp> {
@@ -307,6 +367,7 @@ fn extract_wake(body: &mut Bytes, host: &HostRow) -> Result<Option<WakeRequest>,
     let wake = obj.remove("wake");
     let webhook_v = obj.remove("webhook");
     let meta_v = obj.remove("meta");
+    let ack_v = obj.remove("ack_timeout_secs");
     let wants = match &wake {
         Some(Value::Bool(b)) => *b,
         None => webhook_v.is_some(),
@@ -323,12 +384,17 @@ fn extract_wake(body: &mut Bytes, host: &HostRow) -> Result<Option<WakeRequest>,
                 err(StatusCode::BAD_REQUEST, format!("wake requested but host {:?} has no default webhook — pass `webhook` or reconnect the host with one", host.host))
             })?,
         };
-        let meta = match meta_v {
-            Some(m) if !m.is_null() => m,
-            _ => host.meta.clone(),
-        };
+        let explicit_meta = meta_v.unwrap_or(Value::Null);
+        check_meta(&explicit_meta)?;
+        let meta = merge_meta(&host.meta, &explicit_meta);
         check_meta(&meta)?;
-        Some(WakeRequest { target, meta })
+        require_routing(&meta)?;
+        let ack_timeout_secs = match ack_v {
+            None | Some(Value::Null) => ack_timeout(None)?,
+            Some(Value::Number(n)) => ack_timeout(n.as_i64())?,
+            Some(_) => return Err(err(StatusCode::BAD_REQUEST, "ack_timeout_secs must be an integer")),
+        };
+        Some(WakeRequest { target, meta, ack_timeout_secs })
     } else {
         None
     };
@@ -422,7 +488,7 @@ pub async fn proxy(
     if let (Some(w), true) = (wake, status == StatusCode::CREATED) {
         if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(sid) = v.get("session_id").and_then(Value::as_str).map(str::to_string) {
-                match store::insert_watch(&state.db, &row.host, &sid, &w.target, &w.meta, 0).await {
+                match store::insert_watch(&state.db, &row.host, &sid, &w.target, &w.meta, 0, w.ack_timeout_secs).await {
                     Ok(watch) => {
                         watcher::spawn(&state, watch.clone());
                         v["watch"] = serde_json::to_value(&watch).unwrap_or(Value::Null);
@@ -453,10 +519,17 @@ pub async fn create_watch(State(state): State<AppState>, PokJson(body): PokJson<
         },
         Err(e) => return e,
     };
-    let meta = if body.meta.is_null() { row.meta.clone() } else { body.meta };
-    if let Err(e) = check_meta(&meta) {
+    if let Err(e) = check_meta(&body.meta) {
         return e;
     }
+    let meta = merge_meta(&row.meta, &body.meta);
+    if let Err(e) = check_meta(&meta).and_then(|_| require_routing(&meta)) {
+        return e;
+    }
+    let ack_timeout_secs = match ack_timeout(body.ack_timeout_secs) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     if let Ok(Some(existing)) = store::find_active_watch(&state.db, &row.host, &body.session_id).await {
         return (
             StatusCode::CONFLICT,
@@ -475,7 +548,7 @@ pub async fn create_watch(State(state): State<AppState>, PokJson(body): PokJson<
         Ok(r) if !r.status().is_success() => return err(StatusCode::BAD_GATEWAY, format!("host {} returned HTTP {} for /status", row.host, r.status().as_u16())),
         Ok(r) => r.json::<Value>().await.ok().and_then(|v| v.get("boundary_cursor").and_then(Value::as_i64)).unwrap_or(0),
     };
-    match store::insert_watch(&state.db, &row.host, &body.session_id, &target, &meta, since).await {
+    match store::insert_watch(&state.db, &row.host, &body.session_id, &target, &meta, since, ack_timeout_secs).await {
         Ok(watch) => {
             watcher::spawn(&state, watch.clone());
             (StatusCode::CREATED, Json(serde_json::to_value(&watch).unwrap_or(json!({}))))
@@ -508,9 +581,41 @@ pub async fn delete_watch(State(state): State<AppState>, Path(id): Path<String>)
         Ok(Some(_)) => {
             state.hub.abort_task(&id).await;
             let _ = store::set_state(&state.db, &id, "stopped", None, None).await;
-            (StatusCode::OK, Json(json!({ "ok": true, "watch_id": id })))
+            let cancelled = store::cancel_for_watch(&state.db, &id).await.unwrap_or(0);
+            (StatusCode::OK, Json(json!({ "ok": true, "watch_id": id, "notifications_cancelled": cancelled })))
         }
         Ok(None) => err(StatusCode::NOT_FOUND, format!("watch {id:?} not found")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// `GET /notifications?state=&host=&session_id=&limit=`
+pub async fn list_notifications(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Resp {
+    let st = q.get("state").map(String::as_str).unwrap_or("unacked");
+    if !["unacked", "pending", "delivered", "acked", "failed", "cancelled", "all"].contains(&st) {
+        return err(StatusCode::BAD_REQUEST, "state must be one of unacked, pending, delivered, acked, failed, cancelled, all");
+    }
+    let limit = q.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(50).clamp(1, 500);
+    match store::list_notifications(&state.db, st, q.get("host").map(String::as_str), q.get("session_id").map(String::as_str), limit).await {
+        Ok(rows) => (StatusCode::OK, Json(serde_json::to_value(&rows).unwrap_or(json!([])))),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// `GET /notifications/{id}`
+pub async fn get_notification(State(state): State<AppState>, Path(id): Path<String>) -> Resp {
+    match store::get_notification(&state.db, &id).await {
+        Ok(Some(n)) => (StatusCode::OK, Json(serde_json::to_value(&n).unwrap_or(json!({})))),
+        Ok(None) => err(StatusCode::NOT_FOUND, format!("notification {id:?} not found")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// `POST /notifications/{id}/ack` — the orchestrator handled it; stop replaying.
+pub async fn ack_notification(State(state): State<AppState>, Path(id): Path<String>) -> Resp {
+    match store::ack(&state.db, &id).await {
+        Ok(Some(fresh)) => (StatusCode::OK, Json(json!({ "ok": true, "notification_id": id, "already_acked": !fresh }))),
+        Ok(None) => err(StatusCode::NOT_FOUND, format!("notification {id:?} not found")),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -530,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_wake_strips_hub_fields_and_needs_a_webhook() {
+    fn extract_wake_strips_hub_fields_needs_a_webhook_and_routing_meta() {
         let mut host = HostRow {
             host: "box".into(),
             base_url: "http://box:1".into(),
@@ -540,29 +645,72 @@ mod tests {
             last_seen_at: None,
             last_error: None,
         };
+        let routing = r#"{"platform":"zulip","chat_id":"stream:eng","thread_id":"t"}"#;
         // No wake → body untouched, no watch.
         let mut b = Bytes::from(r#"{"cwd":"/w"}"#);
         assert!(extract_wake(&mut b, &host).unwrap().is_none());
         // wake without any webhook → 400.
-        let mut b = Bytes::from(r#"{"cwd":"/w","wake":true}"#);
+        let mut b = Bytes::from(format!(r#"{{"cwd":"/w","wake":true,"meta":{routing}}}"#));
         assert!(extract_wake(&mut b, &host).is_err());
-        // Explicit webhook wins; fields are stripped from the forwarded body.
-        let mut b = Bytes::from(r#"{"cwd":"/w","wake":true,"webhook":{"url":"http://h/w","secret_env":"S"},"meta":{"k":"v"}}"#);
+        // Explicit webhook but empty meta → 400 naming the missing routing keys.
+        let mut b = Bytes::from(r#"{"cwd":"/w","wake":true,"webhook":{"url":"http://h/w","secret_env":"S"},"meta":{}}"#);
+        let e = extract_wake(&mut b, &host).err().unwrap();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert!(e.1 .0["error"].as_str().unwrap().contains("platform, chat_id, thread_id"), "{}", e.1 .0);
+        // Explicit webhook + full routing: fields are stripped from the forwarded body.
+        let mut b = Bytes::from(format!(r#"{{"cwd":"/w","wake":true,"webhook":{{"url":"http://h/w","secret_env":"S"}},"meta":{routing},"ack_timeout_secs":120}}"#));
         let w = extract_wake(&mut b, &host).unwrap().unwrap();
         assert_eq!(w.target.url, "http://h/w");
-        assert_eq!(w.meta["k"], "v");
+        assert_eq!(w.meta["chat_id"], "stream:eng");
+        assert_eq!(w.ack_timeout_secs, 120);
         let forwarded: Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(forwarded, serde_json::json!({ "cwd": "/w" }));
-        // Host default webhook + meta apply when only wake=true is given.
+        // Host default webhook + meta apply when only wake=true is given; the
+        // explicit meta overlays the host meta.
         host.webhook = Some(WebhookTarget { url: "http://h/d".into(), secret_env: Some("S".into()), secret_file: None });
-        host.meta = serde_json::json!({ "chat": 1 });
-        let mut b = Bytes::from(r#"{"cwd":"/w","wake":true}"#);
+        host.meta = serde_json::json!({ "platform": "zulip", "chat_id": "stream:eng", "thread_id": "default" });
+        let mut b = Bytes::from(r#"{"cwd":"/w","wake":true,"meta":{"thread_id":"specific"}}"#);
         let w = extract_wake(&mut b, &host).unwrap().unwrap();
         assert_eq!(w.target.url, "http://h/d");
-        assert_eq!(w.meta["chat"], 1);
-        // `webhook` alone implies wake.
-        let mut b = Bytes::from(r#"{"cwd":"/w","webhook":{"url":"http://h/x","secret_file":"/s"}}"#);
+        assert_eq!(w.meta["chat_id"], "stream:eng");
+        assert_eq!(w.meta["thread_id"], "specific");
+        assert_eq!(w.ack_timeout_secs, defaults::ACK_TIMEOUT.as_secs() as i64);
+        // `webhook` alone implies wake; `unrouted` is the deliberate escape hatch.
+        host.meta = Value::Null;
+        let mut b = Bytes::from(r#"{"cwd":"/w","webhook":{"url":"http://h/x","secret_file":"/s"},"meta":{"unrouted":true}}"#);
         assert!(extract_wake(&mut b, &host).unwrap().is_some());
+        // Out-of-range ack timeout → 400.
+        let mut b = Bytes::from(format!(r#"{{"cwd":"/w","wake":true,"meta":{routing},"ack_timeout_secs":5}}"#));
+        assert!(extract_wake(&mut b, &host).is_err());
+    }
+
+    #[tokio::test]
+    async fn notifications_endpoints_list_get_and_ack() {
+        let st = test_state().await;
+        let wh = WebhookTarget { url: "http://h/w".into(), secret_env: Some("S".into()), secret_file: None };
+        let w = store::insert_watch(&st.db, "box", "sid-1", &wh, &serde_json::json!({ "chat_id": "c" }), 0, 900).await.unwrap();
+        let n = store::enqueue(&st.db, &w, "finished", Some("idle"), 4, &Value::Null, None, &serde_json::json!({})).await.unwrap().unwrap();
+        let app = crate::http::router(st.clone());
+        let (s, v) = get(app.clone(), "/notifications").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v[0]["id"], n.id);
+        assert_eq!(v[0]["state"], "pending");
+        let (s, v) = get(app.clone(), &format!("/notifications/{}", n.id)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["event"], "finished");
+        let (s, _) = get(app.clone(), "/notifications?state=bogus").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, v) = call(app.clone(), "POST", &format!("/notifications/{}/ack", n.id), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["already_acked"], false);
+        let (_, v) = call(app.clone(), "POST", &format!("/notifications/{}/ack", n.id), None).await;
+        assert_eq!(v["already_acked"], true);
+        let (s, _) = call(app.clone(), "POST", "/notifications/n-nope/ack", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (_, v) = get(app.clone(), "/notifications").await;
+        assert_eq!(v, serde_json::json!([]));
+        let (_, v) = get(app, "/notifications?state=acked&host=box").await;
+        assert_eq!(v[0]["id"], n.id);
     }
 
     #[tokio::test]
@@ -607,8 +755,12 @@ mod tests {
         let (s, v) = call(app.clone(), "POST", "/watches", Some(r#"{"host":"nope","session_id":"x"}"#)).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert!(v["error"].as_str().unwrap().contains("not connected"));
-        let (s, v) = call(app, "POST", "/watches", Some(r#"{"host":"local","session_id":"x"}"#)).await;
+        let (s, v) = call(app.clone(), "POST", "/watches", Some(r#"{"host":"local","session_id":"x"}"#)).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(v["error"].as_str().unwrap().contains("webhook"));
+        // Webhook given but no routing meta → 400 before any remote call.
+        let (s, v) = call(app, "POST", "/watches", Some(r#"{"host":"local","session_id":"x","webhook":{"url":"http://h/w","secret_env":"S"}}"#)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("routing metadata"), "{v}");
     }
 }

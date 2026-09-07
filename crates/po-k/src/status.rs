@@ -101,7 +101,7 @@ pub fn derive_status(latest: &HashMap<String, i64>, ended_at: Option<&str>) -> (
     if perm_pending {
         return (Status::AwaitingInput, get("permission_request"));
     }
-    let awaiting_signals = [get("notification"), get("user_question")]
+    let awaiting_signals = [get("notification"), get("user_question"), get("permission_prompt")]
         .into_iter()
         .flatten()
         .max();

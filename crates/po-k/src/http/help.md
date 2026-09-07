@@ -108,6 +108,13 @@ cursor** to arm `/wait` with.
 
 ### `POST /sessions/{id}/interrupt` — send ESC. `{"ok": true}`
 ### `POST /sessions/{id}/clear` — send `/clear`. `{"ok": true}`
+### `POST /sessions/{id}/keys`
+`{"keys": ["2", "enter"]}` → `{"ok": true, "keys": [...]}`. Raw key events for
+CC's pane: named keys (`enter`, `esc`, `tab`, `up`, `down`, `left`, `right`,
+`backspace`, `space`, `pageup`, `pagedown`, `home`, `end`, `delete`), `ctrl+c`,
+single characters, `literal:<text>`. This is how a **native TUI picker** is
+answered (a `permission_prompt` event: its payload carries `pane` and
+`options`); a typed message would land inside the picker as text.
 ### `POST /sessions/{id}/files`
 `{"filename": "data.txt", "content_base64": "..."}` → written to
 `<cwd>/.po-k-inbox/data.txt`. `filename` must be a bare name.
@@ -193,6 +200,14 @@ asks about becomes a `permission_request` event
 ### `POST /sessions/{id}/permission_requests/{req_id}`
 `{"behavior": "allow" | "deny", "message": "optional reason"}` → `{"ok": true, "request_id"}`.
 
+Which input to use, by `deciding_event.kind`:
+
+| kind | what it is | answer with |
+|---|---|---|
+| `permission_request` | CC asked po-k's permission tool | `POST .../permission_requests/{req_id}` |
+| `permission_prompt` | CC's own TUI dialog (`payload.options`, `payload.pane`) | `POST .../keys {"keys": ["<index>", "enter"]}` |
+| `user_question` | AskUserQuestion | `POST .../messages` (or `/keys` when it renders as a picker) |
+
 ---
 
 ## Hub: other boxes
@@ -226,22 +241,51 @@ Transparent proxy: `/hosts/<h>/sessions/<sid>/wait?since=3` is exactly
 same status codes. Long-poll and SSE routes are passed through with generous
 timeouts. `502 {"error": "cannot reach host ..."}` when the box is down.
 
-`POST /hosts/{host}/sessions` accepts three extra fields that never reach the
-box: `"wake": true` (start a watch with the host's default webhook),
-`"webhook": {...}` (explicit target, implies wake), `"meta": {...}` (override).
+`POST /hosts/{host}/sessions` accepts extra fields that never reach the box:
+`"wake": true` (start a watch with the host's default webhook),
+`"webhook": {...}` (explicit target, implies wake), `"meta": {...}` (routing,
+overlaid on the host's), `"ack_timeout_secs"` (replay interval, default 900).
 On `201` the response gains `"watch": {...}`.
 
+**Routing metadata is required for a watch.** The effective meta (host meta with
+the request's keys on top) must contain non-empty `platform`, `chat_id` and
+`thread_id`, e.g. Zulip: `{"platform": "zulip", "chat_id": "stream:<stream>",
+"thread_id": "<topic>"}`. Otherwise `400 wake requested but routing metadata is
+missing ...`. A wake-up lands in a fresh orchestrator turn that knows only what
+the envelope tells it, so an unrouted wake-up ends up in the home channel — pass
+`{"unrouted": true}` only when that is intended.
+
 ### `POST /watches`
-`{"host": "jamail-c1", "session_id": "<sid>", "webhook"?: {...}, "meta"?: {...}}` →
+`{"host": "jamail-c1", "session_id": "<sid>", "webhook"?: {...}, "meta"?: {...}, "ack_timeout_secs"?: 900}` →
 `201` watch. Starts from the session's current `boundary_cursor`, so an old
 turn never fires. `409 {"error", "watch_id"}` if already watched.
 
 ### `GET /watches[?host=&state=]` · `GET /watches/{id}` · `DELETE /watches/{id}`
-Watch rows: `{id, host, session_id, webhook, meta, since_boundary, state, last_event, last_error, created_at, updated_at}`.
-States: `active`, `done` (session ended / lost), `failed`, `stopped`.
+Watch rows: `{id, host, session_id, webhook, meta, since_boundary, ack_timeout_secs, state, last_event, last_error, created_at, updated_at}`.
+States: `active`, `done` (session ended / lost), `failed`, `stopped`. Deleting a
+watch cancels its outstanding notifications.
+
+### `GET /notifications[?state=&host=&session_id=&limit=]` · `GET /notifications/{id}`
+The notification log — the one place to see what happened to every wake-up.
+`state` ∈ `unacked` (default: pending or delivered, ack still owed), `pending`,
+`delivered`, `acked`, `failed`, `cancelled`, `all`. Rows:
+`{id, watch_id, host, session_id, event, boundary_cursor, status, deciding_event, origin, requires_ack, state, attempts, next_attempt_at, first_delivered_at, delivered_at, acked_at, last_error, created_at, updated_at}`.
+A `failed` or old `unacked` row **is** a lost completion: read the session and act.
+
+### `POST /notifications/{id}/ack`
+→ `{"ok": true, "notification_id", "already_acked"}`. Says "handled"; replays
+stop. Idempotent. Call it **after** the report/follow-up has been posted, never
+before.
 
 ### Webhook contract
-The hub long-polls the remote `/wait` and POSTs one signed JSON body per event:
+The loop that keeps the orchestrator and CC in step:
+
+```
+box /wait ─▶ hub watcher ─▶ notification row (exactly one per watch/event/boundary) ─▶ POST webhook
+                                              ▲ replayed after ack_timeout_secs until ─▶ POST /notifications/{id}/ack
+```
+The watcher long-polls the remote `/wait`, **persists** the boundary first, and a
+separate deliverer POSTs one signed JSON body per notification:
 
 | event | when |
 |---|---|
@@ -255,21 +299,38 @@ The hub long-polls the remote `/wait` and POSTs one signed JSON body per event:
 | `version_mismatch` | the box runs a different po-k build; watch failed |
 
 ```json
-{"event_type": "pok_notification", "event": "finished", "host": "jamail-c1",
+{"event_type": "pok_notification", "notification_id": "n-...", "attempt": 1,
+ "first_delivered_at": null, "event": "finished", "host": "jamail-c1",
  "session_id": "<sid>", "watch_id": "w-...", "status": "idle", "boundary_cursor": 42,
  "deciding_event": {"kind": "stop", "seq": 42, "ts": "...", "payload": null},
- "message": null, "meta": {"chat_id": "stream:eng"},
- "origin": {"platform": "", "chat_id": "stream:eng", "chat_name": "", "thread_id": "", "user_id": "", "user_name": "", "session_key": "", "hint": ""},
+ "message": null, "requires_ack": true, "unacked_previous": [],
+ "origin": {"platform": "zulip", "chat_id": "stream:eng", "chat_name": "", "thread_id": "deploy", "user_id": "", "user_name": "", "session_key": "", "hint": ""},
  "ts": "..."}
 ```
-`origin` mirrors `meta` with every routing key always present (empty when
-unknown) so a receiver template like `{origin.chat_id}` can never render literally.
-Headers: `x-webhook-signature` = hex HMAC-SHA256 of the exact body under the
-secret named by `secret_env` (an env var of the `po-k serve` process) or
-`secret_file`; `x-request-id` = `<watch_id>:<event>:<boundary_cursor>` (dedupe
-key); `x-pok-event: pok_notification`. Bodies never contain CC prose — the woken
-turn reads `.../events` itself. Deliveries retry 30 s → 15 m for six attempts;
-a `4xx` parks the delivery and records `last_error` on the watch.
+`origin` mirrors the watch's meta with every routing key always present (empty
+when unknown) so a receiver template like `{origin.chat_id}` can never render
+literally. Headers: `x-webhook-signature` = hex HMAC-SHA256 of the exact body
+under the secret named by `secret_env` (an env var of the `po-k serve` process)
+or `secret_file`; `x-request-id` = `<notification_id>:<attempt>` (fresh per
+attempt, so a receiver that dedupes on it still sees replays);
+`x-pok-event: pok_notification`. Bodies never contain CC prose — the woken turn
+reads `.../events` itself.
+
+Delivery and acknowledgement:
+- `finished`, `needs_input`, `ended`, `session_lost` **require an ack**. After a
+  `2xx` the row is `delivered`; if no `POST /notifications/{id}/ack` arrives
+  within `ack_timeout_secs` it is POSTed again (`attempt` 2, 3, …; interval
+  doubling to 1 h; up to 24 attempts, then `failed`). A replay has
+  `first_delivered_at` set: check `GET /notifications/{id}` first and stop if
+  it is already acked.
+- Connectivity events (`connection_lost`, `connection_restored`, `auth_failed`,
+  `version_mismatch`) are informational: acked automatically on `2xx`.
+- Connection refused / `5xx` / `429` → retried 30 s → 15 m (`pending`); any
+  other `4xx` → `failed` with `last_error` (a route or secret problem).
+- `unacked_previous` lists older notifications of the same watch still owed an
+  ack — handle them too.
+- Everything `pending` or overdue when `po-k serve` restarts is delivered after
+  the restart. Stopping a watch or forgetting a host cancels its rows.
 
 ---
 
@@ -291,7 +352,8 @@ Every event is `{seq, ts, kind, ...payload}`.
 Lifecycle: `cc_started`, `cc_exited`, `cc_recovered`, `cc_lost`.
 Hooks: `user_prompt`, `stop` (the turn boundary), `subagent_stop`,
 `tool_result`, `notification`, `idle_notification` (CC's post-turn "waiting for
-input"; not status-relevant), `session_end`.
+input"; not status-relevant), `permission_prompt` (CC's native permission
+dialog; payload `pane` + `options` — answer with `/keys`), `session_end`.
 Transcript (JSONL tailer): `user_prompt`, `assistant_message` (`text`,
 `stop_reason`, `turn_id`), `tool_use`, `tool_result`, `user_question`
 (AskUserQuestion), `turn_end` (cost/usage), `raw_<type>`.
@@ -302,6 +364,7 @@ Permissions: `permission_request`, `permission_decision`.
 Sessions live on in zellij across a po-k restart. On startup po-k recovers every
 session with `ended_at IS NULL` whose zellij + MCP socket still answer
 (`cc_recovered`), marks the rest ended (`cc_lost`), resumes each JSONL tailer
-from its stored byte offset, and respawns every active hub watch. The callback
+from its stored byte offset, respawns every active hub watch, and resumes
+delivering pending / unacknowledged notifications. The callback
 URL baked into a session's `hooks.json` must still match this server: a bind
 change orphans older sessions (logged at recovery) — recreate them.

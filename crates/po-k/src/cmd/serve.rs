@@ -84,6 +84,8 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::warn!(error = %e, "session recovery failed; starting clean");
     }
     crate::hub::watcher::respawn_all(&state).await;
+    // Deliver anything pending/overdue and keep doing so; wakes on new rows.
+    crate::hub::deliver::spawn(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
     tracing::info!(

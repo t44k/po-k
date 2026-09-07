@@ -82,7 +82,7 @@ fn webhook_prop() -> Value {
 }
 
 fn meta_prop() -> Value {
-    json!({ "type": "object", "description": "Small JSON object echoed in every webhook (e.g. {platform, chat_id, thread_id}) so the wake-up can be routed back to this conversation." })
+    json!({ "type": "object", "description": "Routing metadata for wake-ups: {\"platform\": \"zulip\", \"chat_id\": \"stream:<stream>\", \"thread_id\": \"<topic>\"} — take stream and topic from your Current Session Context (**Source:** line). Required for a watch unless the host was connected with it (explicit keys overlay the host's); {\"unrouted\": true} deliberately sends wake-ups to the home channel." })
 }
 
 fn obj(props: Value, required: &[&str]) -> Value {
@@ -145,9 +145,10 @@ impl AgentTools {
         let mut schema = CreateRequest::json_schema();
         if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
             props.insert("host".into(), host_prop());
-            props.insert("wake".into(), json!({ "type": "boolean", "description": "Start a watch so a webhook fires when the turn finishes / needs input / ends (default true when a webhook is configured)." }));
+            props.insert("wake".into(), json!({ "type": "boolean", "description": "Start a watch so a webhook wakes you when the turn finishes / needs input / ends (default true when a webhook is configured). Each wake-up carries a notification_id you must `ack` after acting on it, or it is re-sent." }));
             props.insert("webhook".into(), webhook_prop());
             props.insert("meta".into(), meta_prop());
+            props.insert("ack_timeout_secs".into(), json!({ "type": "integer", "description": "Re-send an unacknowledged wake-up after this many seconds (default 900, 30..86400)." }));
         }
         if let Some(req) = schema.get_mut("required").and_then(Value::as_array_mut) {
             req.insert(0, json!("host"));
@@ -158,6 +159,7 @@ impl AgentTools {
 }
 
 const WAIT_TOOL_TIMEOUT: u64 = 660;
+const WAIT_DEFAULT_SECS: u64 = 120;
 
 /// Human-readable reason for a request that never got an HTTP answer.
 fn transport_error_message(e: &reqwest::Error, base: &str, method: &str, path: &str, timeout: Duration) -> String {
@@ -209,7 +211,7 @@ impl McpTools for AgentTools {
     fn tools(&self) -> Vec<Value> {
         vec![
             tool("docs", "Read po-k's API description (routes, the create-session JSON Schema, defaults, cursor rules, webhook contract). Call once before your first `create`.", obj(json!({ "format": { "type": "string", "enum": ["json", "markdown"], "description": "default json" } }), &[])),
-            tool("connect", "Connect a dev box so its Claude Code sessions can be driven. Probes it and remembers it. Set a webhook here to get woken when sessions on it finish.", obj(json!({ "host": { "type": "string", "description": "Box name (e.g. `jamail-c1` → jamail-c1.zrz), `host:port`, `http://host:port`, or `local`." }, "webhook": webhook_prop(), "meta": meta_prop() }), &["host"])),
+            tool("connect", "Connect a dev box so its Claude Code sessions can be driven. Probes it and remembers it. The webhook and meta given here become the defaults for every watch on the box; pass the routing meta of the conversation that owns the box.", obj(json!({ "host": { "type": "string", "description": "Box name (e.g. `jamail-c1` → jamail-c1.zrz), `host:port`, `http://host:port`, or `local`." }, "webhook": webhook_prop(), "meta": meta_prop() }), &["host"])),
             tool("hosts", "List connected boxes with their last contact and active watch counts.", obj(json!({}), &[])),
             tool("host", "One connected box with a live probe (version, sessions).", obj(json!({ "host": host_prop() }), &["host"])),
             tool("disconnect", "Forget a box and stop its watches.", obj(json!({ "host": host_prop() }), &["host"])),
@@ -217,19 +219,22 @@ impl McpTools for AgentTools {
             tool("sessions", "List running sessions on a box.", obj(json!({ "host": host_prop() }), &["host"])),
             tool("prompt", "Type a prompt into a session. Returns `cursor`: the boundary cursor to pass to `wait`.", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "text": { "type": "string" } }), &["host", "session_id", "text"])),
             tool("status", "Derived status (working | awaiting_input | idle | ended) plus cursor and boundary_cursor.", obj(json!({ "host": host_prop(), "session_id": sid_prop() }), &["host", "session_id"])),
-            tool("wait", "Block until the session reaches a turn boundary newer than `since` (default: its current boundary). Returns status; `timed_out: true` means call again. Prefer a webhook (`wake`) for long tasks.", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "since": { "type": "integer", "description": "boundary cursor from `prompt`/`status`/a webhook; default: current boundary" }, "timeout": { "type": "integer", "description": "seconds, max 600 (default 600)" } }), &["host", "session_id"])),
+            tool("wait", "Block until the session reaches a turn boundary newer than `since` (default: its current boundary). Returns status; `timed_out: true` means call again. For short tasks only: a wake-up (`wake` on create / `watch`) is durable — if a wait is interrupted the completion is still delivered as a webhook and listed by `notifications`.", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "since": { "type": "integer", "description": "boundary cursor from `prompt`/`status`/a webhook; default: current boundary" }, "timeout": { "type": "integer", "description": "seconds, max 600 (default 120)" } }), &["host", "session_id"])),
             tool("events", "Read session events. Default: the latest 10 (offset=-1). Use `transcript_only` for just prompts/replies/tool calls. Keep `size` small — a full transcript can be huge.", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "offset": { "type": "integer", "description": "-1 = tail (default); or a cursor to page forward from" }, "size": { "type": "integer", "description": "default 10, max 1000" }, "wait": { "type": "integer", "description": "long-poll seconds when empty (default 2)" }, "follow": { "type": "boolean", "description": "with offset=-1: wait for NEW events only" }, "transcript_only": { "type": "boolean" } }), &["host", "session_id"])),
             tool("pane", "Raw zellij pane content — ground truth when events look wrong.", obj(json!({ "host": host_prop(), "session_id": sid_prop() }), &["host", "session_id"])),
             tool("interrupt", "Send ESC to interrupt the current turn.", obj(json!({ "host": host_prop(), "session_id": sid_prop() }), &["host", "session_id"])),
+            tool("keys", "Send raw keys to CC's pane. Answers a native TUI picker (`permission_prompt` event: see `deciding_event.payload.options`) — e.g. [\"1\", \"enter\"] to accept. Named keys: enter, esc, tab, up, down, left, right, backspace, space; `ctrl+c`; single characters; `literal:<text>`.", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "keys": { "type": "array", "items": { "type": "string" }, "description": "1..20 key entries, sent in order" } }), &["host", "session_id", "keys"])),
             tool("clear", "Send /clear to reset CC's context.", obj(json!({ "host": host_prop(), "session_id": sid_prop() }), &["host", "session_id"])),
             tool("upload", "Drop a file into the session's <cwd>/.po-k-inbox/. Pass content_base64, or file_path (read on this machine).", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "filename": { "type": "string" }, "content_base64": { "type": "string" }, "file_path": { "type": "string" } }), &["host", "session_id", "filename"])),
             tool("cost", "Token and cost totals.", obj(json!({ "host": host_prop(), "session_id": sid_prop() }), &["host", "session_id"])),
             tool("capabilities", "What the session loaded: plugins (agents, skills, MCP), settings, warnings.", obj(json!({ "host": host_prop(), "session_id": sid_prop() }), &["host", "session_id"])),
-            tool("permission", "Answer a permission_request (see status.deciding_event or a needs_input webhook).", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "request_id": { "type": "string" }, "behavior": { "type": "string", "enum": ["allow", "deny"] }, "message": { "type": "string" } }), &["host", "session_id", "request_id", "behavior"])),
+            tool("permission", "Answer a permission_request (deciding_event.kind == permission_request, from status or a needs_input wake-up). For permission_prompt (CC's own dialog) use `keys` instead.", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "request_id": { "type": "string" }, "behavior": { "type": "string", "enum": ["allow", "deny"] }, "message": { "type": "string" } }), &["host", "session_id", "request_id", "behavior"])),
             tool("delete", "Stop a session and remove its zellij session.", obj(json!({ "host": host_prop(), "session_id": sid_prop() }), &["host", "session_id"])),
-            tool("watch", "Watch an existing session: webhook on finished / needs_input / ended / connection_lost.", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "webhook": webhook_prop(), "meta": meta_prop() }), &["host", "session_id"])),
-            tool("unwatch", "Stop a watch.", obj(json!({ "watch_id": { "type": "string" } }), &["watch_id"])),
+            tool("watch", "Watch an existing session: a webhook wakes you on finished / needs_input / ended / connection_lost. Needs routing meta (or a host connected with it).", obj(json!({ "host": host_prop(), "session_id": sid_prop(), "webhook": webhook_prop(), "meta": meta_prop(), "ack_timeout_secs": { "type": "integer", "description": "Re-send an unacknowledged wake-up after this many seconds (default 900, 30..86400)." } }), &["host", "session_id"])),
+            tool("unwatch", "Stop a watch and cancel its outstanding notifications.", obj(json!({ "watch_id": { "type": "string" } }), &["watch_id"])),
             tool("watches", "List watches (optionally by host / state).", obj(json!({ "host": { "type": "string" }, "state": { "type": "string", "enum": ["active", "done", "failed", "stopped"] } }), &[])),
+            tool("ack", "Acknowledge a wake-up notification: you handled it (report posted / follow-up sent / prompt answered), so it must not be re-sent. Call AFTER acting, never before. Idempotent.", obj(json!({ "notification_id": { "type": "string", "description": "`notification_id` from the webhook body" } }), &["notification_id"])),
+            tool("notifications", "The notification log: what wake-ups exist and whether they were delivered / acknowledged. `unacked` (default) = still owed an ack — after an interrupted wait, or on a replay (`first_delivered_at` set in the webhook body), check here first.", obj(json!({ "state": { "type": "string", "enum": ["unacked", "pending", "delivered", "acked", "failed", "cancelled", "all"], "description": "default unacked" }, "host": { "type": "string" }, "session_id": { "type": "string" }, "notification_id": { "type": "string", "description": "fetch just this one" }, "limit": { "type": "integer", "description": "default 50" } }), &[])),
         ]
     }
 
@@ -269,6 +274,7 @@ impl McpTools for AgentTools {
                 };
                 obj.remove("webhook");
                 obj.remove("meta");
+                let ack_timeout = obj.remove("ack_timeout_secs");
                 if wake {
                     let Some(w) = self.webhook_for(&args) else {
                         return Ok(text_result("wake requested but no webhook is configured: pass `webhook` or set POK_WEBHOOK_URL for `po-k mcp`. Pass wake=false to create without a watch.", true, None));
@@ -278,6 +284,9 @@ impl McpTools for AgentTools {
                     let meta = self.meta_for(&args);
                     if !meta.is_null() {
                         obj.insert("meta".into(), meta);
+                    }
+                    if let Some(t) = ack_timeout.filter(|t| !t.is_null()) {
+                        obj.insert("ack_timeout_secs".into(), t);
                     }
                 }
                 self.post(&format!("/hosts/{host}/sessions"), body, 90).await
@@ -293,7 +302,7 @@ impl McpTools for AgentTools {
             }
             "wait" => {
                 let (h, sid) = (s(&args, "host")?, s(&args, "session_id")?);
-                let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(600).min(600);
+                let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(WAIT_DEFAULT_SECS).min(600);
                 let since = match args.get("since").and_then(Value::as_i64) {
                     Some(v) => v,
                     None => {
@@ -328,6 +337,34 @@ impl McpTools for AgentTools {
             "interrupt" | "clear" => {
                 let (h, sid) = (s(&args, "host")?, s(&args, "session_id")?);
                 self.post(&sp(&h, &sid, &format!("/{name}")), json!({}), 130).await
+            }
+            "keys" => {
+                let (h, sid) = (s(&args, "host")?, s(&args, "session_id")?);
+                let keys = args.get("keys").and_then(Value::as_array).ok_or_else(|| ToolError::InvalidParams("keys must be an array of strings".into()))?;
+                if keys.is_empty() || !keys.iter().all(Value::is_string) {
+                    return Err(ToolError::InvalidParams("keys must be a non-empty array of strings".into()));
+                }
+                self.post(&sp(&h, &sid, "/keys"), json!({ "keys": keys }), 30).await
+            }
+            "ack" => {
+                let id = s(&args, "notification_id")?;
+                self.post(&format!("/notifications/{id}/ack"), json!({}), 30).await
+            }
+            "notifications" => {
+                if let Some(id) = opt_s(&args, "notification_id") {
+                    return self.get(&format!("/notifications/{id}"), 30).await;
+                }
+                let mut q = vec![format!("state={}", opt_s(&args, "state").unwrap_or_else(|| "unacked".into()))];
+                if let Some(h) = opt_s(&args, "host") {
+                    q.push(format!("host={h}"));
+                }
+                if let Some(sid) = opt_s(&args, "session_id") {
+                    q.push(format!("session_id={sid}"));
+                }
+                if let Some(l) = args.get("limit").and_then(Value::as_u64) {
+                    q.push(format!("limit={l}"));
+                }
+                self.get(&format!("/notifications?{}", q.join("&")), 30).await
             }
             "upload" => {
                 let (h, sid) = (s(&args, "host")?, s(&args, "session_id")?);
@@ -364,6 +401,9 @@ impl McpTools for AgentTools {
                 let meta = self.meta_for(&args);
                 if !meta.is_null() {
                     body["meta"] = meta;
+                }
+                if let Some(t) = args.get("ack_timeout_secs").and_then(Value::as_i64) {
+                    body["ack_timeout_secs"] = json!(t);
                 }
                 self.post("/watches", body, 30).await
             }
@@ -445,14 +485,16 @@ mod tests {
         let t = tools();
         let schema = t.create_schema();
         let props = schema["properties"].as_object().unwrap();
-        for k in ["host", "wake", "webhook", "meta", "cwd", "model", "plugins", "mcp_servers"] {
+        for k in ["host", "wake", "webhook", "meta", "ack_timeout_secs", "cwd", "model", "plugins", "mcp_servers"] {
             assert!(props.contains_key(k), "missing {k}");
         }
         assert_eq!(schema["required"], json!(["host", "cwd"]));
         let all = t.tools();
         let names: Vec<&str> = all.iter().map(|x| x["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"create") && names.contains(&"wait") && names.contains(&"docs"));
-        assert_eq!(names.len(), 22);
+        for n in ["create", "wait", "docs", "ack", "notifications", "keys"] {
+            assert!(names.contains(&n), "missing tool {n}");
+        }
+        assert_eq!(names.len(), 25);
     }
 
     #[tokio::test]
