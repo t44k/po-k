@@ -25,10 +25,19 @@ pub trait McpTools {
 }
 
 /// A `tools/call` result carrying text (and optionally structured content).
+///
+/// `structuredContent` must be a JSON object per the MCP spec (clients such as
+/// Hermes validate it as a dict), so a top-level array — `hosts`, `sessions`,
+/// `watches`, `notifications` — is wrapped as `{"items": [...], "count": n}`
+/// and a scalar as `{"value": ...}`.
 pub fn text_result(text: impl Into<String>, is_error: bool, structured: Option<Value>) -> Value {
     let mut v = json!({ "content": [{ "type": "text", "text": text.into() }], "isError": is_error });
     if let Some(s) = structured {
-        v["structuredContent"] = s;
+        v["structuredContent"] = match s {
+            Value::Object(_) => s,
+            Value::Array(items) => json!({ "count": items.len(), "items": items }),
+            other => json!({ "value": other }),
+        };
     }
     v
 }
@@ -146,6 +155,10 @@ mod tests {
         let v: Value = serde_json::from_str(&call).unwrap();
         assert_eq!(v["result"]["structuredContent"]["a"], 1);
         assert_eq!(v["result"]["isError"], false);
+        // Arrays are wrapped: structuredContent must be an object for MCP clients.
+        let arr = text_result("x", false, Some(json!([1, 2])));
+        assert_eq!(arr["structuredContent"], json!({ "count": 2, "items": [1, 2] }));
+        assert_eq!(text_result("x", false, Some(json!(7)))["structuredContent"], json!({ "value": 7 }));
         let bad = handle(&Fake, &json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "nope" } })).await.unwrap();
         let v: Value = serde_json::from_str(&bad).unwrap();
         assert_eq!(v["error"]["code"], -32601);
