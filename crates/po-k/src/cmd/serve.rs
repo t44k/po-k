@@ -95,7 +95,7 @@ pub async fn run(args: Args) -> Result<()> {
         config = %cfg_path.display(),
         "po-k serve listening"
     );
-    axum::serve(listener, http::router(state))
+    axum::serve(listener, http::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("axum serve")?;

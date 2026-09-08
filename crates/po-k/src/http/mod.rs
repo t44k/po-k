@@ -26,6 +26,7 @@ pub mod hub;
 pub mod messages;
 pub mod perms;
 pub mod query;
+pub mod reqlog;
 pub mod routes;
 pub mod sessions;
 
@@ -74,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .merge(protected)
         .fallback(not_found)
         .layer(middleware::from_fn(crate::version::enforce))
+        .layer(middleware::from_fn(reqlog::log))
         .with_state(state)
 }
 

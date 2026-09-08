@@ -221,6 +221,7 @@ async fn spawn_inner(state: &AppState, name: String, req: SpawnRequest) -> Resul
         system_prompt_file: system_prompt_path.as_deref(),
     };
     let cmd = render_bootstrap(&spec);
+    tracing::info!(sid = %sid, zellij = %zellij_session, cmd = %cmd, "bootstrapping CC in pane");
     zellij::write_to_focused_pane(&zellij_session, &format!("{cmd}\n")).await?;
 
     let started_at = events_store::now_iso();
